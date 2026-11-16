@@ -25,6 +25,7 @@ internal static class Program
         }
 
         var identity = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(root.ToUpperInvariant())))[..16];
+        var startRequested = args.Contains("--start", StringComparer.OrdinalIgnoreCase);
         using var singleInstance = new Mutex(true, $"Local\\QZZ.ServerControl.{identity}", out var firstInstance);
         if (!firstInstance)
         {
@@ -32,6 +33,11 @@ internal static class Program
             {
                 using var showExisting = EventWaitHandle.OpenExisting($"Local\\QZZ.ServerControl.Show.{identity}");
                 showExisting.Set();
+                if (startRequested)
+                {
+                    using var startExisting = EventWaitHandle.OpenExisting($"Local\\QZZ.ServerControl.Start.{identity}");
+                    startExisting.Set();
+                }
             }
             catch (WaitHandleCannotBeOpenedException) { }
             return;
@@ -39,7 +45,10 @@ internal static class Program
 
         using var showEvent = new EventWaitHandle(false, EventResetMode.AutoReset,
             $"Local\\QZZ.ServerControl.Show.{identity}");
-        Application.Run(new ControlWindow(root, showEvent, args.Contains("--autostart", StringComparer.OrdinalIgnoreCase)));
+        using var startEvent = new EventWaitHandle(false, EventResetMode.AutoReset,
+            $"Local\\QZZ.ServerControl.Start.{identity}");
+        Application.Run(new ControlWindow(root, showEvent, startEvent,
+            args.Contains("--autostart", StringComparer.OrdinalIgnoreCase), startRequested));
     }
 
     private static string? FindProjectRoot()
@@ -69,6 +78,7 @@ internal sealed class ControlWindow : Form
     private readonly string root;
     private readonly string settingsPath;
     private readonly EventWaitHandle showEvent;
+    private readonly EventWaitHandle startEvent;
     private readonly NotifyIcon tray;
     private readonly HttpClient http = new() { Timeout = TimeSpan.FromSeconds(1) };
     private readonly NumericUpDown portInput = new() { Minimum = 1024, Maximum = 65535, Width = 110 };
@@ -93,10 +103,11 @@ internal sealed class ControlWindow : Form
     private bool starting;
     private bool exiting;
 
-    public ControlWindow(string root, EventWaitHandle showEvent, bool autoLaunch)
+    public ControlWindow(string root, EventWaitHandle showEvent, EventWaitHandle startEvent, bool autoLaunch, bool startRequested)
     {
         this.root = root;
         this.showEvent = showEvent;
+        this.startEvent = startEvent;
         settingsPath = Path.Combine(root, "data", "controller.json");
         settings = LoadSettings();
 
@@ -158,11 +169,15 @@ internal sealed class ControlWindow : Form
         {
             while (true)
             {
-                showEvent.WaitOne();
+                var requestedEvent = WaitHandle.WaitAny(new WaitHandle[] { showEvent, startEvent });
                 if (exiting || IsDisposed) return;
                 try
                 {
-                    if (IsHandleCreated) BeginInvoke(ShowWindow);
+                    if (IsHandleCreated) BeginInvoke(async () =>
+                    {
+                        ShowWindow();
+                        if (requestedEvent == 1) await StartServerAsync();
+                    });
                 }
                 catch (InvalidOperationException) { return; }
             }
@@ -170,7 +185,11 @@ internal sealed class ControlWindow : Form
 
         Shown += async (_, _) =>
         {
-            if (autoLaunch && settings.AutoStart)
+            if (startRequested)
+            {
+                await StartServerAsync();
+            }
+            else if (autoLaunch && settings.AutoStart)
             {
                 Hide();
                 await StartServerAsync();
