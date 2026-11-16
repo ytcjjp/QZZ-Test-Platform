@@ -6,6 +6,40 @@
   letter-spacing: 0;
 }
 * { box-sizing: border-box; }
+.auth-tabs { display: flex; padding: 3px; border: 1px solid #dbe4e2; border-radius: 6px; margin-bottom: 20px; background: #f6f8f8; }
+.auth-tabs button { flex: 1; border: 0; border-radius: 4px; min-height: 36px; background: transparent; color: #627775; }
+.auth-tabs button.selected { background: white; color: #177e70; box-shadow: 0 1px 4px #20323316; font-weight: 700; }
+.check-field { display: flex; align-items: center; gap: 9px; font-size: 13px; min-height: 34px; }
+.check-field input, .permission-row input { width: 16px; height: 16px; flex: none; accent-color: #197d70; }
+.account-modal { width: min(470px, 100%); }
+.account-form { display: grid; gap: 18px; }
+.account-users-modal { width: min(760px, 100%); }
+.member-picker { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; max-height: 210px; overflow: auto; margin-bottom: 22px; }
+.member-option { display: flex; align-items: center; gap: 9px; text-align: left; border: 1px solid #e0e8e6; background: white; padding: 10px; border-radius: 5px; min-width: 0; }
+.member-option.selected { background: #e9f4f0; border-color: #77ab9f; }
+.member-option strong { overflow-wrap: anywhere; min-width: 0; flex: 1; font-size: 13px; }
+.member-option > span:last-child { font-size: 11px; color: #647975; flex: none; }
+.account-editor { border-top: 1px solid #e0e8e6; padding-top: 18px; display: grid; gap: 16px; }
+.account-editor h3, .password-reveal h3 { font-size: 14px; margin: 0 0 5px; }
+.permissions-table { border: 1px solid #e0e8e6; border-radius: 5px; overflow: hidden; }
+.permission-row { display: grid; grid-template-columns: minmax(120px, 1fr) 70px 100px; align-items: center; gap: 7px; min-height: 40px; padding: 7px 14px; font-size: 12px; border-bottom: 1px solid #edf1ef; }
+.permission-row:last-child { border-bottom: 0; }
+.permission-row input { justify-self: center; }
+.permission-row > span:not(:first-child) { text-align: center; }
+.permission-head { background: #f6f8f8; color: #647975; font-weight: 600; }
+.password-reveal { border-top: 1px solid #e0e8e6; margin-top: 18px; padding-top: 18px; }
+.reveal-controls { display: flex; align-items: flex-end; gap: 12px; margin-top: 12px; }
+.reveal-controls .field { flex: 1; min-width: 0; }
+.reveal-controls .button { flex: none; }
+.revealed-password { background: #f3f7f5; padding: 10px 12px; display: flex; align-items: center; justify-content: space-between; margin-top: 10px; }
+.revealed-password code { overflow-wrap: anywhere; min-width: 0; user-select: all; }
+.account-success { color: #197d70; display: flex; gap: 7px; align-items: center; font-size: 13px; margin-top: 16px; }
+.read-only-module .heading-actions .button, .read-only-module .empty-state .button:has(svg.lucide-plus), .read-only-module .upload-zone, .read-only-module .row-actions .icon-button:has(svg.lucide-trash-2) { display: none; }
+@media (max-width: 520px) {
+  .member-picker { grid-template-columns: 1fr; }
+  .reveal-controls { flex-direction: column; align-items: stretch; }
+  .permission-row { grid-template-columns: minmax(110px, 1fr) 45px 85px; padding: 7px 10px; }
+}
 body { margin: 0; min-width: 320px; }
 button, input, select, textarea { font: inherit; letter-spacing: 0; }
 button { cursor: pointer; }

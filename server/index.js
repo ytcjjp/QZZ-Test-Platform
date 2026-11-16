@@ -3,13 +3,13 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { promisify } from 'node:util';
 import Database from 'better-sqlite3';
 import express from 'express';
 import multer from 'multer';
 import { WebSocketServer } from 'ws';
+import { hashPassword, verifyPassword, loadPasswordKey,
+  encryptPassword as encryptWithKey, decryptPassword as decryptWithKey } from './passwords.js';
 
-const scrypt = promisify(crypto.scrypt);
 const serverDir = path.dirname(fileURLToPath(import.meta.url));
 const projectDir = path.resolve(serverDir, '..');
 const dataDir = path.resolve(process.env.QZZ_DATA_DIR || path.join(projectDir, 'data'));
@@ -64,19 +64,53 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS files_created_idx ON files(created_at DESC);
 `);
 
-function hashPassword(password) {
-  const salt = crypto.randomBytes(16).toString('hex');
-  const digest = crypto.scryptSync(password, salt, 64).toString('hex');
-  return `scrypt:${salt}:${digest}`;
+const userColumns = db.prepare('PRAGMA table_info(users)').all().map((column) => column.name);
+for (const [name, definition] of Object.entries({
+  disabled: 'INTEGER NOT NULL DEFAULT 0', permissions: 'TEXT', password_encrypted: 'TEXT',
+})) {
+  if (!userColumns.includes(name)) db.exec(`ALTER TABLE users ADD COLUMN ${name} ${definition}`);
+}
+db.exec(`CREATE TABLE IF NOT EXISTS account_audit (
+  id TEXT PRIMARY KEY, actor_id TEXT NOT NULL, target_id TEXT NOT NULL,
+  action TEXT NOT NULL, created_at TEXT NOT NULL
+)`);
+const passwordKey = loadPasswordKey(dataDir, Boolean(db.prepare('SELECT 1 FROM users WHERE password_encrypted IS NOT NULL').get()));
+const permissionModules = ['cases', 'defects', 'ai', 'files'];
+
+function normalizePermissions(value) {
+  if (value != null && (typeof value !== 'object' || Array.isArray(value))) throw new InputError('权限格式不正确');
+  return Object.fromEntries(permissionModules.map((name) => {
+    const item = value?.[name];
+    if (item != null && (typeof item !== 'object' || Array.isArray(item))) throw new InputError('权限格式不正确');
+    for (const flag of ['view', 'write']) {
+      if (item?.[flag] !== undefined && typeof item[flag] !== 'boolean') throw new InputError('权限格式不正确');
+    }
+    const view = item?.view ?? true;
+    return [name, { view, write: view && (item?.write ?? true) }];
+  }));
 }
 
-async function verifyPassword(password, stored) {
-  const [algorithm, salt, encoded] = stored.split(':');
-  if (algorithm !== 'scrypt' || !salt || !encoded) return false;
-  const expected = Buffer.from(encoded, 'hex');
-  if (expected.length !== 64) return false;
-  const actual = await scrypt(password, salt, expected.length);
-  return crypto.timingSafeEqual(actual, expected);
+function mapUser(user) {
+  return { id: user.id, username: user.username, role: user.role, disabled: Boolean(user.disabled),
+    permissions: normalizePermissions(user.role === 'admin' ? null : JSON.parse(user.permissions || 'null')),
+    passwordAvailable: Boolean(user.password_encrypted), createdAt: user.created_at };
+}
+
+function encryptPassword(password) {
+  return encryptWithKey(password, passwordKey);
+}
+
+function decryptPassword(value) {
+  return decryptWithKey(value, passwordKey);
+}
+
+function validatePassword(password) {
+  if (typeof password !== 'string' || password.length < 6 || password.length > 200) throw new InputError('密码须为 6-200 位');
+}
+
+function audit(actor, target, action) {
+  db.prepare('INSERT INTO account_audit VALUES (?, ?, ?, ?, ?)')
+    .run(crypto.randomUUID(), actor, target, action, new Date().toISOString());
 }
 
 if (db.prepare('SELECT count(*) AS count FROM users').get().count === 0) {
@@ -84,14 +118,14 @@ if (db.prepare('SELECT count(*) AS count FROM users').get().count === 0) {
   const generated = !process.env.ADMIN_PASSWORD;
   const password = process.env.ADMIN_PASSWORD || crypto.randomBytes(24).toString('base64url');
   if (!/^[\p{L}\p{N}._-]{2,32}$/u.test(username)) throw new Error('Invalid ADMIN_USERNAME');
-  if (password.length < 12) throw new Error('ADMIN_PASSWORD must contain at least 12 characters');
+  if (password.length < 6 || password.length > 200) throw new Error('ADMIN_PASSWORD must contain 6-200 characters');
   if (generated) {
     fs.writeFileSync(credentialFile, `username=${username}\npassword=${password}\n`, { mode: 0o600, flag: 'wx' });
     console.log(`Initial admin credentials: ${credentialFile}`);
   }
   try {
-    db.prepare('INSERT INTO users VALUES (?, ?, ?, ?, ?)')
-      .run(crypto.randomUUID(), username, hashPassword(password), 'admin', new Date().toISOString());
+    db.prepare('INSERT INTO users (id, username, password_hash, role, created_at, password_encrypted) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(crypto.randomUUID(), username, hashPassword(password), 'admin', new Date().toISOString(), encryptPassword(password));
   } catch (error) {
     if (generated) fs.unlinkSync(credentialFile);
     throw error;
@@ -102,6 +136,7 @@ const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', trustProxy ? 'loopback' : false);
 app.use(express.json({ limit: '1mb' }));
+app.use('/api', (req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
 
 function sendError(res, status, error, message) {
   return res.status(status).json({ error, message });
@@ -118,10 +153,11 @@ function userFromRequest(req) {
   const token = cookieToken(req);
   if (!token) return null;
   const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
-  return db.prepare(`SELECT users.id, users.username, users.role FROM sessions
+  const user = db.prepare(`SELECT users.* FROM sessions
     JOIN users ON users.id = sessions.user_id
-    WHERE sessions.token_hash = ? AND sessions.expires_at > ?`)
+    WHERE sessions.token_hash = ? AND sessions.expires_at > ? AND users.disabled = 0`)
     .get(tokenHash, Date.now()) || null;
+  return user ? mapUser(user) : null;
 }
 
 function requireAuth(req, res, next) {
@@ -147,9 +183,25 @@ app.use((req, res, next) => {
 });
 
 const loginAttempts = new Map();
+const accountAttempts = new Map();
 const loginWindowMs = 15 * 60 * 1000;
 const maxLoginAttemptKeys = 5000;
 let lastLoginPrune = 0;
+
+function limitAccountAttempts(req, res, next) {
+  const now = Date.now();
+  for (const [key, value] of accountAttempts) {
+    if (value.expiresAt <= now) accountAttempts.delete(key);
+  }
+  const key = `${req.ip}:${req.user?.id || 'public'}:${req.path.endsWith('reveal-password') ? 'reveal' : req.path}`;
+  const previous = accountAttempts.get(key);
+  const maximum = req.path === '/api/register' ? 30 : 10;
+  if ((previous?.count || 0) >= maximum || (!previous && accountAttempts.size >= maxLoginAttemptKeys)) {
+    return sendError(res, 429, 'too_many_attempts', '尝试次数过多，请稍后重试');
+  }
+  accountAttempts.set(key, { count: (previous?.count || 0) + 1, expiresAt: previous?.expiresAt || now + loginWindowMs });
+  next();
+}
 
 function pruneLoginAttempts(now) {
   if (now - lastLoginPrune < 60000 && loginAttempts.size < maxLoginAttemptKeys) return;
@@ -164,7 +216,42 @@ app.get('/api/health', (req, res) => {
 });
 
 app.get('/api/session', (req, res) => {
-  res.json({ user: userFromRequest(req) });
+  res.json({ user: userFromRequest(req), registrationEnabled: true });
+});
+
+function createSession(req, res, user) {
+  const token = crypto.randomBytes(32).toString('base64url');
+  const remember = req.body?.remember === true;
+  const duration = (remember ? 30 : 1) * 24 * 60 * 60 * 1000;
+  db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(Date.now());
+  db.prepare('INSERT INTO sessions VALUES (?, ?, ?)')
+    .run(crypto.createHash('sha256').update(token).digest('hex'), user.id, Date.now() + duration);
+  res.cookie('qzz_session', token, {
+    httpOnly: true, sameSite: 'lax', secure: req.secure, path: '/', ...(remember ? { maxAge: duration } : {}),
+  });
+}
+
+function createUser(body, actor) {
+  const username = typeof body?.username === 'string' ? body.username.trim() : '';
+  if (!/^[\p{L}\p{N}._-]{2,32}$/u.test(username)) throw new InputError('账号须为 2-32 位文字、数字或 ._-');
+  validatePassword(body?.password);
+  if (body.confirmPassword !== undefined && body.password !== body.confirmPassword) throw new InputError('两次密码不一致');
+  if (db.prepare('SELECT id FROM users WHERE username = ?').get(username)) return null;
+  const id = crypto.randomUUID();
+  db.prepare('INSERT INTO users (id, username, password_hash, role, created_at, password_encrypted) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(id, username, hashPassword(body.password), 'member', new Date().toISOString(), encryptPassword(body.password));
+  audit(actor || id, id, actor ? 'user.created' : 'user.registered');
+  return db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+}
+
+app.post('/api/register', limitAccountAttempts, (req, res) => {
+  if (typeof req.body?.username === 'string' && req.body.username.trim().toLowerCase() === 'admin') {
+    return sendError(res, 409, 'reserved_admin', 'admin 为保留管理员账号');
+  }
+  const user = createUser(req.body);
+  if (!user) return sendError(res, 409, 'duplicate', '账号已存在');
+  createSession(req, res, user);
+  res.status(201).json({ user: mapUser(user) });
 });
 
 app.post('/api/session', async (req, res, next) => {
@@ -184,7 +271,9 @@ app.post('/api/session', async (req, res, next) => {
       return sendError(res, 429, 'too_many_attempts', '尝试次数过多，请稍后重试');
     }
     const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
-    const valid = user && await verifyPassword(password, user.password_hash);
+    const verified = user && !user.disabled && await verifyPassword(password, user.password_hash);
+    const fresh = user && db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
+    const valid = verified && fresh && !fresh.disabled && fresh.password_hash === user.password_hash;
     if (!valid) {
       loginAttempts.set(attemptKey, {
         count: (attempt?.expiresAt > now ? attempt.count : 0) + 1,
@@ -193,16 +282,9 @@ app.post('/api/session', async (req, res, next) => {
       return sendError(res, 401, 'invalid_credentials', '账号或密码错误');
     }
     loginAttempts.delete(attemptKey);
-    const token = crypto.randomBytes(32).toString('base64url');
-    const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000;
-    db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(Date.now());
-    db.prepare('INSERT INTO sessions VALUES (?, ?, ?)')
-      .run(crypto.createHash('sha256').update(token).digest('hex'), user.id, expiresAt);
-    res.cookie('qzz_session', token, {
-      httpOnly: true, sameSite: 'lax', secure: req.secure, path: '/', maxAge: 7 * 24 * 60 * 60 * 1000,
-    });
+    createSession(req, res, fresh);
     if (user.role === 'admin' && fs.existsSync(credentialFile)) fs.unlinkSync(credentialFile);
-    res.json({ user: { id: user.id, username: user.username, role: user.role } });
+    res.json({ user: mapUser(fresh) });
   } catch (error) { next(error); }
 });
 
@@ -224,25 +306,98 @@ app.get('/api/config', (req, res) => {
 });
 
 app.get('/api/users', requireAdmin, (req, res) => {
-  const users = db.prepare('SELECT id, username, role, created_at AS createdAt FROM users ORDER BY created_at').all();
+  const users = db.prepare('SELECT * FROM users ORDER BY created_at').all().map(mapUser);
   res.json({ users });
 });
 
 app.post('/api/users', requireAdmin, (req, res) => {
-  const username = typeof req.body?.username === 'string' ? req.body.username.trim() : '';
-  const password = typeof req.body?.password === 'string' ? req.body.password : '';
-  if (!/^[\p{L}\p{N}._-]{2,32}$/u.test(username) || password.length < 12 || password.length > 200) {
-    return sendError(res, 400, 'invalid_input', '账号须为 2-32 位文字、数字或 ._-；密码须为 12-200 位');
+  const user = createUser(req.body, req.user.id);
+  if (!user) return sendError(res, 409, 'duplicate', '账号已存在');
+  res.status(201).json({ user: mapUser(user) });
+});
+
+function invalidateUserSessions(id, keepToken = null) {
+  const keepHash = keepToken ? crypto.createHash('sha256').update(keepToken).digest('hex') : '';
+  db.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?').run(id, keepHash);
+  for (const client of wss.clients) {
+    if (client.userId === id && client.tokenHash !== keepHash) client.close(1008, 'Account updated');
   }
-  const user = { id: crypto.randomUUID(), username, role: 'member', createdAt: new Date().toISOString() };
-  try {
-    db.prepare('INSERT INTO users VALUES (?, ?, ?, ?, ?)')
-      .run(user.id, user.username, hashPassword(password), user.role, user.createdAt);
-  } catch (error) {
-    if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') return sendError(res, 409, 'duplicate', '账号已存在');
-    throw error;
+}
+
+app.get('/api/account', (req, res) => res.json({ user: req.user }));
+app.patch('/api/account', (req, res) => {
+  if (Object.keys(req.body || {}).length) return sendError(res, 400, 'invalid_input', '当前仅支持在修改密码中更新密码');
+  res.json({ user: req.user });
+});
+
+app.post('/api/account/password', limitAccountAttempts, async (req, res) => {
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
+  const currentPassword = req.body?.currentPassword;
+  if (typeof currentPassword !== 'string' || currentPassword.length > 200 ||
+      !await verifyPassword(currentPassword, user.password_hash)) {
+    return sendError(res, 403, 'invalid_password', '当前密码不正确');
   }
-  res.status(201).json({ user });
+  const fresh = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
+  if (!userFromRequest(req) || fresh.password_hash !== user.password_hash) {
+    return sendError(res, 401, 'unauthorized', '账号已更新，请重新登录');
+  }
+  validatePassword(req.body?.newPassword);
+  db.prepare('UPDATE users SET password_hash = ?, password_encrypted = ? WHERE id = ?')
+    .run(hashPassword(req.body.newPassword), encryptPassword(req.body.newPassword), user.id);
+  invalidateUserSessions(user.id, cookieToken(req));
+  audit(user.id, user.id, 'password.changed');
+  res.json({ ok: true, user: mapUser(db.prepare('SELECT * FROM users WHERE id = ?').get(user.id)) });
+});
+
+app.put('/api/users/:id', requireAdmin, (req, res) => {
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
+  if (!user) return sendError(res, 404, 'not_found', '账号不存在');
+  const role = req.body?.role ?? user.role;
+  const disabled = req.body?.disabled ?? Boolean(user.disabled);
+  if (!['admin', 'member'].includes(role) || typeof disabled !== 'boolean') throw new InputError('账号设置格式不正确');
+  if (user.username === 'admin' && (role !== 'admin' || disabled)) {
+    return sendError(res, 400, 'reserved_admin', 'admin 为保留管理员，不能停用或降级');
+  }
+  if (user.role === 'admin' && !user.disabled && (role !== 'admin' || disabled) &&
+      db.prepare("SELECT count(*) AS count FROM users WHERE role = 'admin' AND disabled = 0").get().count <= 1) {
+    return sendError(res, 400, 'last_admin', '至少保留一名启用的管理员');
+  }
+  const permissions = normalizePermissions(req.body?.permissions ?? JSON.parse(user.permissions || 'null'));
+  if (req.body?.password !== undefined) validatePassword(req.body.password);
+  db.prepare('UPDATE users SET role = ?, disabled = ?, permissions = ?, password_hash = ?, password_encrypted = ? WHERE id = ?')
+    .run(role, Number(disabled), JSON.stringify(permissions),
+      req.body?.password !== undefined ? hashPassword(req.body.password) : user.password_hash,
+      req.body?.password !== undefined ? encryptPassword(req.body.password) : user.password_encrypted, user.id);
+  invalidateUserSessions(user.id, user.id === req.user.id ? cookieToken(req) : null);
+  audit(req.user.id, user.id, req.body?.password !== undefined ? 'user.password_reset' : 'user.permissions_changed');
+  res.json({ user: mapUser(db.prepare('SELECT * FROM users WHERE id = ?').get(user.id)) });
+});
+
+app.post('/api/users/:id/reveal-password', requireAdmin, limitAccountAttempts, async (req, res) => {
+  const admin = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
+  const password = req.body?.currentPassword;
+  if (typeof password !== 'string' || password.length > 200 || !await verifyPassword(password, admin.password_hash)) {
+    return sendError(res, 403, 'invalid_password', '管理员密码不正确');
+  }
+  const freshAdmin = userFromRequest(req);
+  const freshCredentials = db.prepare('SELECT * FROM users WHERE id = ?').get(admin.id);
+  if (!freshAdmin || freshAdmin.role !== 'admin' || freshCredentials.password_hash !== admin.password_hash) {
+    return sendError(res, 401, 'unauthorized', '账号已更新，请重新登录');
+  }
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
+  if (!user) return sendError(res, 404, 'not_found', '账号不存在');
+  audit(req.user.id, user.id, 'password.revealed');
+  res.set('Cache-Control', 'no-store');
+  res.json({ available: Boolean(user.password_encrypted), password: user.password_encrypted ? decryptPassword(user.password_encrypted) : null });
+});
+
+app.use('/api', (req, res, next) => {
+  const module = req.path.split('/')[1];
+  if (!permissionModules.includes(module) || req.user.role === 'admin') return next();
+  const permission = req.user.permissions[module];
+  const operation = req.method === 'GET' ? 'view' : 'write';
+  if (!permission[operation]) return sendError(res, 403, 'forbidden', '没有此模块的操作权限');
+  next();
 });
 
 function readString(value, field, max, fallback = '') {
@@ -573,6 +728,7 @@ server.on('upgrade', (req, socket, head) => {
   }
   wss.handleUpgrade(req, socket, head, (ws) => {
     ws.tokenHash = crypto.createHash('sha256').update(cookieToken(req)).digest('hex');
+    ws.userId = userFromRequest(req).id;
     wss.emit('connection', ws, req);
   });
 });
@@ -581,9 +737,12 @@ function broadcast(type, details) {
   const payload = JSON.stringify({ type, ...details });
   for (const client of wss.clients) {
     if (client.readyState !== 1) continue;
-    const session = db.prepare('SELECT 1 FROM sessions WHERE token_hash = ? AND expires_at > ?')
+    const session = db.prepare(`SELECT users.* FROM sessions JOIN users ON users.id = sessions.user_id
+      WHERE token_hash = ? AND expires_at > ? AND disabled = 0`)
       .get(client.tokenHash, Date.now());
-    if (session) client.send(payload);
+    const module = { case: 'cases', defect: 'defects', file: 'files' }[type.split('.')[0]];
+    if (session && (!module || mapUser(session).permissions[module].view)) client.send(payload);
+    else if (session) continue;
     else client.close(1008, 'Session expired');
   }
 }

@@ -7,19 +7,41 @@
 
 第一次启动会创建管理员 `admin`，生成随机密码并写入
 `data/initial-admin.txt`。在本机读取它并登录后，该文件会自动删除。
-也可在首次启动前设置 `ADMIN_USERNAME` 和至少 12 位的 `ADMIN_PASSWORD`，
-则不会生成密码文件。密码仅以 scrypt 哈希形式存入数据库。
+也可在首次启动前设置 `ADMIN_USERNAME` 和 6-200 位的 `ADMIN_PASSWORD`，
+则不会生成密码文件。登录校验使用 scrypt 哈希；为支持管理员查看用户密码，
+新注册和新修改的密码另存 AES-256-GCM 加密副本，本地密钥是 `data/password-key`。
+旧版只有哈希的密码无法查看，需修改或重置后才能查看。密钥缺失时服务会明确报错，
+不会生成新密钥冒充可恢复。备份必须包含数据库和原密钥。
 请勿将 `data/`、环境变量文件、密钥或备份加入 Git。
 
-运行数据默认位于项目根目录的 `data/`，包括 SQLite 数据库、WAL 文件
-及 `uploads/`。可用 `QZZ_DATA_DIR` 改位置。建议定期备份整个数据目录，
+运行数据默认位于项目根目录的 `data/`，包括 SQLite 数据库、WAL 文件、
+`password-key` 及 `uploads/`。可用 `QZZ_DATA_DIR` 改位置。建议定期备份整个数据目录，
 备份数据库时应先停服务，或使用 SQLite 在线备份工具。
 
-登录后管理员可通过 `POST /api/users` 创建独立成员账号，请求体为
-`{"username":"tester","password":"至少12位"}`，可用 `GET /api/users`
-查看账号。登录 API 为 `POST /api/session`，退出为 `DELETE /api/session`。
+账号及密码 API：
+
+- `POST /api/register`：公开注册，`{username,password,confirmPassword?}`，成功后直接登录；注册只能创建普通成员。
+- `GET /api/session`：返回 `{user,registrationEnabled:true}`；`POST /api/session` 接收 `{username,password,remember?}`；`DELETE /api/session` 退出。
+- `remember:true` 设置 30 天 HttpOnly 会话；未勾选时使用浏览器会话 Cookie，服务端最多保留 1 天。
+- `GET /api/account`：当前账号；`POST /api/account/password` 接收 `{currentPassword,newPassword}`，修改自身密码并撤销其他会话。
+- `PATCH /api/account` 当前只接受空对象读取账号；不允许普通成员修改角色、权限或其他用户。
+- `GET /api/users`、`POST /api/users`：仅管理员可列出和创建用户，创建请求为 `{username,password}`。
+- `PUT /api/users/:id`：仅管理员可修改 `{role?,disabled?,permissions?,password?}`，修改后撤销目标用户其他会话。
+- `POST /api/users/:id/reveal-password`：仅管理员，必须传 `{currentPassword}` 再次验证管理员密码，返回 `{available,password}`；旧密码副本不存在时返回 `available:false,password:null`。
+
+账号名为 2-32 位文字、数字或 `._-`，密码为 6-200 位。`admin` 是保留管理员，
+不可停用、降级或公开注册，其他管理员也不能移除最后一名启用管理员。
+`permissions` 按 `cases`、`defects`、`ai`、`files` 分模块，例如
+`{"cases":{"view":true,"write":false}}`；缺省模块保留原有可读写行为，
+`view:false` 会同时关闭写权限。管理员始终具有全部模块权限。
+所有业务 API 都在服务端校验权限，WebSocket 广播按模块查看权限过滤。
+密码查看、修改和注册有次数限制；敏感操作仅记录操作者、目标、操作和时间，
+不记录密码。普通接口、用户列表和广播不返回密码、加密副本或密钥。
+
+本机维护重置可在停止服务并备份数据后执行 `node server/reset-admin-password.js`，
+通过标准输入传入新密码并结束输入；命令只输出成功提示，撤销 admin 会话。
+须先使用新版服务完成数据库迁移。不要将密码写进命令行参数、脚本或 Git。
 健康检查为无需登录的 `GET /api/health`；业务接口均需登录，使用 HttpOnly 会话 Cookie。
-首版暂不提供密码重置、账号停用或细分权限；请妥善保存管理员密码。
 
 AI 用例生成默认关闭。配置 `AI_API_KEY`、`AI_MODEL`，以及可选的
 `AI_BASE_URL`（默认为 `https://api.openai.com/v1`）后，

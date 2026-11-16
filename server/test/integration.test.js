@@ -1,13 +1,147 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { access, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { access, mkdtemp, readFile, rm, unlink } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import WebSocket from 'ws';
+import Database from 'better-sqlite3';
+import { hashPassword, encryptPassword, decryptPassword, loadPasswordKey } from '../passwords.js';
 
 const serverDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+test('legacy hashes migrate safely and stdin maintenance reset restores a recoverable admin password', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'qzz-legacy-test-'));
+  let child;
+  try {
+    const db = new Database(path.join(dataDir, 'platform.db'));
+    db.exec('CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT UNIQUE, password_hash TEXT, role TEXT, created_at TEXT)');
+    db.prepare('INSERT INTO users VALUES (?, ?, ?, ?, ?)')
+      .run('legacy-admin', 'admin', hashPassword('legacy-pass'), 'admin', new Date().toISOString());
+    db.close();
+    let started = await launch(dataDir);
+    child = started.child;
+    const login = await request(started.url, '/api/session', null, {
+      method: 'POST', body: { username: 'admin', password: 'legacy-pass' },
+    });
+    assert.equal(login.status, 200);
+    assert.equal(login.body.user.passwordAvailable, false);
+    const cookie = login.response.headers.get('set-cookie').split(';')[0];
+    assert.equal((await request(started.url, '/api/cases', cookie)).status, 200);
+    await new Promise((resolve) => { child.once('exit', resolve); child.kill(); });
+    child = null;
+    const reset = spawn(process.execPath, [path.join(serverDir, 'reset-admin-password.js')], {
+      cwd: os.tmpdir(), env: { ...process.env, QZZ_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let output = '';
+    reset.stdout.on('data', (data) => { output += data; });
+    reset.stderr.on('data', (data) => { output += data; });
+    reset.stdin.end('new-local-password\n');
+    assert.equal(await new Promise((resolve) => reset.once('exit', resolve)), 0, output);
+    assert.equal(output.includes('new-local-password'), false);
+    started = await launch(dataDir);
+    child = started.child;
+    assert.equal((await request(started.url, '/api/account', cookie)).status, 401);
+    assert.equal((await request(started.url, '/api/session', null, {
+      method: 'POST', body: { username: 'admin', password: 'new-local-password' },
+    })).body.user.passwordAvailable, true);
+    await new Promise((resolve) => { child.once('exit', resolve); child.kill(); });
+    child = null;
+    await unlink(path.join(dataDir, 'password-key'));
+    assert.throws(() => loadPasswordKey(dataDir, true), /missing/);
+  } finally {
+    if (child) await new Promise((resolve) => { child.once('exit', resolve); child.kill(); });
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('registration, own password, admin recovery and module permissions enforce account boundaries', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'qzz-accounts-test-'));
+  let child;
+  try {
+    const started = await launch(dataDir);
+    child = started.child;
+    const { url } = started;
+    const login = await request(url, '/api/session', null, {
+      method: 'POST', body: { username: 'admin', password: 'AdminPassword123456', remember: true },
+    });
+    const adminCookie = login.response.headers.get('set-cookie').split(';')[0];
+    assert.match(login.response.headers.get('set-cookie'), /Max-Age=2592000/);
+    assert.equal(login.response.headers.get('cache-control'), 'no-store');
+    const adminId = login.body.user.id;
+    const registered = await request(url, '/api/register', null, {
+      method: 'POST', body: { username: 'newtester', password: '1234567', role: 'admin', permissions: {} },
+    });
+    assert.equal(registered.status, 201);
+    assert.equal(registered.body.user.role, 'member');
+    assert.equal(registered.body.user.permissions.cases.write, true);
+    assert.doesNotMatch(registered.response.headers.get('set-cookie'), /Max-Age=/);
+    let memberCookie = registered.response.headers.get('set-cookie').split(';')[0];
+    const memberId = registered.body.user.id;
+    assert.equal((await request(url, '/api/register', null, {
+      method: 'POST', body: { username: 'newtester', password: '1234567' },
+    })).status, 409);
+    for (const [route, method, body] of [
+      ['/api/users', 'GET'], [`/api/users/${adminId}`, 'PUT', { password: 'invalid-access' }],
+      [`/api/users/${adminId}/reveal-password`, 'POST', { currentPassword: '1234567' }],
+    ]) assert.equal((await request(url, route, memberCookie, { method, body })).status, 403);
+    assert.equal((await request(url, '/api/account/password', memberCookie, {
+      method: 'POST', body: { currentPassword: 'wrong-password', newPassword: '7654321' },
+    })).status, 403);
+    assert.equal((await request(url, '/api/account/password', memberCookie, {
+      method: 'POST', body: { currentPassword: '1234567', newPassword: '7654321' },
+    })).status, 200);
+    assert.equal((await request(url, '/api/account', memberCookie)).status, 200);
+    assert.equal((await request(url, `/api/users/${memberId}/reveal-password`, adminCookie, {
+      method: 'POST', body: { currentPassword: 'wrong-password' },
+    })).status, 403);
+    const reveal = await request(url, `/api/users/${memberId}/reveal-password`, adminCookie, {
+      method: 'POST', body: { currentPassword: 'AdminPassword123456' },
+    });
+    assert.deepEqual(reveal.body, { available: true, password: '7654321' });
+    assert.equal((await request(url, `/api/users/${adminId}`, adminCookie, {
+      method: 'PUT', body: { role: 'member' },
+    })).status, 400);
+    assert.equal((await request(url, `/api/users/${memberId}`, adminCookie, {
+      method: 'PUT', body: { password: 'reset123', permissions: { cases: { view: false, write: false }, files: { view: true, write: false } } },
+    })).status, 200);
+    assert.equal((await request(url, '/api/account', memberCookie)).status, 401);
+    const memberLogin = await request(url, '/api/session', null, {
+      method: 'POST', body: { username: 'newtester', password: 'reset123' },
+    });
+    memberCookie = memberLogin.response.headers.get('set-cookie').split(';')[0];
+    assert.equal((await request(url, '/api/cases', memberCookie)).status, 403);
+    assert.equal((await request(url, '/api/files', memberCookie)).status, 200);
+    assert.equal((await request(url, '/api/files', memberCookie, { method: 'POST', body: {} })).status, 403);
+    const users = await request(url, '/api/users', adminCookie);
+    assert.equal(JSON.stringify(users.body).includes('reset123'), false);
+    assert.equal(JSON.stringify(users.body).includes('password_encrypted'), false);
+    const db = new Database(path.join(dataDir, 'platform.db'));
+    const stored = db.prepare('SELECT * FROM users WHERE id = ?').get(memberId);
+    assert.notEqual(stored.password_encrypted, 'reset123');
+    assert.equal(decryptPassword(stored.password_encrypted, loadPasswordKey(dataDir, true)), 'reset123');
+    assert.equal(db.prepare('SELECT count(*) AS count FROM account_audit').get().count >= 4, true);
+    assert.equal(JSON.stringify(db.prepare('SELECT * FROM account_audit').all()).includes('reset123'), false);
+    db.prepare('UPDATE users SET password_encrypted = NULL WHERE id = ?').run(memberId);
+    db.close();
+    assert.deepEqual((await request(url, `/api/users/${memberId}/reveal-password`, adminCookie, {
+      method: 'POST', body: { currentPassword: 'AdminPassword123456' },
+    })).body, { available: false, password: null });
+    for (let i = 0; i < 10; i++) {
+      const result = await request(url, `/api/users/${memberId}/reveal-password`, adminCookie, {
+        method: 'POST', body: { currentPassword: 'wrong-password' },
+      });
+      if (i === 9) assert.equal(result.status, 429);
+    }
+    const key = loadPasswordKey(dataDir, true);
+    const encrypted = encryptPassword('roundtrip', key);
+    assert.equal(decryptPassword(encrypted, key), 'roundtrip');
+  } finally {
+    if (child) await new Promise((resolve) => { child.once('exit', resolve); child.kill(); });
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
 
 async function launch(dataDir, extraEnv = {}) {
   const child = spawn(process.execPath, [path.join(serverDir, 'index.js')], {
