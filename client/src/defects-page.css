@@ -1,0 +1,8 @@
+.select-col { width: 42px; text-align: center; }
+.select-col input { width: 16px; height: 16px; accent-color: var(--accent, #238b7d); cursor: pointer; }
+.record-selected { background: #eaf6f1; }
+.defect-bulk { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 12px 18px; background: #edf5f3; border-bottom: 1px solid #dce7e3; }
+.defect-bulk strong { font-size: 13px; margin-right: 8px; }
+.defect-bulk select, .defect-status-select { border: 1px solid #d5dfdc; border-radius: 4px; background: #fff; padding: 7px 9px; font: inherit; font-size: 12px; min-width: 104px; }
+.defect-delete-modal { max-width: 440px; }
+@media (max-width: 600px) { .defect-bulk { gap: 8px; padding: 12px; } }

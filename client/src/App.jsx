@@ -1,6 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { forgetLogin, readRememberedLogin, rememberLogin } from './remembered-login';
 import ProjectsPage, { ProjectContext, ProjectIcon } from './Projects';
+import CaseSetsPage from './CaseSetsPage';
+import DefectsPage from './DefectsPage';
+import AiDocuments from './AiDocuments';
 import {
   AlertCircle, ArrowDownToLine, ArrowUpRight, Bot, Bug, Check, Copy,
   ChevronDown, ChevronRight, CircleHelp, CloudUpload, Database,
@@ -179,77 +182,6 @@ function RecordDetail({ kind, record, onClose, onEdit, onDelete, canWrite }) {
   </div>;
 }
 
-function RecordPage({ kind, items, loading, onNew, onSelect, onRefresh, canWrite }) {
-  const isCase = kind === 'cases';
-  const [query, setQuery] = useState('');
-  const [module, setModule] = useState('全部模块');
-  const [status, setStatus] = useState('全部状态');
-  const [sort, setSort] = useState('latest');
-  const modules = useMemo(() => [...new Set(items.map((item) => item.module).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'zh-CN')), [items]);
-  const statuses = isCase ? ['未执行', '通过', '失败', '阻塞'] : ['待处理', '处理中', '待验证', '已解决', '已关闭'];
-  const visible = useMemo(() => items.filter((item) => {
-    const haystack = [item.title, item.module, item.assignee, item.version, ...(Array.isArray(item.tags) ? item.tags : [])].join(' ').toLowerCase();
-    return (!query || haystack.includes(query.toLowerCase())) && (module === '全部模块' || item.module === module) && (status === '全部状态' || item.status === status);
-  }).sort((a, b) => sort === 'title' ? String(a.title).localeCompare(String(b.title), 'zh-CN') : new Date(b.updatedAt || b.createdAt || 0) - new Date(a.updatedAt || a.createdAt || 0)), [items, query, module, status, sort]);
-  const heading = isCase ? '测试用例库' : '当前缺陷';
-  const description = isCase ? '维护团队共用的测试资产' : '跟踪问题处理与验证进度';
-  const openCount = items.filter((item) => isCase ? item.status === '未执行' : !['已解决', '已关闭'].includes(item.status)).length;
-  const criticalCount = items.filter((item) => isCase ? ['P0', 'P1'].includes(item.priority) : ['致命', '严重'].includes(item.severity)).length;
-  return <section className="workspace-section">
-    <div className="section-heading"><div><span className="eyebrow">{isCase ? 'CASE LIBRARY' : 'ISSUE TRACKER'}</span><h1>{heading}</h1><p>{description}</p></div><div className="heading-actions"><IconButton icon={RefreshCw} label="刷新" onClick={onRefresh} disabled={loading} />{canWrite && <button className="button primary" type="button" onClick={onNew}><Plus size={17} /> 新建{isCase ? '用例' : '缺陷'}</button>}</div></div>
-    <div className="summary-band"><div><span>记录总数</span><strong>{items.length}</strong></div><div><span>{isCase ? '待执行' : '未关闭'}</span><strong>{openCount}</strong></div><div><span>{isCase ? '高优先级' : '高严重度'}</span><strong>{criticalCount}</strong></div><div className="summary-note"><LayoutDashboard size={16} /><span>团队数据实时更新</span></div></div>
-    <div className="table-surface">
-      <div className="table-toolbar"><div className="search-box"><Search size={17} /><input aria-label={`搜索${heading}`} placeholder={isCase ? '搜索标题、模块或标签' : '搜索标题、模块、负责人'} value={query} onChange={(event) => setQuery(event.target.value)} /></div><div className="toolbar-filters"><span className="filter-icon"><Filter size={16} /></span><select aria-label="模块筛选" value={module} onChange={(event) => setModule(event.target.value)}><option>全部模块</option>{modules.map((value) => <option key={value}>{value}</option>)}</select><select aria-label="状态筛选" value={status} onChange={(event) => setStatus(event.target.value)}><option>全部状态</option>{statuses.map((value) => <option key={value}>{value}</option>)}</select><select aria-label="排序方式" value={sort} onChange={(event) => setSort(event.target.value)}><option value="latest">最近更新</option><option value="title">按标题</option></select></div></div>
-      <div className="table-caption">显示 {visible.length} / {items.length} 条</div>
-      {loading && items.length === 0 ? <div className="loading-state"><RefreshCw size={18} className="spin" /> 加载中…</div> : visible.length === 0
-        ? <Empty icon={isCase ? FileText : Bug} title={items.length ? '没有匹配的记录' : isCase ? '还没有测试用例' : '还没有缺陷记录'} detail={items.length ? '调整搜索或筛选条件后重试。' : '从团队的第一条记录开始。'} action={items.length || !canWrite ? null : <button className="button secondary" type="button" onClick={onNew}><Plus size={16} /> 新建{isCase ? '用例' : '缺陷'}</button>} />
-        : <div className="table-scroll"><table><thead><tr><th>{isCase ? '用例标题' : '缺陷标题'}</th><th>所属模块</th><th>{isCase ? '优先级' : '严重度'}</th><th>状态</th>{!isCase && <th>负责人</th>}<th>最近更新</th><th className="actions-col">操作</th></tr></thead><tbody>{visible.map((item) => <tr key={item.id} onClick={() => onSelect(item)} tabIndex={0} onKeyDown={(event) => { if (event.key === 'Enter') onSelect(item); }}><td><div className="record-title">{item.title}</div><div className="record-meta">#{String(item.id).slice(0, 8)}{isCase && Array.isArray(item.tags) && item.tags.length ? ` · ${item.tags.slice(0, 2).join(' · ')}` : ''}</div></td><td>{item.module || '—'}</td><td><Tone value={isCase ? item.priority : item.severity} /></td><td><Tone value={item.status} /></td>{!isCase && <td>{item.assignee || '未指派'}</td>}<td className="date-cell">{displayDate(item.updatedAt || item.createdAt)}</td><td className="actions-col"><IconButton icon={ChevronRight} label="查看详情" onClick={(event) => { event.stopPropagation(); onSelect(item); }} /></td></tr>)}</tbody></table></div>}
-    </div>
-  </section>;
-}
-
-function AiPage({ config, projects, onSave, onEdit, showError, canWrite, canSave }) {
-  const [requirements, setRequirements] = useState('');
-  const [module, setModule] = useState('');
-  const [count, setCount] = useState(5);
-  const [generating, setGenerating] = useState(false);
-  const [generated, setGenerated] = useState([]);
-  const [saved, setSaved] = useState(new Set());
-  const [saving, setSaving] = useState(-1);
-  const [expanded, setExpanded] = useState(0);
-  const [projectId, setProjectId] = useState('');
-  useEffect(() => { if (projectId && !projects.some((project) => project.id === projectId)) setProjectId(''); }, [projects, projectId]);
-  const configured = Boolean(config.aiConfigured) && canWrite;
-  async function generate(event) {
-    event.preventDefault();
-    setGenerating(true); setGenerated([]); setSaved(new Set());
-    try {
-      const result = await api('/api/ai/generate', { method: 'POST', body: JSON.stringify({ requirements: requirements.trim(), module: module.trim(), count: Number(count) }) });
-      setGenerated((result.cases || []).map((record) => prepareGenerated(record, module)));
-      setExpanded(0);
-    } catch (error) { showError(error.message); }
-    finally { setGenerating(false); }
-  }
-  async function save(index) {
-    const targetProjectId = projectId;
-    setSaving(index);
-    try { await onSave(generated[index], targetProjectId); setSaved((old) => new Set([...old, `${targetProjectId}:${index}`])); }
-    catch (error) { showError(error.message); }
-    finally { setSaving(-1); }
-  }
-  return <section className="workspace-section ai-section">
-    <div className="section-heading"><div><span className="eyebrow">AI ASSISTANT</span><h1>AI 用例生成</h1><p>从需求描述生成草稿，审核后保存到用例库</p></div><div className="heading-symbol"><Bot size={24} /></div></div>
-    <div className="ai-layout"><form className="generator-panel" onSubmit={generate}><div className="panel-title"><Sparkles size={19} /><h2>需求输入</h2></div>
-      {!configured && <div className="notice"><CircleHelp size={18} /><span>{canWrite ? 'AI 服务尚未配置，请联系平台管理员在服务器配置 API Key。' : '当前账号仅有查看权限，请联系管理员开放生成权限。'}</span></div>}
-      <label className="field"><span>功能需求 <em>*</em></span><textarea rows={11} placeholder="粘贴需求描述、规则或验收标准…" value={requirements} onChange={(event) => setRequirements(event.target.value)} required disabled={!configured || generating} /></label>
-      <div className="generator-row"><label className="field"><span>所属模块</span><input placeholder="例如：活动中心" value={module} onChange={(event) => setModule(event.target.value)} disabled={!configured || generating} /></label><label className="field count-field"><span>生成条数</span><input type="number" min="1" max="20" value={count} onChange={(event) => setCount(event.target.value)} disabled={!configured || generating} /></label></div>
-      <button className="button primary generate-button" type="submit" disabled={!configured || generating || saving !== -1 || !requirements.trim()}>{generating ? <><RefreshCw size={17} className="spin" /> 正在生成…</> : <><Sparkles size={17} /> 生成用例草稿</>}</button>
-    </form><div className="results-panel"><div className="results-head"><div><span className="eyebrow">REVIEW</span><h2>生成结果</h2></div><span>{generated.length} 条草稿</span></div>
-      {canSave && <label className="field ai-project-target"><span>保存到项目组 <em>*</em></span><select aria-label="保存到项目组" value={projectId} onChange={(event) => setProjectId(event.target.value)} disabled={saving !== -1}><option value="">请选择项目组</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label>}
-      {generated.length === 0 ? <Empty icon={Bot} title="等待生成结果" detail="生成后逐条检查，再决定是否保存到用例库。" /> : <div className="result-list">{generated.map((item, index) => <div className="result-item" key={`${index}-${item.title}`}><button type="button" className="result-toggle" onClick={() => setExpanded(expanded === index ? -1 : index)} aria-expanded={expanded === index}><span className="result-number">{String(index + 1).padStart(2, '0')}</span><span className="result-name">{item.title || '未命名用例'}</span>{expanded === index ? <ChevronDown size={18} /> : <ChevronRight size={18} />}</button>{expanded === index && <div className="result-detail"><div className="result-tags"><Tone value={item.priority || 'P2'} /><span>{item.module || module || '未分类'}</span></div><div><strong>前置条件</strong><p>{item.preconditions || '—'}</p></div><div><strong>操作步骤</strong><p>{item.steps || '—'}</p></div><div><strong>预期结果</strong><p>{item.expected || '—'}</p></div><div className="result-actions"><button type="button" className="button secondary" onClick={() => onEdit(item, projectId, index, (savedIndex) => setSaved((old) => new Set([...old, `${projectId}:${savedIndex}`])))} disabled={!canSave || !projectId || saved.has(`${projectId}:${index}`) || saving !== -1}>编辑并保存</button><button type="button" className="button primary" onClick={() => save(index)} disabled={!canSave || !projectId || saved.has(`${projectId}:${index}`) || saving !== -1}>{saved.has(`${projectId}:${index}`) ? <><Check size={16} /> 已保存</> : saving === index ? '保存中…' : '保存到用例库'}</button></div></div>}</div>)}</div>}
-    </div></div>
-  </section>;
-}
 
 function FilesPage({ files, loading, maxUploadMb, onUpload, onDelete, onRefresh, showError, canWrite }) {
   const inputRef = useRef(null);
@@ -481,10 +413,12 @@ export default function App() {
     finally { setLoginBusy(false); }
   }
   async function logout() {
+    if (!window.dispatchEvent(new Event('qzz-before-navigate', { cancelable: true }))) return;
     try { await api('/api/session', { method: 'DELETE' }); applyUser(null); }
     catch (failure) { setError(failure.message); }
   }
-  function navigate(next) { contextRef.current.active = next; changeProject(null); setActive(next); setMobileOpen(false); }
+  function navigate(next) { if (!window.dispatchEvent(new Event('qzz-before-navigate', { cancelable: true }))) return; contextRef.current.active = next; changeProject(null); setActive(next); setMobileOpen(false); }
+  function selectProject(projectId) { if (window.dispatchEvent(new Event('qzz-before-navigate', { cancelable: true }))) changeProject(projectId); }
   function openForm(kind, record = null, projectId = selectedProjectId, sourceIndex = null, onSaved = null) {
     if (!projectId || !projects.some((project) => project.id === projectId) || !permitted(user, kind, 'write')) return;
     setForm({ kind, record, projectId, sourceIndex, onSaved }); setDetail(null); setFormError('');
@@ -545,6 +479,17 @@ export default function App() {
     if (authEpoch.current === auth) { await loadData(); setToast('项目图标已更新'); }
     return result.project;
   }
+  async function deleteProject(project, confirmationName) {
+    const auth = authEpoch.current;
+    await api(`/api/projects/${encodeURIComponent(project.id)}`, { method: 'DELETE', body: JSON.stringify({ revision: project.revision, confirmationName }) });
+    if (authEpoch.current === auth) { await loadData(); setToast('项目组已删除，可在已删除项目组中恢复'); }
+  }
+  async function restoreProject(project) {
+    const auth = authEpoch.current;
+    await api(`/api/projects/${encodeURIComponent(project.id)}/restore`, { method: 'POST', body: JSON.stringify({ revision: project.revision }) });
+    if (authEpoch.current === auth) { await loadData(); setToast('项目组已恢复'); }
+  }
+  async function listArchivedProjects() { return (await api('/api/projects?archived=1')).projects; }
   async function upload(file) {
     const body = new FormData(); body.append('file', file);
     await api('/api/files', { method: 'POST', body }); setToast('文件已上传'); await loadData();
@@ -573,9 +518,9 @@ export default function App() {
       {error && <div className="global-error"><AlertCircle size={17} /><span>{error}</span><IconButton icon={X} label="关闭错误提示" onClick={() => setError('')} /></div>}
       <main className={`content ${canWrite ? '' : 'read-only-module'}`}>
         {!canView ? <Empty icon={ShieldCheck} title="暂未开放模块权限" detail="请联系管理员分配工作区权限。" action={<button className="button secondary" type="button" onClick={() => setPasswordOpen(true)}><KeyRound size={16} />修改我的密码</button>} />
-          : active === 'cases' || active === 'defects' ? selectedProject ? <><ProjectContext project={selectedProject} onBack={() => changeProject(null)} /><RecordPage canWrite={canWrite} key={`${active}-${selectedProject.id}`} kind={active} items={active === 'cases' ? cases : defects} loading={loading} onNew={() => canWrite && openForm(active)} onSelect={(record) => setDetail({ kind: active, id: record.id })} onRefresh={loadData} /></>
-            : <ProjectsPage key={active} kind={active} projects={projects} loading={loading} canManage={user.role === 'admin'} onSelect={(project) => changeProject(project.id)} onRefresh={loadData} onCreate={createProject} onRename={renameProject} onUpload={uploadProjectIcon} />
-          : active === 'ai' ? <AiPage canWrite={canWrite} canSave={permitted(user, 'cases', 'write')} config={config} projects={projects} onSave={saveGenerated} onEdit={(record, projectId, index, onSaved) => permitted(user, 'cases', 'write') && openForm('cases', record, projectId, index, onSaved)} showError={setError} />
+          : active === 'cases' || active === 'defects' ? selectedProject ? <><ProjectContext project={selectedProject} onBack={() => selectProject(null)} />{active === 'cases' ? <CaseSetsPage key={`cases-${selectedProject.id}`} project={selectedProject} items={cases} loading={loading} canWrite={canWrite} onRefresh={loadData} showError={setError} onNotice={setToast} /> : <DefectsPage key={`defects-${selectedProject.id}`} project={selectedProject} items={defects} loading={loading} canWrite={canWrite} onNew={() => canWrite && openForm('defects')} onSelect={(record) => setDetail({ kind: 'defects', id: record.id })} onRefresh={loadData} showError={setError} onNotice={setToast} />}</>
+            : <ProjectsPage key={active} kind={active} projects={projects} loading={loading} canManage={user.role === 'admin'} onSelect={(project) => selectProject(project.id)} onRefresh={loadData} onCreate={createProject} onRename={renameProject} onUpload={uploadProjectIcon} onDelete={deleteProject} onRestore={restoreProject} onListArchived={listArchivedProjects} />
+          : active === 'ai' ? <AiDocuments key={`ai-${user.id}`} isAdmin={user.role === 'admin'} canWrite={canWrite} canSave={permitted(user, 'cases', 'write')} config={config} projects={projects} onRefresh={loadData} showError={setError} onNotice={setToast} />
             : <FilesPage canWrite={canWrite} files={files} loading={loading} maxUploadMb={config.maxUploadMb} onUpload={upload} onDelete={deleteFile} onRefresh={loadData} showError={setError} />}
       </main>
       {toast && <div className="toast" role="status"><Check size={17} />{toast}</div>}

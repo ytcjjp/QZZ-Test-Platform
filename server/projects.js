@@ -12,6 +12,7 @@ export function initializeProjects(db, dataDir) {
       id TEXT PRIMARY KEY, name TEXT NOT NULL, name_key TEXT NOT NULL UNIQUE,
       icon_file TEXT, revision INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     )`);
+    if (!db.prepare('PRAGMA table_info(projects)').all().some((column) => column.name === 'deleted_at')) db.exec('ALTER TABLE projects ADD COLUMN deleted_at TEXT');
     for (const table of ['cases', 'defects']) {
       if (!db.prepare(`PRAGMA table_info(${table})`).all().some((column) => column.name === 'project_id')) {
         db.exec(`ALTER TABLE ${table} ADD COLUMN project_id TEXT REFERENCES projects(id)`);
@@ -21,7 +22,7 @@ export function initializeProjects(db, dataDir) {
     if (!defaultProject) {
       const id = crypto.randomUUID();
       const now = new Date().toISOString();
-      db.prepare('INSERT INTO projects VALUES (?, ?, ?, NULL, 1, ?, ?)')
+      db.prepare('INSERT INTO projects (id, name, name_key, icon_file, revision, created_at, updated_at) VALUES (?, ?, ?, NULL, 1, ?, ?)')
         .run(id, '默认项目组', '默认项目组', now, now);
       defaultProject = { id };
     }
@@ -41,7 +42,7 @@ export function createProjectService({ db, iconDir, sendError, inputError, authe
     return {
       id: row.id, name: row.name,
       iconUrl: row.icon_file ? `/api/projects/${row.id}/icon?v=${row.revision}` : null,
-      revision: row.revision, createdAt: row.created_at, updatedAt: row.updated_at,
+      revision: row.revision, createdAt: row.created_at, updatedAt: row.updated_at, deletedAt: row.deleted_at,
       caseCount: user.permissions.cases.view ? db.prepare('SELECT count(*) AS count FROM cases WHERE project_id = ?').get(row.id).count : null,
       defectCount: user.permissions.defects.view ? db.prepare('SELECT count(*) AS count FROM defects WHERE project_id = ?').get(row.id).count : null,
     };
@@ -50,7 +51,7 @@ export function createProjectService({ db, iconDir, sendError, inputError, authe
   function requireProject(value) {
     if (typeof value !== 'string' || !value || value.length > 100) throw inputError('请先选择项目组');
     const project = getProject.get(value);
-    if (!project) throw inputError('项目组不存在，请重新选择');
+    if (!project || project.deleted_at) throw inputError('项目组不存在或已删除，请重新选择');
     return project.id;
   }
 
@@ -77,17 +78,19 @@ export function createProjectService({ db, iconDir, sendError, inputError, authe
 
   function register(app, requireAdmin, broadcast) {
     app.get('/api/projects', requireView, (req, res) => {
-      res.json({ projects: db.prepare('SELECT * FROM projects ORDER BY created_at, id').all().map((row) => mapProject(row, req.user)) });
+      const archived = req.query.archived === '1';
+      if (archived && req.user.role !== 'admin') return sendError(res, 403, 'forbidden', '仅管理员可查看已删除项目组');
+      res.json({ projects: db.prepare(`SELECT * FROM projects WHERE deleted_at IS ${archived ? 'NOT ' : ''}NULL ORDER BY created_at, id`).all().map((row) => mapProject(row, req.user)) });
     });
 
     app.post('/api/projects', requireAdmin, (req, res) => {
       const value = nameValue(req.body?.name);
       if (db.prepare('SELECT 1 FROM projects WHERE name_key = ?').get(value.key)) {
-        return sendError(res, 409, 'duplicate', '项目组名称已存在');
+        return sendError(res, 409, 'duplicate', '项目组名称已存在，请检查已删除项目组并恢复');
       }
       const id = crypto.randomUUID();
       const now = new Date().toISOString();
-      db.prepare('INSERT INTO projects VALUES (?, ?, ?, NULL, 1, ?, ?)').run(id, value.name, value.key, now, now);
+      db.prepare('INSERT INTO projects (id, name, name_key, icon_file, revision, created_at, updated_at) VALUES (?, ?, ?, NULL, 1, ?, ?)').run(id, value.name, value.key, now, now);
       const project = mapProject(getProject.get(id), req.user);
       broadcast('project.created', { project });
       res.status(201).json({ project });
@@ -95,7 +98,7 @@ export function createProjectService({ db, iconDir, sendError, inputError, authe
 
     app.put('/api/projects/:id', requireAdmin, (req, res) => {
       const current = getProject.get(req.params.id);
-      if (!current) return sendError(res, 404, 'not_found', '项目组不存在');
+      if (!current || current.deleted_at) return sendError(res, 404, 'not_found', '项目组不存在或已删除');
       const revision = revisionValue(req.body?.revision);
       if (revision !== current.revision) return conflict(res, current, req.user);
       const value = nameValue(req.body?.name);
@@ -107,6 +110,33 @@ export function createProjectService({ db, iconDir, sendError, inputError, authe
       if (!result.changes) return conflict(res, getProject.get(current.id), req.user);
       const project = mapProject(getProject.get(current.id), req.user);
       broadcast('project.updated', { project });
+      res.json({ project });
+    });
+
+    app.delete('/api/projects/:id', requireAdmin, (req, res) => {
+      const current = getProject.get(req.params.id);
+      if (!current || current.deleted_at) return sendError(res, 404, 'not_found', '项目组不存在或已删除');
+      const revision = revisionValue(req.body?.revision);
+      if (revision !== current.revision) return conflict(res, current, req.user);
+      if (req.body?.confirmationName !== current.name) throw inputError('请输入完整项目组名称以确认删除');
+      const now = new Date().toISOString();
+      const result = db.prepare('UPDATE projects SET deleted_at = ?, updated_at = ?, revision = revision + 1 WHERE id = ? AND revision = ? AND deleted_at IS NULL').run(now, now, current.id, revision);
+      if (!result.changes) return conflict(res, getProject.get(current.id), req.user);
+      const project = mapProject(getProject.get(current.id), req.user);
+      broadcast('project.deleted', { project });
+      res.json({ project });
+    });
+
+    app.post('/api/projects/:id/restore', requireAdmin, (req, res) => {
+      const current = getProject.get(req.params.id);
+      if (!current) return sendError(res, 404, 'not_found', '项目组不存在');
+      const revision = revisionValue(req.body?.revision);
+      if (revision !== current.revision) return conflict(res, current, req.user);
+      if (!current.deleted_at) throw inputError('此项目组未被删除');
+      const result = db.prepare('UPDATE projects SET deleted_at = NULL, updated_at = ?, revision = revision + 1 WHERE id = ? AND revision = ? AND deleted_at IS NOT NULL').run(new Date().toISOString(), current.id, revision);
+      if (!result.changes) return conflict(res, getProject.get(current.id), req.user);
+      const project = mapProject(getProject.get(current.id), req.user);
+      broadcast('project.restored', { project });
       res.json({ project });
     });
 
@@ -122,7 +152,7 @@ export function createProjectService({ db, iconDir, sendError, inputError, authe
       });
     }, async (req, res) => {
       const current = getProject.get(req.params.id);
-      if (!current) return sendError(res, 404, 'not_found', '项目组不存在');
+      if (!current || current.deleted_at) return sendError(res, 404, 'not_found', '项目组不存在或已删除');
       const revision = revisionValue(typeof req.body?.revision === 'string' && /^[1-9]\d*$/.test(req.body.revision) ? Number(req.body.revision) : null);
       if (revision !== current.revision) return conflict(res, current, req.user);
       if (!req.file) throw inputError('请选择项目图标');
@@ -167,7 +197,7 @@ export function createProjectService({ db, iconDir, sendError, inputError, authe
 
     app.get('/api/projects/:id/icon', requireView, (req, res, next) => {
       const project = getProject.get(req.params.id);
-      if (!project?.icon_file) return sendError(res, 404, 'not_found', '项目图标不存在');
+      if (!project?.icon_file || project.deleted_at) return sendError(res, 404, 'not_found', '项目图标不存在');
       res.set('X-Content-Type-Options', 'nosniff');
       res.type('image/webp');
       res.sendFile(path.join(iconDir, project.icon_file), (error) => { if (error && !res.headersSent) next(error); });

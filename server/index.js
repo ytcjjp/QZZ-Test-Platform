@@ -8,6 +8,8 @@ import express from 'express';
 import multer from 'multer';
 import { WebSocketServer } from 'ws';
 import { initializeProjects, createProjectService } from './projects.js';
+import { initializeCaseSets, caseTree, registerCaseSetRoutes } from './case-sets.js';
+import { registerAiRoutes } from './ai-documents.js';
 import { hashPassword, verifyPassword, loadPasswordKey,
   encryptPassword as encryptWithKey, decryptPassword as decryptWithKey } from './passwords.js';
 
@@ -65,6 +67,7 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS files_created_idx ON files(created_at DESC);
 `);
 const projectIconDir = initializeProjects(db, dataDir);
+initializeCaseSets(db);
 
 const userColumns = db.prepare('PRAGMA table_info(users)').all().map((column) => column.name);
 for (const [name, definition] of Object.entries({
@@ -137,7 +140,7 @@ if (db.prepare('SELECT count(*) AS count FROM users').get().count === 0) {
 const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', trustProxy ? 'loopback' : false);
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '4mb' }));
 app.use('/api', (req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
 
 function sendError(res, status, error, message) {
@@ -400,7 +403,7 @@ app.use('/api', (req, res, next) => {
   const module = req.path.split('/')[1];
   if (!permissionModules.includes(module) || req.user.role === 'admin') return next();
   const permission = req.user.permissions[module];
-  const operation = req.method === 'GET' ? 'view' : 'write';
+  const operation = req.method === 'GET' || (req.method === 'POST' && req.path === '/cases/export') ? 'view' : 'write';
   if (!permission[operation]) return sendError(res, 403, 'forbidden', '没有此模块的操作权限');
   next();
 });
@@ -437,6 +440,7 @@ function normalizeCase(body, previous = {}) {
     tags: [...new Set(tags.map((tag) => tag.trim()))],
   };
   if (!result.title) throw new InputError('请输入用例标题');
+  result.tree = caseTree(source, previous, result, (message) => new InputError(message));
   return result;
 }
 
@@ -444,7 +448,7 @@ function mapCase(row) {
   return {
     id: row.id, projectId: row.project_id, title: row.title, module: row.module, priority: row.priority,
     status: row.status, preconditions: row.preconditions, steps: row.steps,
-    expected: row.expected, notes: row.notes, tags: JSON.parse(row.tags),
+    expected: row.expected, notes: row.notes, tags: JSON.parse(row.tags), tree: JSON.parse(row.tree),
     revision: row.revision, createdBy: row.creator_name, createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -465,9 +469,9 @@ app.post('/api/cases', (req, res) => {
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
   db.prepare(`INSERT INTO cases (id, title, module, priority, status, preconditions, steps, expected, notes, tags,
-    revision, created_by, created_at, updated_at, project_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`)
+    revision, created_by, created_at, updated_at, project_id, tree) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`)
     .run(id, value.title, value.module, value.priority, value.status, value.preconditions,
-      value.steps, value.expected, value.notes, JSON.stringify(value.tags), req.user.id, now, now, projectId);
+      value.steps, value.expected, value.notes, JSON.stringify(value.tags), req.user.id, now, now, projectId, JSON.stringify(value.tree));
   const record = mapCase(getCase.get(id));
   broadcast('case.created', { case: record, projectId });
   res.status(201).json({ case: record });
@@ -483,9 +487,9 @@ app.put('/api/cases/:id', (req, res) => {
   }
   const value = normalizeCase(req.body, mapCase(current));
   const result = db.prepare(`UPDATE cases SET title=?, module=?, priority=?, status=?, preconditions=?,
-    steps=?, expected=?, notes=?, tags=?, revision=revision+1, updated_at=?
+    steps=?, expected=?, notes=?, tags=?, tree=?, revision=revision+1, updated_at=?
     WHERE id=? AND revision=?`).run(value.title, value.module, value.priority, value.status,
-      value.preconditions, value.steps, value.expected, value.notes, JSON.stringify(value.tags),
+      value.preconditions, value.steps, value.expected, value.notes, JSON.stringify(value.tags), JSON.stringify(value.tree),
       new Date().toISOString(), current.id, revision);
   if (!result.changes) return res.status(409).json({ error: 'conflict', message: '用例已被其他人修改', case: mapCase(getCase.get(current.id)) });
   const record = mapCase(getCase.get(current.id));
@@ -667,47 +671,8 @@ app.delete('/api/files/:id', (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/ai/generate', async (req, res) => {
-  if (!process.env.AI_API_KEY || !process.env.AI_MODEL) {
-    return sendError(res, 503, 'ai_not_configured', 'AI 服务尚未配置，请联系管理员');
-  }
-  const requirements = readString(req.body?.requirements, 'requirements', 12000);
-  const module = readString(req.body?.module, 'module', 100);
-  const count = req.body?.count === undefined ? 5 : req.body.count;
-  if (!requirements || !Number.isSafeInteger(count) || count < 1 || count > 20) {
-    return sendError(res, 400, 'invalid_input', '请填写需求描述，生成数量须为 1-20');
-  }
-  try {
-    const baseUrl = new URL(process.env.AI_BASE_URL || 'https://api.openai.com/v1/');
-    if (!['https:', 'http:'].includes(baseUrl.protocol)) throw new Error('Invalid AI_BASE_URL');
-    const apiUrl = new URL('chat/completions', `${baseUrl.href.replace(/\/$/, '')}/`);
-    const response = await fetch(apiUrl, {
-      method: 'POST',
-      headers: { authorization: `Bearer ${process.env.AI_API_KEY}`, 'content-type': 'application/json' },
-      body: JSON.stringify({
-        model: process.env.AI_MODEL,
-        messages: [
-          { role: 'system', content: '你是游戏测试用例编写助手。仅输出 JSON 对象，格式为 {"cases":[{"title":"","module":"","priority":"medium","preconditions":"","steps":"","expected":"","notes":"","tags":[]}]}。每条需有明确的步骤和预期；不要编造未给出的业务规则，必要时在 notes 标注待确认。不要输出 Markdown。' },
-          { role: 'user', content: `模块：${module || '未指定'}\n生成数量：${count}\n需求：\n${requirements}` },
-        ],
-        temperature: 0.3,
-      }),
-      signal: AbortSignal.timeout(60000),
-    });
-    if (!response.ok) throw new Error(`AI HTTP ${response.status}`);
-    const payload = await response.json();
-    const content = payload.choices?.[0]?.message?.content;
-    const parsed = JSON.parse(content);
-    if (!Array.isArray(parsed.cases) || parsed.cases.length < 1 || parsed.cases.length > count) {
-      throw new Error('Invalid AI cases');
-    }
-    const cases = parsed.cases.map((item) => normalizeCase({ ...item, module: item.module || module }));
-    res.json({ cases });
-  } catch (error) {
-    console.error('AI generation failed:', error);
-    sendError(res, 502, 'ai_failed', 'AI 服务暂时不可用，请稍后重试');
-  }
-});
+registerCaseSetRoutes(app, { db, projects, sendError, inputError: (message) => new InputError(message), readRevision, mapCase, mapDefect, getCase, getDefect, broadcast });
+registerAiRoutes(app, { db, dataDir, sendError, inputError: (message) => new InputError(message), authenticate: userFromRequest, requireProject: projects.requireProject });
 
 app.use('/api', (req, res) => sendError(res, 404, 'not_found', '接口不存在'));
 
@@ -727,6 +692,7 @@ app.use((error, req, res, next) => {
       'upload_error', error.code === 'LIMIT_FILE_SIZE' ? `文件不能超过 ${maxUploadMb} MB` : '文件上传失败');
   }
   if (error instanceof SyntaxError && 'body' in error) return sendError(res, 400, 'invalid_json', '请求内容不是有效的 JSON');
+  if (error.type === 'entity.too.large') return sendError(res, 413, 'too_large', '请求内容超过 4 MB，请缩小思维导图后重试');
   console.error(error);
   sendError(res, 500, 'internal_error', '服务器发生错误');
 });

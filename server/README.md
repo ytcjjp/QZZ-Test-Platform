@@ -48,6 +48,7 @@
 
 - `GET /api/projects`：有用例库或缺陷查看权限时返回 `{projects}`；项目包含 `id`、`name`、`iconUrl`、`revision`、`caseCount`、`defectCount` 和创建、更新时间。无对应模块查看权限的计数为 `null`。
 - `POST /api/projects`：管理员添加共享项目组，请求 `{name}`；`PUT /api/projects/:id` 接收 `{name,revision}` 重命名。
+- `DELETE /api/projects/:id`：管理员传 `{revision,confirmationName}`，名称必须完全匹配。采用软删除，记录和图标保留，已删除项目无法继续访问用例、缺陷或图标。`GET /api/projects?archived=1` 仅管理员可查看已删除项目，`POST /api/projects/:id/restore` 传 `{revision}` 恢复；所有项目均删除后重启不会新建默认组。项目返回 `deletedAt`，删除及恢复都会增加修订号。
 - 名称去掉两端空格后为 1-60 位，不接受控制字符；名称重复（忽略大小写）返回 409。项目 ID 不随名称变化。
 - `POST /api/projects/:id/icon`：管理员上传 multipart 字段 `file`、`revision`。只接受有效 PNG、JPG、WebP、GIF，最大 2 MB、1600 万像素；服务端解码并转为最大 256×256 WebP。SVG、伪造或损坏图片返回 400，超限返回 413。替换后清理旧图标。
 - `GET /api/projects/:id/icon`：登录且有用例库或缺陷查看权限后才能访问，返回图像及 `nosniff` 头。`iconUrl` 自带修订版本参数。
@@ -60,12 +61,41 @@
 创建一个默认组，但网页不会代替用户自动选择；进入用例或缺陷模块前需手动选组。
 AI 生成草稿无需项目，保存进用例库时必须选择所属项目。
 
+用例集、思维导图及批量 API：
+
+- `/api/cases` 的一条记录现在代表一个用例集，保留原有字段，并新增 `tree`：`{id,title,children:[...]}`。`POST` 仅传 `{projectId,title}` 即创建只有中心主题的空白导图；`PUT /api/cases/:id` 传 `{projectId,revision,title?,tree?}` 保存，修订冲突返回 409。旧用例在迁移中转成包含模块、优先级、状态、前置条件、步骤、预期、标签和备注的导图，原字段、ID、修订和时间均保留。
+- 节点 ID 只接受 1-100 位字母、数字、下划线或连字符，单图不允许重复。导图上限为 5000 节点、64 层、50 万字符，单节点 3 万字符；JSON 请求上限 4 MB。
+- `POST /api/cases/import`：multipart 字段 `projectId`、`file`，支持 UTF-8 `.md/.markdown` 和 `.xmind`，返回 `{cases}`。多个一级标题或 XMind 多画布导入为多个用例集；导入一次最多 100 个用例集。XMind 支持现代 `content.json` 和旧版 `content.xml`，读取主题文本和层级，不导入原应用的主题样式、画布坐标、图片附件等。文件上限 10 MB；Markdown 文字上限 2 MB，归档目录和解压内容另有上限。
+- `POST /api/cases/export`：JSON `{projectId,items:[{id,revision}],format:"md"|"xmind"}`，有用例查看权限即可导出。单个 Markdown 返回 `.md`，多个返回包含独立 `.md` 的 ZIP；XMind 返回真实的多画布 `.xmind` ZIP。一次导出最多 1000 个用例集、8 MB UTF-8 导图内容；XMind 另限 100 个画布，含格式结构的 `content.json` 也不能超过 8 MB，以保证可重新导入。超限返回 413 并提示分批；单个 Markdown 转义后的文字也须符合 2 MB 限制。失效修订拒绝导出。
+- `POST /api/cases/batch`：`{projectId,items:[{id,revision}],action:"delete"}`。
+- `POST /api/defects/batch`：同上，支持 `action:"delete"` 或 `action:"status",status:"待处理"|"处理中"|"待验证"|"已解决"|"已关闭"`。单条列表状态修改同样使用此接口，`items` 只有一条。
+- 批量操作须有相应模块写权限，最多 1000 条，不接受重复 ID。先校验全部项目归属和修订，再在事务内整体提交；任一条过期返回 409、跨项目或不存在返回 404，不会部分成功。成功返回 `{ok:true,count}`，逐记录发送原有实时事件。记录删除不可恢复，网页需要用户确认；项目组删除则可从已删除项目恢复。
+
 AI 用例生成默认关闭。配置 `AI_API_KEY`、`AI_MODEL`，以及可选的
 `AI_BASE_URL`（默认为 `https://api.openai.com/v1`）后，
 `POST /api/ai/generate` 才会请求兼容 Chat Completions 的服务。
-请求体为 `{"requirements":"需求描述","count":5,"module":"模块"}`。
-未配置时返回 503，不会伪装生成结果。上传上限默认 100 MB，
-可用 `MAX_UPLOAD_MB` 调整。
+入口仅接收策划文档，不再接受手写 `requirements`。`POST /api/ai/documents`
+上传 multipart `file`（Word `.doc/.docx`、PDF、Markdown、TXT），或 JSON `{url}`
+导入飞书 / Lark 的 `docx/docs/wiki` 地址，返回 `{document:{id,name,text,chars}}`。
+每份文档最多 20 MB、10 万字符，PDF 最多 300 页；扫描版 PDF 无 OCR，
+无可读文字时明确拒绝，不会用空文档生成。暂存文档按账号隔离、24 小时过期，
+可用 `DELETE /api/ai/documents/:id` 移除。文件只用于提取，原二进制不持久保存。
+
+`POST /api/ai/generate` 的请求体为 `{documentIds:[...],title?,clarifications?,confirmed?}`，
+返回 `{title,tree,questions}`。服务加载版本化的 `server/skills/game-prd-testcases.md`，
+按主流程、UI、异常与边界、受影响模块组织导图，每条用例需有前置条件、执行步骤、
+预期结果。规则不清时先返回待确认问题，补充回答后重新生成；也可选择仅覆盖已确认规则。
+文档正文作为待分析资料发送，不作为系统指令；生成结果不会自动入库，需要选择项目组并保存。
+未配置 AI 时返回 503，不会伪装生成结果。
+
+飞书须由管理员在网页配置 `appId`、`appSecret`，或设置环境变量
+`FEISHU_APP_ID`、`FEISHU_APP_SECRET`，并在飞书为应用开通相应文档读取权限、
+授权访问文档。网页 API 为 `GET/PUT /api/ai/feishu-config`，`appSecret` 不返回；
+本地配置 `data/feishu-config.json` 中的密钥使用原有 `password-key` 加密。
+服务仅请求固定的飞书 / Lark 官方 API 域名，不直接抓取任意传入地址。
+缺少授权会提示下载 Word/PDF 后导入。
+
+工具云盘上传上限默认 100 MB，可用 `MAX_UPLOAD_MB` 调整；此设置不改变上述导入限制。
 
 WebSocket 地址是同源 `/api/events`，会在项目组、用例、缺陷和文件变更时
 广播相应的 `project.*`、`case.*`、`defect.*`、`file.*` 事件。用例和缺陷事件包含
