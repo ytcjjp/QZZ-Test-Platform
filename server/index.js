@@ -8,6 +8,7 @@ import express from 'express';
 import multer from 'multer';
 import { WebSocketServer } from 'ws';
 import { initializeProjects, createProjectService } from './projects.js';
+import { loadAiProvider, publicAiProvider } from './ai-provider.js';
 import { initializeCaseSets, caseTree, registerCaseSetRoutes } from './case-sets.js';
 import { registerAiRoutes } from './ai-documents.js';
 import { hashPassword, verifyPassword, loadPasswordKey,
@@ -307,7 +308,8 @@ app.delete('/api/session', requireAuth, (req, res) => {
 app.use('/api', requireAuth);
 
 app.get('/api/config', (req, res) => {
-  res.json({ aiConfigured: Boolean(process.env.AI_API_KEY && process.env.AI_MODEL), maxUploadMb });
+  try { res.json({ ...publicAiProvider(loadAiProvider(dataDir)), maxUploadMb }); }
+  catch { res.json({ aiConfigured: false, aiConfigError: '本机 AI 配置无法读取，请联系管理员检查配置', maxUploadMb }); }
 });
 
 app.get('/api/users', requireAdmin, (req, res) => {

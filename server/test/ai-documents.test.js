@@ -8,6 +8,7 @@ import Database from 'better-sqlite3';
 import express from 'express';
 import { strToU8, zipSync } from 'fflate';
 import { documentName, extractDocument, generateDocumentCases, normalizeAiResult, parseFeishuUrl, readFeishuDocument, registerAiRoutes } from '../ai-documents.js';
+import { saveAiProvider } from '../ai-provider.js';
 
 function fakeDocx(text) {
   return Buffer.from(zipSync({
@@ -116,6 +117,76 @@ test('AI generation loads the actual skill, keeps open questions outside the tre
   await assert.rejects(generateDocumentCases(sources, { env: {} }), /尚未配置/);
 });
 
+test('Responses providers use reasoning without legacy temperature and extract assistant output text', async () => {
+  let sent;
+  const provider = { mode: 'api', wireApi: 'responses', baseUrl: 'https://gateway.example/v1/', apiKey: 'fixture-key', model: 'gpt-6.1-sol', reasoningEffort: 'ultra' };
+  const result = await generateDocumentCases([{ name: '活动.md', text: '点击领取奖励后道具进入背包。' }], {
+    provider,
+    request: async (url, options) => {
+      assert.equal(String(url), 'https://gateway.example/v1/responses');
+      assert.equal(options.headers.authorization, 'Bearer fixture-key');
+      sent = JSON.parse(options.body);
+      return Response.json({ status: 'completed', output: [
+        { type: 'reasoning', summary: [] },
+        { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: JSON.stringify(generated()) }] },
+      ] });
+    },
+  });
+  assert.equal(sent.model, provider.model);
+  assert.deepEqual(sent.reasoning, { effort: 'ultra' });
+  assert.equal(sent.store, false);
+  assert.equal(Object.hasOwn(sent, 'temperature'), false);
+  assert.equal(Object.hasOwn(sent, 'messages'), false);
+  assert.match(sent.instructions, /Never invent unlock conditions/);
+  assert.match(sent.instructions, /API 模式未连接游戏工程/);
+  assert.equal(JSON.parse(sent.input).documents[0].name, '活动.md');
+  assert.equal(result.tree.children[0].title, '主流程');
+});
+
+test('Codex providers receive the actual skill and project context, then share draft validation and clarification blocking', async () => {
+  const signal = new AbortController().signal;
+  const provider = { mode: 'codex', apiKey: 'fixture-key', model: 'gpt-6.1-sol', reasoningEffort: 'ultra', projectRoot: path.resolve('D:/merge_happy.git'), dataDir: 'test-data' };
+  const documents = [{ name: '活动.md', text: '点击领取奖励后道具进入背包。' }];
+  const result = await generateDocumentCases(documents, {
+    provider, signal, clarifications: '奖励只验证成功路径。',
+    codexRunner: async (sources, options) => {
+      assert.deepEqual(sources, documents);
+      assert.equal(options.config, provider);
+      assert.equal(options.signal, signal);
+      assert.equal(options.clarifications, '奖励只验证成功路径。');
+      assert.match(options.skill, /Never invent unlock conditions/);
+      assert.match(options.skill, /只分析本次提供的策划文档和源码证据/);
+      assert.match(options.skill, /不得再调用工具查找或读取文件/);
+      assert.match(options.skill, /"branches"/);
+      return generated(['过期规则需要确认？']);
+    },
+  });
+  assert.deepEqual(result.questions, ['过期规则需要确认？']);
+  assert.equal(result.tree, null);
+  const invalid = generated(); delete invalid.branches[0].cases[0].steps;
+  await assert.rejects(generateDocumentCases(documents, { provider, codexRunner: async () => invalid }), /执行步骤/);
+});
+
+test('provider failures identify authentication, endpoint, model and timeout errors without leaking upstream content', async () => {
+  const documents = [{ name: '活动.md', text: '奖励领取后进入背包。' }];
+  const provider = { mode: 'api', wireApi: 'responses', baseUrl: 'https://gateway.example/v1/', apiKey: 'private-test-key', model: 'gpt-6.1-sol' };
+  for (const [status, payload, expected] of [
+    [401, { error: { message: 'private-test-key rejected with uploaded private text' } }, /认证失败/],
+    [404, { error: { code: 'model_not_found', message: 'private-test-key' } }, /模型不存在/],
+    [404, { error: { code: 'not_found' } }, /接口不匹配/],
+    [400, { error: { message: 'Use Responses instead of unsupported legacy chat/completions' } }, /接口不匹配/],
+    [504, { error: { message: 'private-test-key timed out' } }, /超时/],
+  ]) {
+    await assert.rejects(generateDocumentCases(documents, { provider, request: async () => Response.json(payload, { status }) }), (error) => {
+      assert.match(error.message, expected); assert.equal(error.message.includes('private-test-key'), false); assert.equal(error.message.includes('uploaded private text'), false); return true;
+    });
+  }
+  await assert.rejects(generateDocumentCases(documents, { provider, request: async () => { throw new DOMException('timeout', 'TimeoutError'); } }), /超时/);
+  await assert.rejects(generateDocumentCases(documents, { provider, request: async () => { throw new Error('network private-test-key'); } }), /无法连接/);
+  const canceled = new AbortController(); canceled.abort();
+  await assert.rejects(generateDocumentCases(documents, { provider, signal: canceled.signal, request: async () => { throw new Error('must not run'); } }), (error) => error.name === 'AbortError');
+});
+
 test('document routes isolate users, deny raw requirements, and keep admin Feishu secrets encrypted and out of responses', async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'qzz-ai-documents-'));
   const db = new Database(':memory:');
@@ -126,9 +197,11 @@ test('document routes isolate users, deny raw requirements, and keep admin Feish
     two: { id: 'two', role: 'member', permissions: { ai: { view: true, write: true } } },
   };
   app.use((req, res, next) => { req.user = users[req.headers['x-user'] || 'one']; next(); });
+  let generateStub;
   registerAiRoutes(app, {
     db, dataDir: directory, authenticate: (req) => users[req.headers['x-user'] || 'one'],
     inputError: (message) => new Error(message), sendError: (res, status, error, message) => res.status(status).json({ error, message }),
+    generateCases: (sources, options) => generateStub ? generateStub(sources, options) : generateDocumentCases(sources, options),
   });
   app.use((error, req, res, next) => res.status(400).json({ message: error.message }));
   const server = http.createServer(app); await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -177,6 +250,38 @@ test('document routes isolate users, deny raw requirements, and keep admin Feish
     assert.equal(other.status, 404);
     const oldInput = await fetch(base + '/api/ai/generate', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ documentIds: [document.id], requirements: 'manual input' }) });
     assert.equal(oldInput.status, 400);
+    saveAiProvider(directory, { mode: 'codex', apiKey: 'saved-local-key', model: 'saved-local-model', reasoningEffort: 'ultra', projectRoot: directory });
+    let started; let interrupted;
+    const generationStarted = new Promise((resolve) => { started = resolve; });
+    const generationInterrupted = new Promise((resolve) => { interrupted = resolve; });
+    let jobs = 0;
+    generateStub = (sources, options) => {
+      assert.equal(options.provider.apiKey, 'saved-local-key');
+      assert.equal(options.provider.model, 'saved-local-model');
+      assert.equal(options.provider.mode, 'codex');
+      assert.equal(options.provider.projectRoot, directory);
+      assert.match(sources[0].text, /进入背包/);
+      jobs += 1;
+      if (jobs > 1) return normalizeAiResult(generated());
+      return new Promise((resolve, reject) => {
+        options.signal.addEventListener('abort', () => { reject(new DOMException('client closed', 'AbortError')); interrupted(); }, { once: true });
+        started();
+      });
+    };
+    const generationBody = JSON.stringify({ documentIds: [document.id] });
+    const generationController = new AbortController();
+    const pendingGeneration = fetch(base + '/api/ai/generate', { method: 'POST', headers: { 'content-type': 'application/json' }, body: generationBody, signal: generationController.signal });
+    const canceledGeneration = assert.rejects(pendingGeneration, (error) => error.name === 'AbortError');
+    await generationStarted;
+    const duplicateGeneration = await fetch(base + '/api/ai/generate', { method: 'POST', headers: { 'content-type': 'application/json' }, body: generationBody });
+    assert.equal(duplicateGeneration.status, 429); await duplicateGeneration.json();
+    generationController.abort();
+    await canceledGeneration;
+    await generationInterrupted;
+    await new Promise((resolve) => setImmediate(resolve));
+    const retriedGeneration = await fetch(base + '/api/ai/generate', { method: 'POST', headers: { 'content-type': 'application/json' }, body: generationBody });
+    assert.equal(retriedGeneration.status, 200, 'canceling a disconnected client must release the generation lock');
+    assert.equal((await retriedGeneration.json()).tree.children[0].title, '主流程');
     await fetch(base + '/api/ai/documents/' + document.id, { method: 'DELETE', headers: { 'x-user': 'two' } });
     assert.equal(db.prepare('SELECT COUNT(*) AS count FROM ai_documents').get().count, 1);
     await fetch(base + '/api/ai/documents/' + document.id, { method: 'DELETE' });

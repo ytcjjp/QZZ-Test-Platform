@@ -72,9 +72,18 @@ AI 生成草稿无需项目，保存进用例库时必须选择所属项目。
 - `POST /api/defects/batch`：同上，支持 `action:"delete"` 或 `action:"status",status:"待处理"|"处理中"|"待验证"|"搁置"|"已解决"|"已关闭"`。单条列表状态修改同样使用此接口，`items` 只有一条。
 - 批量操作须有相应模块写权限，最多 1000 条，不接受重复 ID。先校验全部项目归属和修订，再在事务内整体提交；任一条过期返回 409、跨项目或不存在返回 404，不会部分成功。成功返回 `{ok:true,count}`，逐记录发送原有实时事件。记录删除不可恢复，网页需要用户确认；项目组删除则可从已删除项目恢复。
 
-AI 用例生成默认关闭。配置 `AI_API_KEY`、`AI_MODEL`，以及可选的
-`AI_BASE_URL`（默认为 `https://api.openai.com/v1`）后，
-`POST /api/ai/generate` 才会请求兼容 Chat Completions 的服务。
+AI 优先读取 `data/ai-provider.json` 中的固定本机配置，密钥以原有 `password-key`
+进行 AES-GCM 加密，不返回给网页。当前配置通过本机 Codex 使用公司 Responses 网关，
+模型 `gpt-6.1-sol`、档位 `ultra`。当前 CLI 将该档位序列化为网关支持的 `xhigh`；
+已核对真实请求的 `store:false`。CLI 使用独立运行目录和临时输出 schema。
+平台只读采集点点消项目白名单中的相关源码片段，作为材料交给 Codex 分析；
+生成进程禁用系统命令，保持只读沙箱。临时提示及结果文件在完成或取消后清理。
+最长等待 15 分钟，网页取消或断开会终止本次子进程树并释放生成锁。
+
+不存在本机配置时，保留 `AI_API_KEY`、`AI_MODEL`、`AI_BASE_URL` 环境变量兼容方式。
+`AI_WIRE_API=responses` 使用 Responses，`chat` 使用 Chat Completions；
+`AI_REASONING_EFFORT` 传入对应服务支持的推理强度。环境变量方式不会覆盖固定本机配置。
+`GET /api/config` 只返回已配置标记、模型、档位和模式，不返回密钥。
 入口仅接收策划文档，不再接受手写 `requirements`。`POST /api/ai/documents`
 上传 multipart `file`（Word `.doc/.docx`、PDF、Markdown、TXT），或 JSON `{url}`
 导入飞书 / Lark 的 `docx/docs/wiki` 地址，返回 `{document:{id,name,text,chars}}`。

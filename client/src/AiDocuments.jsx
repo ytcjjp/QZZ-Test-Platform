@@ -142,6 +142,12 @@ export default function AiDocuments({ config = {}, projects = [], canWrite, canS
     } catch (failure) { if (operation.current === token) report(failure); }
     finally { if (alive.current && operation.current === token) { locked.current = false; setBusy(''); } }
   }
+  function cancelGeneration() {
+    operation.current += 1;
+    pending.current.forEach((controller) => controller.abort());
+    locked.current = false; setBusy('');
+    onNotice?.('已取消本次生成');
+  }
   async function save() {
     if (!canSave || locked.current || !projectId || !result?.tree || savedTargets.has(projectId)) return;
     if (!result.title.trim()) { setError('请输入用例集名称'); return; }
@@ -166,8 +172,8 @@ export default function AiDocuments({ config = {}, projects = [], canWrite, canS
   const preview = documents.find((doc) => doc.id === previewId) || documents[0];
   const noGenerate = !canWrite || !config.aiConfigured || !documents.length || Boolean(busy);
   return <section className="workspace-section ai-documents-section">
-    <div className="section-heading"><div><span className="eyebrow">AI ASSISTANT</span><h1>AI 用例生成</h1><p>策划文档 · 点点消用例规范</p></div>{isAdmin && <button type="button" className="button secondary" onClick={() => setSettingsOpen(true)} disabled={Boolean(busy)}><Settings2 size={16} />飞书文档连接</button>}</div>
-    {!config.aiConfigured && <div className="notice"><AlertCircle size={17} /><span>AI 服务尚未配置，请联系管理员在服务控制器中配置 API Key 和模型。</span></div>}
+    <div className="section-heading"><div><span className="eyebrow">AI ASSISTANT</span><h1>AI 用例生成</h1><p>点点消用例规范{config.aiModel && ` · ${config.aiModel} · ${config.aiReasoningEffort || ''}`}</p></div>{isAdmin && <button type="button" className="button secondary" onClick={() => setSettingsOpen(true)} disabled={Boolean(busy)}><Settings2 size={16} />飞书文档连接</button>}</div>
+    {!config.aiConfigured && <div className="notice"><AlertCircle size={17} /><span>{config.aiConfigError || 'AI 服务尚未配置，请联系管理员配置本机 AI 服务。'}</span></div>}
     {!canWrite && <div className="notice"><AlertCircle size={17} /><span>当前账号没有生成权限，请联系管理员。</span></div>}
     {error && <div className="inline-error ai-document-error" role="alert"><AlertCircle size={17} /><span>{error}</span><button type="button" className="icon-button" title="关闭错误提示" aria-label="关闭文档错误" onClick={() => setError('')}><X size={15} /></button></div>}
     <div className="ai-document-columns"><div className="ai-source-column">
@@ -187,7 +193,8 @@ export default function AiDocuments({ config = {}, projects = [], canWrite, canS
         {canWrite && <button type="button" className="icon-button danger" title={`移除 ${document.name}`} aria-label={`移除 ${document.name}`} disabled={Boolean(busy)} onClick={() => removeDocument(document)}><Trash2 size={16} /></button>}
       </div>)}</div>}
       {preview && <details className="ai-source-preview"><summary>文档内容 · {preview.name}</summary><pre>{preview.text}</pre></details>}
-      <button type="button" className="button primary ai-document-generate" onClick={() => generate(false)} disabled={noGenerate}>{busy === 'generate' ? <><LoaderCircle size={17} className="spin" />正在生成…</> : <><Sparkles size={17} />生成用例集</>}</button>
+      <button type="button" className="button primary ai-document-generate" onClick={() => generate(false)} disabled={noGenerate}>{busy === 'generate' ? <><LoaderCircle size={17} className="spin" />{config.aiMode === 'codex' ? '正在分析策划案及项目代码…' : '正在生成…'}</> : <><Sparkles size={17} />生成用例集</>}</button>
+      {busy === 'generate' && <button type="button" className="button secondary" onClick={cancelGeneration}><X size={16} />取消生成</button>}
     </div><div className="ai-output-column">
       <div className="ai-source-heading"><h2>用例集草稿</h2><Bot size={20} /></div>
       {!result && <div className="ai-document-empty"><FileText size={32} /><span>{busy === 'generate' ? '正在分析策划文档…' : '暂无草稿'}</span></div>}
