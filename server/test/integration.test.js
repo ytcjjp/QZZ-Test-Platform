@@ -7,6 +7,8 @@ import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import WebSocket from 'ws';
 import Database from 'better-sqlite3';
+import sharp from 'sharp';
+import { initializeProjects } from '../projects.js';
 import { hashPassword, encryptPassword, decryptPassword, loadPasswordKey } from '../passwords.js';
 
 const serverDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -28,7 +30,8 @@ test('legacy hashes migrate safely and stdin maintenance reset restores a recove
     assert.equal(login.status, 200);
     assert.equal(login.body.user.passwordAvailable, false);
     const cookie = login.response.headers.get('set-cookie').split(';')[0];
-    assert.equal((await request(started.url, '/api/cases', cookie)).status, 200);
+    const projectId = (await request(started.url, '/api/projects', cookie)).body.projects[0].id;
+    assert.equal((await request(started.url, `/api/cases?projectId=${projectId}`, cookie)).status, 200);
     await new Promise((resolve) => { child.once('exit', resolve); child.kill(); });
     child = null;
     const reset = spawn(process.execPath, [path.join(serverDir, 'reset-admin-password.js')], {
@@ -193,6 +196,7 @@ test('authenticated LAN APIs persist records and reject stale revisions', async 
     const cookie = login.response.headers.get('set-cookie').split(';')[0];
     assert.equal(login.body.user.role, 'admin');
     assert.equal((await request(url, '/api/session', cookie)).body.user.username, 'admin');
+    const projectId = (await request(url, '/api/projects', cookie)).body.projects[0].id;
     assert.equal((await request(url, '/api/cases', cookie, {
       method: 'POST', headers: { origin: 'http://not-the-platform.invalid' }, body: { title: 'blocked' },
     })).status, 403);
@@ -203,7 +207,7 @@ test('authenticated LAN APIs persist records and reject stale revisions', async 
     assert.equal(createdUser.status, 201);
 
     const createdCase = await request(url, '/api/cases', cookie, {
-      method: 'POST', body: { title: 'Login with invalid password', tags: ['auth'] },
+      method: 'POST', body: { projectId, title: 'Login with invalid password', tags: ['auth'] },
     });
     assert.equal(createdCase.status, 201);
     assert.equal(createdCase.body.case.createdBy, 'admin');
@@ -211,36 +215,36 @@ test('authenticated LAN APIs persist records and reject stale revisions', async 
     const caseId = createdCase.body.case.id;
 
     const updatedCase = await request(url, `/api/cases/${caseId}`, cookie, {
-      method: 'PUT', body: { revision: 1, status: 'ready' },
+      method: 'PUT', body: { projectId, revision: 1, status: 'ready' },
     });
     assert.equal(updatedCase.status, 200);
     assert.equal(updatedCase.body.case.revision, 2);
     assert.equal((await request(url, `/api/cases/${caseId}`, cookie, {
-      method: 'PUT', body: { revision: 1, title: 'stale' },
+      method: 'PUT', body: { projectId, revision: 1, title: 'stale' },
     })).status, 409);
     assert.equal((await request(url, `/api/cases/${caseId}`, cookie, { method: 'DELETE' })).status, 400);
     assert.equal((await request(url, `/api/cases/${caseId}`, cookie, {
-      method: 'DELETE', body: { revision: 1 },
+      method: 'DELETE', body: { projectId, revision: 1 },
     })).status, 409);
-    assert.equal((await request(url, '/api/cases', cookie)).body.cases[0].title, 'Login with invalid password');
+    assert.equal((await request(url, `/api/cases?projectId=${projectId}`, cookie)).body.cases[0].title, 'Login with invalid password');
 
     const createdDefect = await request(url, '/api/defects', cookie, {
-      method: 'POST', body: { title: 'Crash on login', version: '1.0.0' },
+      method: 'POST', body: { projectId, title: 'Crash on login', version: '1.0.0' },
     });
     assert.equal(createdDefect.status, 201);
     const defectId = createdDefect.body.defect.id;
     assert.equal(createdDefect.body.defect.version, '1.0.0');
     assert.equal((await request(url, `/api/defects/${defectId}`, cookie, {
-      method: 'PUT', body: { revision: 1, status: 'fixed' },
+      method: 'PUT', body: { projectId, revision: 1, status: 'fixed' },
     })).body.defect.revision, 2);
     assert.equal((await request(url, `/api/defects/${defectId}`, cookie, {
-      method: 'PUT', body: { revision: 1, status: 'closed' },
+      method: 'PUT', body: { projectId, revision: 1, status: 'closed' },
     })).status, 409);
     assert.equal((await request(url, `/api/defects/${defectId}`, cookie, { method: 'DELETE' })).status, 400);
     assert.equal((await request(url, `/api/defects/${defectId}`, cookie, {
-      method: 'DELETE', body: { revision: 1 },
+      method: 'DELETE', body: { projectId, revision: 1 },
     })).status, 409);
-    assert.equal((await request(url, '/api/defects', cookie)).body.defects[0].status, 'fixed');
+    assert.equal((await request(url, `/api/defects?projectId=${projectId}`, cookie)).body.defects[0].status, 'fixed');
 
     const form = new FormData();
     form.append('file', new Blob(['test artifact'], { type: 'text/plain' }), 'artifact.txt');
@@ -263,12 +267,12 @@ test('authenticated LAN APIs persist records and reject stale revisions', async 
     });
     const memberCookie = memberLogin.response.headers.get('set-cookie').split(';')[0];
     assert.equal((await request(url, '/api/users', memberCookie)).status, 403);
-    assert.equal((await request(url, '/api/defects', memberCookie)).body.defects.length, 1);
+    assert.equal((await request(url, `/api/defects?projectId=${projectId}`, memberCookie)).body.defects.length, 1);
     assert.equal((await request(url, `/api/cases/${caseId}`, cookie, {
-      method: 'DELETE', body: { revision: 2 },
+      method: 'DELETE', body: { projectId, revision: 2 },
     })).status, 200);
     assert.equal((await request(url, `/api/defects/${defectId}`, cookie, {
-      method: 'DELETE', body: { revision: 2 },
+      method: 'DELETE', body: { projectId, revision: 2 },
     })).status, 200);
     assert.equal((await request(url, '/api/session', cookie, { method: 'DELETE' })).status, 200);
     assert.equal((await request(url, '/api/cases', cookie)).status, 401);
@@ -298,18 +302,178 @@ test('first-run generated password survives a restart until login and WebSocket 
     assert.equal(login.status, 200);
     await assert.rejects(access(path.join(dataDir, 'initial-admin.txt')));
     const cookie = login.response.headers.get('set-cookie').split(';')[0];
+    const projectId = (await request(started.url, '/api/projects', cookie)).body.projects[0].id;
     const ws = new WebSocket(`${started.url.replace('http:', 'ws:')}/api/events`, {
       headers: { cookie, origin: started.url },
     });
     await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
     const event = new Promise((resolve) => ws.once('message', (data) => resolve(JSON.parse(data.toString()))));
-    await request(started.url, '/api/defects', cookie, { method: 'POST', body: { title: 'sync' } });
-    assert.equal((await event).type, 'defect.created');
+    await request(started.url, '/api/defects', cookie, { method: 'POST', body: { projectId, title: 'sync' } });
+    const received = await event;
+    assert.equal(received.type, 'defect.created');
+    assert.equal(received.projectId, projectId);
     const disconnected = new Promise((resolve) => ws.once('close', resolve));
     await request(started.url, '/api/session', cookie, { method: 'DELETE' });
     await disconnected;
   } finally {
     if (child) { child.kill(); await new Promise((resolve) => child.once('exit', resolve)); }
+    await rm(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
+test('project migration preserves legacy records and stable renamed project identity on restart', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'qzz-project-migration-'));
+  const db = new Database(path.join(dataDir, 'platform.db'));
+  try {
+    db.pragma('foreign_keys = ON');
+    db.exec(`CREATE TABLE cases (id TEXT PRIMARY KEY, title TEXT, revision INTEGER, updated_at TEXT);
+      CREATE TABLE defects (id TEXT PRIMARY KEY, title TEXT, revision INTEGER, updated_at TEXT);
+      INSERT INTO cases VALUES ('legacy-case', 'Original case', 7, '2026-01-01');
+      INSERT INTO defects VALUES ('legacy-defect', 'Original defect', 4, '2026-01-02');`);
+    initializeProjects(db, dataDir);
+    const original = db.prepare('SELECT * FROM projects').get();
+    assert.equal(original.name, '默认项目组');
+    assert.deepEqual(db.prepare('SELECT * FROM cases').get(), {
+      id: 'legacy-case', title: 'Original case', revision: 7, updated_at: '2026-01-01', project_id: original.id,
+    });
+    assert.deepEqual(db.prepare('SELECT * FROM defects').get(), {
+      id: 'legacy-defect', title: 'Original defect', revision: 4, updated_at: '2026-01-02', project_id: original.id,
+    });
+    db.prepare('UPDATE projects SET name = ?, name_key = ?, revision = 2 WHERE id = ?').run('正式项目', '正式项目', original.id);
+    initializeProjects(db, dataDir);
+    assert.equal(db.prepare('SELECT count(*) AS count FROM projects').get().count, 1);
+    assert.equal(db.prepare('SELECT name FROM projects WHERE id = ?').get(original.id).name, '正式项目');
+    assert.equal(db.prepare('SELECT revision FROM cases').get().revision, 7);
+    assert.equal(db.prepare('SELECT revision FROM defects').get().revision, 4);
+    assert.throws(() => db.prepare('INSERT INTO cases VALUES (?, ?, ?, ?, ?)').run('invalid', 'Bad', 1, '', 'unknown'), /FOREIGN KEY/);
+  } finally {
+    db.close();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('projects isolate both modules, validate icons and enforce shared-group permissions', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'qzz-projects-test-'));
+  let child;
+  let ws;
+  try {
+    const started = await launch(dataDir);
+    child = started.child;
+    const { url } = started;
+    const login = await request(url, '/api/session', null, {
+      method: 'POST', body: { username: 'admin', password: 'AdminPassword123456' },
+    });
+    const cookie = login.response.headers.get('set-cookie').split(';')[0];
+    const defaultProject = (await request(url, '/api/projects', cookie)).body.projects[0];
+    assert.equal(defaultProject.caseCount, 0);
+    assert.equal(defaultProject.defectCount, 0);
+    assert.equal((await request(url, '/api/projects')).status, 401);
+    for (const name of ['', '   ', 'x'.repeat(61), 'bad\nname']) {
+      assert.equal((await request(url, '/api/projects', cookie, { method: 'POST', body: { name } })).status, 400);
+    }
+    const created = await request(url, '/api/projects', cookie, { method: 'POST', body: { name: '  Game A  ' } });
+    assert.equal(created.status, 201);
+    let project = created.body.project;
+    assert.equal(project.name, 'Game A');
+    assert.equal((await request(url, '/api/projects', cookie, { method: 'POST', body: { name: 'game a' } })).status, 409);
+    const renamed = await request(url, `/api/projects/${project.id}`, cookie, { method: 'PUT', body: { name: 'Game B', revision: 1 } });
+    assert.equal(renamed.status, 200);
+    project = renamed.body.project;
+    assert.equal(project.revision, 2);
+    assert.equal(project.name, 'Game B');
+    assert.equal((await request(url, `/api/projects/${project.id}`, cookie, { method: 'PUT', body: { name: 'Lost update', revision: 1 } })).status, 409);
+    assert.equal((await request(url, `/api/projects/${project.id}`, cookie, { method: 'PUT', body: { name: defaultProject.name, revision: 2 } })).status, 409);
+
+    for (const module of ['cases', 'defects']) {
+      assert.equal((await request(url, `/api/${module}`, cookie)).status, 400);
+      assert.equal((await request(url, `/api/${module}?projectId=missing`, cookie)).status, 400);
+      assert.equal((await request(url, `/api/${module}`, cookie, { method: 'POST', body: { title: 'Missing group' } })).status, 400);
+      const createdRecord = await request(url, `/api/${module}`, cookie, { method: 'POST', body: { projectId: project.id, title: `Isolated ${module}` } });
+      assert.equal(createdRecord.status, 201);
+      const record = createdRecord.body[module === 'cases' ? 'case' : 'defect'];
+      assert.equal(record.projectId, project.id);
+      assert.equal((await request(url, `/api/${module}?projectId=${defaultProject.id}`, cookie)).body[module].length, 0);
+      assert.equal((await request(url, `/api/${module}?projectId=${project.id}`, cookie)).body[module].length, 1);
+      for (const method of ['PUT', 'DELETE']) {
+        assert.equal((await request(url, `/api/${module}/${record.id}`, cookie, { method, body: { revision: 1 } })).status, 400);
+        const denied = await request(url, `/api/${module}/${record.id}`, cookie, { method, body: { projectId: defaultProject.id, revision: 1, title: 'Moved' } });
+        assert.equal(denied.status, 404);
+        assert.equal(JSON.stringify(denied.body).includes('Isolated'), false);
+      }
+      assert.equal((await request(url, `/api/${module}?projectId=${project.id}`, cookie)).body[module][0].revision, 1);
+    }
+    const counts = (await request(url, '/api/projects', cookie)).body.projects.find((item) => item.id === project.id);
+    assert.equal(counts.caseCount, 1);
+    assert.equal(counts.defectCount, 1);
+
+    const uploadIcon = (buffer, revision, name = 'icon.png', type = 'image/png', auth = cookie) => {
+      const form = new FormData();
+      form.append('revision', String(revision));
+      form.append('file', new Blob([buffer], { type }), name);
+      return request(url, `/api/projects/${project.id}/icon`, auth, { method: 'POST', body: form });
+    };
+    const png = await sharp({ create: { width: 400, height: 300, channels: 4, background: '#39a974' } }).png().toBuffer();
+    assert.equal((await uploadIcon(Buffer.from('not an image'), project.revision)).status, 400);
+    assert.equal((await uploadIcon(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><script>alert(1)</script></svg>'), project.revision, 'unsafe.svg', 'image/svg+xml')).status, 400);
+    assert.equal((await uploadIcon(Buffer.alloc(2 * 1024 * 1024 + 1), project.revision)).status, 413);
+    const valid = await uploadIcon(png, project.revision);
+    assert.equal(valid.status, 200);
+    project = valid.body.project;
+    assert.equal(project.revision, 3);
+    assert.ok(project.iconUrl);
+    const iconResponse = await fetch(`${url}${project.iconUrl}`, { headers: { cookie } });
+    assert.equal(iconResponse.status, 200);
+    assert.equal(iconResponse.headers.get('content-type'), 'image/webp');
+    assert.equal(iconResponse.headers.get('x-content-type-options'), 'nosniff');
+    const metadata = await sharp(Buffer.from(await iconResponse.arrayBuffer())).metadata();
+    assert.equal(metadata.width, 256);
+    assert.equal(metadata.height, 256);
+    assert.equal((await fetch(`${url}${project.iconUrl}`)).status, 401);
+    assert.equal((await uploadIcon(png, 2)).status, 409);
+    assert.equal((await uploadIcon(png, project.revision)).status, 200);
+    const { readdir } = await import('node:fs/promises');
+    assert.equal((await readdir(path.join(dataDir, 'project-icons'))).length, 1);
+
+    const registered = await request(url, '/api/register', null, { method: 'POST', body: { username: 'viewer', password: 'viewer123' } });
+    const viewerId = registered.body.user.id;
+    await request(url, `/api/users/${viewerId}`, cookie, {
+      method: 'PUT', body: { permissions: { cases: { view: true, write: false }, defects: { view: false, write: false } } },
+    });
+    const viewerLogin = await request(url, '/api/session', null, { method: 'POST', body: { username: 'viewer', password: 'viewer123' } });
+    const viewerCookie = viewerLogin.response.headers.get('set-cookie').split(';')[0];
+    const viewerProjects = await request(url, '/api/projects', viewerCookie);
+    assert.equal(viewerProjects.status, 200);
+    const viewerProject = viewerProjects.body.projects.find((item) => item.id === project.id);
+    assert.equal(viewerProject.caseCount, 1);
+    assert.equal(viewerProject.defectCount, null);
+    assert.equal((await request(url, `/api/cases?projectId=${project.id}`, viewerCookie)).status, 200);
+    assert.equal((await request(url, `/api/defects?projectId=${project.id}`, viewerCookie)).status, 403);
+    assert.equal((await request(url, '/api/cases', viewerCookie, { method: 'POST', body: { projectId: project.id, title: 'No write' } })).status, 403);
+    assert.equal((await request(url, '/api/projects', viewerCookie, { method: 'POST', body: { name: 'No group write' } })).status, 403);
+    assert.equal((await request(url, `/api/projects/${project.id}`, viewerCookie, { method: 'PUT', body: { revision: 4, name: 'No rename' } })).status, 403);
+    assert.equal((await uploadIcon(png, 4, 'icon.png', 'image/png', viewerCookie)).status, 403);
+    assert.equal((await fetch(`${url}${viewerProject.iconUrl}`, { headers: { cookie: viewerCookie } })).status, 200);
+
+    ws = new WebSocket(`${url.replace('http:', 'ws:')}/api/events`, { headers: { cookie: viewerCookie, origin: url } });
+    await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+    const event = new Promise((resolve) => ws.once('message', (data) => resolve(JSON.parse(data.toString()))));
+    await request(url, '/api/projects', cookie, { method: 'POST', body: { name: 'Shared notification' } });
+    const received = await event;
+    assert.equal(received.type, 'project.created');
+    assert.equal(received.project.caseCount, 0);
+    assert.equal(received.project.defectCount, null);
+    ws.close();
+    await new Promise((resolve) => ws.once('close', resolve));
+    ws = null;
+
+    await request(url, `/api/users/${viewerId}`, cookie, { method: 'PUT', body: { permissions: { cases: { view: false }, defects: { view: false } } } });
+    const deniedLogin = await request(url, '/api/session', null, { method: 'POST', body: { username: 'viewer', password: 'viewer123' } });
+    const deniedCookie = deniedLogin.response.headers.get('set-cookie').split(';')[0];
+    assert.equal((await request(url, '/api/projects', deniedCookie)).status, 403);
+    assert.equal((await fetch(`${url}${viewerProject.iconUrl}`, { headers: { cookie: deniedCookie } })).status, 403);
+  } finally {
+    if (ws) ws.terminate();
+    if (child) await new Promise((resolve) => { child.once('exit', resolve); child.kill(); });
     await rm(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });

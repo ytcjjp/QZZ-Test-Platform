@@ -7,6 +7,7 @@ import Database from 'better-sqlite3';
 import express from 'express';
 import multer from 'multer';
 import { WebSocketServer } from 'ws';
+import { initializeProjects, createProjectService } from './projects.js';
 import { hashPassword, verifyPassword, loadPasswordKey,
   encryptPassword as encryptWithKey, decryptPassword as decryptWithKey } from './passwords.js';
 
@@ -15,7 +16,7 @@ const projectDir = path.resolve(serverDir, '..');
 const dataDir = path.resolve(process.env.QZZ_DATA_DIR || path.join(projectDir, 'data'));
 const uploadDir = path.join(dataDir, 'uploads');
 const credentialFile = path.join(dataDir, 'initial-admin.txt');
-const distDir = path.join(projectDir, 'client', 'dist');
+const distDir = path.resolve(projectDir, process.env.QZZ_CLIENT_DIST || path.join('client', 'dist'));
 const port = Number(process.env.PORT || 3210);
 const maxUploadMb = Number(process.env.MAX_UPLOAD_MB || 100);
 const trustProxy = process.env.TRUST_PROXY === '1';
@@ -63,6 +64,7 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS files_created_idx ON files(created_at DESC);
 `);
+const projectIconDir = initializeProjects(db, dataDir);
 
 const userColumns = db.prepare('PRAGMA table_info(users)').all().map((column) => column.name);
 for (const [name, definition] of Object.entries({
@@ -391,6 +393,9 @@ app.post('/api/users/:id/reveal-password', requireAdmin, limitAccountAttempts, a
   res.json({ available: Boolean(user.password_encrypted), password: user.password_encrypted ? decryptPassword(user.password_encrypted) : null });
 });
 
+const projects = createProjectService({ db, iconDir: projectIconDir, sendError, inputError: (message) => new InputError(message), authenticate: userFromRequest });
+projects.register(app, requireAdmin, broadcast);
+
 app.use('/api', (req, res, next) => {
   const module = req.path.split('/')[1];
   if (!permissionModules.includes(module) || req.user.role === 'admin') return next();
@@ -437,7 +442,7 @@ function normalizeCase(body, previous = {}) {
 
 function mapCase(row) {
   return {
-    id: row.id, title: row.title, module: row.module, priority: row.priority,
+    id: row.id, projectId: row.project_id, title: row.title, module: row.module, priority: row.priority,
     status: row.status, preconditions: row.preconditions, steps: row.steps,
     expected: row.expected, notes: row.notes, tags: JSON.parse(row.tags),
     revision: row.revision, createdBy: row.creator_name, createdAt: row.created_at,
@@ -450,24 +455,28 @@ const caseSelect = `SELECT cases.*, users.username AS creator_name FROM cases
 const getCase = db.prepare(`${caseSelect} WHERE cases.id = ?`);
 
 app.get('/api/cases', (req, res) => {
-  res.json({ cases: db.prepare(`${caseSelect} ORDER BY cases.updated_at DESC, cases.id DESC`).all().map(mapCase) });
+  const projectId = projects.requireProject(req.query.projectId);
+  res.json({ cases: db.prepare(`${caseSelect} WHERE cases.project_id = ? ORDER BY cases.updated_at DESC, cases.id DESC`).all(projectId).map(mapCase) });
 });
 
 app.post('/api/cases', (req, res) => {
+  const projectId = projects.requireProject(req.body?.projectId);
   const value = normalizeCase(req.body);
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
-  db.prepare(`INSERT INTO cases VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`)
+  db.prepare(`INSERT INTO cases (id, title, module, priority, status, preconditions, steps, expected, notes, tags,
+    revision, created_by, created_at, updated_at, project_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`)
     .run(id, value.title, value.module, value.priority, value.status, value.preconditions,
-      value.steps, value.expected, value.notes, JSON.stringify(value.tags), req.user.id, now, now);
+      value.steps, value.expected, value.notes, JSON.stringify(value.tags), req.user.id, now, now, projectId);
   const record = mapCase(getCase.get(id));
-  broadcast('case.created', { case: record });
+  broadcast('case.created', { case: record, projectId });
   res.status(201).json({ case: record });
 });
 
 app.put('/api/cases/:id', (req, res) => {
+  const projectId = projects.requireProject(req.body?.projectId);
   const current = getCase.get(req.params.id);
-  if (!current) return sendError(res, 404, 'not_found', '用例不存在');
+  if (!current || current.project_id !== projectId) return sendError(res, 404, 'not_found', '用例不存在');
   const revision = readRevision(req.body?.revision);
   if (revision !== current.revision) {
     return res.status(409).json({ error: 'conflict', message: '用例已被其他人修改，请刷新后重试', case: mapCase(current) });
@@ -480,14 +489,15 @@ app.put('/api/cases/:id', (req, res) => {
       new Date().toISOString(), current.id, revision);
   if (!result.changes) return res.status(409).json({ error: 'conflict', message: '用例已被其他人修改', case: mapCase(getCase.get(current.id)) });
   const record = mapCase(getCase.get(current.id));
-  broadcast('case.updated', { case: record });
+  broadcast('case.updated', { case: record, projectId });
   res.json({ case: record });
 });
 
 app.delete('/api/cases/:id', (req, res) => {
+  const projectId = projects.requireProject(req.body?.projectId);
   const revision = readRevision(req.body?.revision);
   const current = getCase.get(req.params.id);
-  if (!current) return sendError(res, 404, 'not_found', '用例不存在');
+  if (!current || current.project_id !== projectId) return sendError(res, 404, 'not_found', '用例不存在');
   if (revision !== current.revision) {
     return res.status(409).json({ error: 'conflict', message: '用例已被其他人修改', case: mapCase(current) });
   }
@@ -498,7 +508,7 @@ app.delete('/api/cases/:id', (req, res) => {
       ? res.status(409).json({ error: 'conflict', message: '用例已被其他人修改', case: mapCase(latest) })
       : sendError(res, 404, 'not_found', '用例不存在');
   }
-  broadcast('case.deleted', { id: current.id });
+  broadcast('case.deleted', { id: current.id, projectId });
   res.json({ ok: true });
 });
 
@@ -522,7 +532,7 @@ function normalizeDefect(body, previous = {}) {
 
 function mapDefect(row) {
   return {
-    id: row.id, title: row.title, module: row.module, severity: row.severity,
+    id: row.id, projectId: row.project_id, title: row.title, module: row.module, severity: row.severity,
     status: row.status, assignee: row.assignee, version: row.version,
     reproSteps: row.repro_steps, expected: row.expected, actual: row.actual,
     notes: row.notes, revision: row.revision, createdBy: row.creator_name,
@@ -535,25 +545,30 @@ const defectSelect = `SELECT defects.*, users.username AS creator_name FROM defe
 const getDefect = db.prepare(`${defectSelect} WHERE defects.id = ?`);
 
 app.get('/api/defects', (req, res) => {
-  res.json({ defects: db.prepare(`${defectSelect} ORDER BY defects.updated_at DESC, defects.id DESC`).all().map(mapDefect) });
+  const projectId = projects.requireProject(req.query.projectId);
+  res.json({ defects: db.prepare(`${defectSelect} WHERE defects.project_id = ? ORDER BY defects.updated_at DESC, defects.id DESC`).all(projectId).map(mapDefect) });
 });
 
 app.post('/api/defects', (req, res) => {
+  const projectId = projects.requireProject(req.body?.projectId);
   const value = normalizeDefect(req.body);
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
-  db.prepare(`INSERT INTO defects VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`)
+  db.prepare(`INSERT INTO defects (id, title, module, severity, status, assignee, version, repro_steps,
+    expected, actual, notes, revision, created_by, created_at, updated_at, project_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`)
     .run(id, value.title, value.module, value.severity, value.status, value.assignee,
       value.version, value.reproSteps, value.expected, value.actual, value.notes,
-      req.user.id, now, now);
+      req.user.id, now, now, projectId);
   const record = mapDefect(getDefect.get(id));
-  broadcast('defect.created', { defect: record });
+  broadcast('defect.created', { defect: record, projectId });
   res.status(201).json({ defect: record });
 });
 
 app.put('/api/defects/:id', (req, res) => {
+  const projectId = projects.requireProject(req.body?.projectId);
   const current = getDefect.get(req.params.id);
-  if (!current) return sendError(res, 404, 'not_found', '缺陷不存在');
+  if (!current || current.project_id !== projectId) return sendError(res, 404, 'not_found', '缺陷不存在');
   const revision = readRevision(req.body?.revision);
   if (revision !== current.revision) {
     return res.status(409).json({ error: 'conflict', message: '缺陷已被其他人修改，请刷新后重试', defect: mapDefect(current) });
@@ -566,14 +581,15 @@ app.put('/api/defects/:id', (req, res) => {
       value.notes, new Date().toISOString(), current.id, revision);
   if (!result.changes) return res.status(409).json({ error: 'conflict', message: '缺陷已被其他人修改', defect: mapDefect(getDefect.get(current.id)) });
   const record = mapDefect(getDefect.get(current.id));
-  broadcast('defect.updated', { defect: record });
+  broadcast('defect.updated', { defect: record, projectId });
   res.json({ defect: record });
 });
 
 app.delete('/api/defects/:id', (req, res) => {
+  const projectId = projects.requireProject(req.body?.projectId);
   const revision = readRevision(req.body?.revision);
   const current = getDefect.get(req.params.id);
-  if (!current) return sendError(res, 404, 'not_found', '缺陷不存在');
+  if (!current || current.project_id !== projectId) return sendError(res, 404, 'not_found', '缺陷不存在');
   if (revision !== current.revision) {
     return res.status(409).json({ error: 'conflict', message: '缺陷已被其他人修改', defect: mapDefect(current) });
   }
@@ -584,7 +600,7 @@ app.delete('/api/defects/:id', (req, res) => {
       ? res.status(409).json({ error: 'conflict', message: '缺陷已被其他人修改', defect: mapDefect(latest) })
       : sendError(res, 404, 'not_found', '缺陷不存在');
   }
-  broadcast('defect.deleted', { id: current.id });
+  broadcast('defect.deleted', { id: current.id, projectId });
   res.json({ ok: true });
 });
 
@@ -740,8 +756,13 @@ function broadcast(type, details) {
     const session = db.prepare(`SELECT users.* FROM sessions JOIN users ON users.id = sessions.user_id
       WHERE token_hash = ? AND expires_at > ? AND disabled = 0`)
       .get(client.tokenHash, Date.now());
-    const module = { case: 'cases', defect: 'defects', file: 'files' }[type.split('.')[0]];
-    if (session && (!module || mapUser(session).permissions[module].view)) client.send(payload);
+    const category = type.split('.')[0];
+    const module = { case: 'cases', defect: 'defects', file: 'files' }[category];
+    const user = session && mapUser(session);
+    if (user && category === 'project') {
+      if (projects.canView(user)) client.send(JSON.stringify({ type, project: projects.mapProject(projects.getProject.get(details.project.id), user) }));
+    }
+    else if (session && (!module || user.permissions[module].view)) client.send(payload);
     else if (session) continue;
     else client.close(1008, 'Session expired');
   }

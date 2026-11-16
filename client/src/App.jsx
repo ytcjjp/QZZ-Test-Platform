@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { forgetLogin, readRememberedLogin, rememberLogin } from './remembered-login';
+import ProjectsPage, { ProjectContext, ProjectIcon } from './Projects';
 import {
   AlertCircle, ArrowDownToLine, ArrowUpRight, Bot, Bug, Check, Copy,
   ChevronDown, ChevronRight, CircleHelp, CloudUpload, Database,
@@ -135,7 +136,7 @@ function Login({ onLogin, busy, error }) {
   </div>;
 }
 
-function RecordForm({ kind, initial, mode, onClose, onSave, busy, error, onReload }) {
+function RecordForm({ kind, initial, mode, project, onClose, onSave, busy, error, onReload }) {
   const fields = kind === 'cases' ? CASE_FIELDS : DEFECT_FIELDS;
   const [values, setValues] = useState(() => ({ ...(kind === 'cases' ? EMPTY_CASE : EMPTY_DEFECT), ...initial, tags: Array.isArray(initial?.tags) ? initial.tags.join(', ') : initial?.tags || '' }));
   const title = kind === 'cases' ? '用例' : '缺陷';
@@ -149,6 +150,7 @@ function RecordForm({ kind, initial, mode, onClose, onSave, busy, error, onReloa
     <div className="modal" role="dialog" aria-modal="true" aria-labelledby="form-title">
       <div className="modal-head"><div><span className="eyebrow">{mode === 'edit' ? 'EDIT RECORD' : 'NEW RECORD'}</span><h2 id="form-title">{mode === 'edit' ? `编辑${title}` : `新建${title}`}</h2></div><IconButton icon={X} label="关闭" onClick={onClose} /></div>
       <form onSubmit={submit} className="modal-form">
+        {project && <div className="record-form-project"><ProjectIcon project={project} small /><span>{project.name}</span></div>}
         <div className="form-grid">{fields.map((field) => <label key={field.key} className={`field ${field.wide ? 'field-wide' : ''}`}><span>{field.label}{field.required && <em> *</em>}</span>
           {field.type === 'textarea'
             ? <textarea value={values[field.key] ?? ''} onChange={(e) => setValues({ ...values, [field.key]: e.target.value })} placeholder={field.placeholder} rows={field.key === 'steps' || field.key === 'reproSteps' ? 4 : 3} required={field.required} />
@@ -206,7 +208,7 @@ function RecordPage({ kind, items, loading, onNew, onSelect, onRefresh, canWrite
   </section>;
 }
 
-function AiPage({ config, onSave, onEdit, showError, canWrite, canSave }) {
+function AiPage({ config, projects, onSave, onEdit, showError, canWrite, canSave }) {
   const [requirements, setRequirements] = useState('');
   const [module, setModule] = useState('');
   const [count, setCount] = useState(5);
@@ -215,6 +217,8 @@ function AiPage({ config, onSave, onEdit, showError, canWrite, canSave }) {
   const [saved, setSaved] = useState(new Set());
   const [saving, setSaving] = useState(-1);
   const [expanded, setExpanded] = useState(0);
+  const [projectId, setProjectId] = useState('');
+  useEffect(() => { if (projectId && !projects.some((project) => project.id === projectId)) setProjectId(''); }, [projects, projectId]);
   const configured = Boolean(config.aiConfigured) && canWrite;
   async function generate(event) {
     event.preventDefault();
@@ -227,8 +231,9 @@ function AiPage({ config, onSave, onEdit, showError, canWrite, canSave }) {
     finally { setGenerating(false); }
   }
   async function save(index) {
+    const targetProjectId = projectId;
     setSaving(index);
-    try { await onSave(generated[index]); setSaved((old) => new Set([...old, index])); }
+    try { await onSave(generated[index], targetProjectId); setSaved((old) => new Set([...old, `${targetProjectId}:${index}`])); }
     catch (error) { showError(error.message); }
     finally { setSaving(-1); }
   }
@@ -238,9 +243,10 @@ function AiPage({ config, onSave, onEdit, showError, canWrite, canSave }) {
       {!configured && <div className="notice"><CircleHelp size={18} /><span>{canWrite ? 'AI 服务尚未配置，请联系平台管理员在服务器配置 API Key。' : '当前账号仅有查看权限，请联系管理员开放生成权限。'}</span></div>}
       <label className="field"><span>功能需求 <em>*</em></span><textarea rows={11} placeholder="粘贴需求描述、规则或验收标准…" value={requirements} onChange={(event) => setRequirements(event.target.value)} required disabled={!configured || generating} /></label>
       <div className="generator-row"><label className="field"><span>所属模块</span><input placeholder="例如：活动中心" value={module} onChange={(event) => setModule(event.target.value)} disabled={!configured || generating} /></label><label className="field count-field"><span>生成条数</span><input type="number" min="1" max="20" value={count} onChange={(event) => setCount(event.target.value)} disabled={!configured || generating} /></label></div>
-      <button className="button primary generate-button" type="submit" disabled={!configured || generating || !requirements.trim()}>{generating ? <><RefreshCw size={17} className="spin" /> 正在生成…</> : <><Sparkles size={17} /> 生成用例草稿</>}</button>
+      <button className="button primary generate-button" type="submit" disabled={!configured || generating || saving !== -1 || !requirements.trim()}>{generating ? <><RefreshCw size={17} className="spin" /> 正在生成…</> : <><Sparkles size={17} /> 生成用例草稿</>}</button>
     </form><div className="results-panel"><div className="results-head"><div><span className="eyebrow">REVIEW</span><h2>生成结果</h2></div><span>{generated.length} 条草稿</span></div>
-      {generated.length === 0 ? <Empty icon={Bot} title="等待生成结果" detail="生成后逐条检查，再决定是否保存到用例库。" /> : <div className="result-list">{generated.map((item, index) => <div className="result-item" key={`${index}-${item.title}`}><button type="button" className="result-toggle" onClick={() => setExpanded(expanded === index ? -1 : index)} aria-expanded={expanded === index}><span className="result-number">{String(index + 1).padStart(2, '0')}</span><span className="result-name">{item.title || '未命名用例'}</span>{expanded === index ? <ChevronDown size={18} /> : <ChevronRight size={18} />}</button>{expanded === index && <div className="result-detail"><div className="result-tags"><Tone value={item.priority || 'P2'} /><span>{item.module || module || '未分类'}</span></div><div><strong>前置条件</strong><p>{item.preconditions || '—'}</p></div><div><strong>操作步骤</strong><p>{item.steps || '—'}</p></div><div><strong>预期结果</strong><p>{item.expected || '—'}</p></div><div className="result-actions"><button type="button" className="button secondary" onClick={() => onEdit(item, index, (savedIndex) => setSaved((old) => new Set([...old, savedIndex])))} disabled={!canSave || saved.has(index)}>编辑并保存</button><button type="button" className="button primary" onClick={() => save(index)} disabled={!canSave || saved.has(index) || saving === index}>{saved.has(index) ? <><Check size={16} /> 已保存</> : saving === index ? '保存中…' : '保存到用例库'}</button></div></div>}</div>)}</div>}
+      {canSave && <label className="field ai-project-target"><span>保存到项目组 <em>*</em></span><select aria-label="保存到项目组" value={projectId} onChange={(event) => setProjectId(event.target.value)} disabled={saving !== -1}><option value="">请选择项目组</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label>}
+      {generated.length === 0 ? <Empty icon={Bot} title="等待生成结果" detail="生成后逐条检查，再决定是否保存到用例库。" /> : <div className="result-list">{generated.map((item, index) => <div className="result-item" key={`${index}-${item.title}`}><button type="button" className="result-toggle" onClick={() => setExpanded(expanded === index ? -1 : index)} aria-expanded={expanded === index}><span className="result-number">{String(index + 1).padStart(2, '0')}</span><span className="result-name">{item.title || '未命名用例'}</span>{expanded === index ? <ChevronDown size={18} /> : <ChevronRight size={18} />}</button>{expanded === index && <div className="result-detail"><div className="result-tags"><Tone value={item.priority || 'P2'} /><span>{item.module || module || '未分类'}</span></div><div><strong>前置条件</strong><p>{item.preconditions || '—'}</p></div><div><strong>操作步骤</strong><p>{item.steps || '—'}</p></div><div><strong>预期结果</strong><p>{item.expected || '—'}</p></div><div className="result-actions"><button type="button" className="button secondary" onClick={() => onEdit(item, projectId, index, (savedIndex) => setSaved((old) => new Set([...old, `${projectId}:${savedIndex}`])))} disabled={!canSave || !projectId || saved.has(`${projectId}:${index}`) || saving !== -1}>编辑并保存</button><button type="button" className="button primary" onClick={() => save(index)} disabled={!canSave || !projectId || saved.has(`${projectId}:${index}`) || saving !== -1}>{saved.has(`${projectId}:${index}`) ? <><Check size={16} /> 已保存</> : saving === index ? '保存中…' : '保存到用例库'}</button></div></div>}</div>)}</div>}
     </div></div>
   </section>;
 }
@@ -347,6 +353,8 @@ export default function App() {
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem('qzz-sidebar-collapsed') === 'true');
   const [mobileOpen, setMobileOpen] = useState(false);
   const [connection, setConnection] = useState('connecting');
+  const [projects, setProjects] = useState([]);
+  const [selectedProjectId, setSelectedProjectId] = useState(null);
   const [cases, setCases] = useState([]);
   const [defects, setDefects] = useState([]);
   const [files, setFiles] = useState([]);
@@ -359,58 +367,107 @@ export default function App() {
   const [formError, setFormError] = useState('');
   const [usersOpen, setUsersOpen] = useState(false);
   const [passwordOpen, setPasswordOpen] = useState(false);
+  const contextRef = useRef({ user, active, projectId: selectedProjectId });
+  const authEpoch = useRef(0);
+  const scopeEpoch = useRef(0);
+  const loadSequence = useRef(0);
+  contextRef.current = { user, active, projectId: selectedProjectId };
+
+  const changeProject = useCallback((projectId) => {
+    scopeEpoch.current += 1; loadSequence.current += 1;
+    contextRef.current.projectId = projectId;
+    setSelectedProjectId(projectId); setCases([]); setDefects([]);
+    setDetail(null); setForm(null); setFormError(''); setFormBusy(false); setError('');
+  }, []);
+
+  const applyUser = useCallback((next) => {
+    const previous = contextRef.current.user;
+    if (previous?.id !== next?.id || !next) {
+      authEpoch.current += 1;
+      changeProject(null); setProjects([]); setFiles([]);
+      setUsersOpen(false); setPasswordOpen(false);
+    } else if (!permitted(next, contextRef.current.active) && contextRef.current.projectId) changeProject(null);
+    contextRef.current.user = next;
+    setUser((old) => JSON.stringify(old) === JSON.stringify(next) ? old : next);
+  }, [changeProject]);
 
   useEffect(() => { localStorage.setItem('qzz-sidebar-collapsed', String(collapsed)); }, [collapsed]);
   useEffect(() => {
     if (!user) return;
     if (!permitted(user, active)) {
       const first = NAV.find(({ id }) => permitted(user, id));
-      if (first) setActive(first.id);
+      if (first) { contextRef.current.active = first.id; changeProject(null); setActive(first.id); }
     }
     if (user.role !== 'admin') setUsersOpen(false);
     if (form && !permitted(user, form.kind, 'write')) setForm(null);
-  }, [user, active, form]);
+    if (detail && !permitted(user, detail.kind)) setDetail(null);
+  }, [user, active, form, detail, changeProject]);
+  useEffect(() => { if (form && !projects.some((project) => project.id === form.projectId)) setForm(null); }, [projects, form]);
   useEffect(() => { if (!toast) return; const timer = setTimeout(() => setToast(''), 3500); return () => clearTimeout(timer); }, [toast]);
   useEffect(() => {
-    api('/api/session').then((data) => setUser(data.user || null)).catch((failure) => { setUser(null); setLoginError(failure.message); });
-  }, []);
+    api('/api/session').then((data) => applyUser(data.user || null)).catch((failure) => { applyUser(null); setLoginError(failure.message); });
+  }, [applyUser]);
 
   const loadData = useCallback(async () => {
+    const snapshot = { ...contextRef.current };
+    if (!snapshot.user) return [];
+    const auth = authEpoch.current;
+    const scope = scopeEpoch.current;
+    const sequence = ++loadSequence.current;
+    const current = () => authEpoch.current === auth && scopeEpoch.current === scope && loadSequence.current === sequence;
+    setLoading(true);
     try {
       const session = await api('/api/session');
+      if (!current()) return [];
       const currentUser = session.user;
-      if (!currentUser) { setUser(null); return; }
-      setUser((old) => JSON.stringify(old) === JSON.stringify(currentUser) ? old : currentUser);
-      const [caseData, defectData, fileData] = await Promise.all(['cases', 'defects', 'files'].map((module) => permitted(currentUser, module) ? api(`/api/${module}`) : Promise.resolve({})));
-      setCases(caseData.cases || []); setDefects(defectData.defects || []); setFiles(fileData.files || []);
+      if (!currentUser) { applyUser(null); return []; }
+      applyUser(currentUser);
+      if (!current()) return [];
+      const canLoadProjects = currentUser.role === 'admin' || permitted(currentUser, 'cases') || permitted(currentUser, 'defects');
+      const scoped = ['cases', 'defects'].includes(snapshot.active) && snapshot.projectId && permitted(currentUser, snapshot.active);
+      const [projectData, recordData, fileData] = await Promise.all([
+        canLoadProjects ? api('/api/projects') : Promise.resolve({ projects: [] }),
+        scoped ? api(`/api/${snapshot.active}?projectId=${encodeURIComponent(snapshot.projectId)}`) : Promise.resolve({}),
+        snapshot.active === 'files' && permitted(currentUser, 'files') ? api('/api/files') : Promise.resolve({}),
+      ]);
+      if (!current()) return [];
+      const latestProjects = projectData.projects || [];
+      setProjects(latestProjects);
+      if (snapshot.projectId && !latestProjects.some((project) => project.id === snapshot.projectId)) { changeProject(null); return latestProjects; }
+      setCases(snapshot.active === 'cases' ? recordData.cases || [] : []);
+      setDefects(snapshot.active === 'defects' ? recordData.defects || [] : []);
+      setFiles(fileData.files || []);
       setError('');
+      return latestProjects;
     } catch (failure) {
-      if (failure.status === 401) setUser(null);
-      else setError(failure.message);
-    }
-  }, []);
+      if (authEpoch.current === auth && failure.status === 401) applyUser(null);
+      else if (current()) setError(failure.message);
+      return [];
+    } finally { if (current()) setLoading(false); }
+  }, [applyUser, changeProject]);
+
+  useEffect(() => { if (user) loadData(); }, [user?.id, active, selectedProjectId, loadData]);
 
   useEffect(() => {
     if (!user) return undefined;
     let alive = true;
     let socket;
     let retryTimer;
-    setLoading(true);
-    loadData().finally(() => { if (alive) setLoading(false); });
+    const auth = authEpoch.current;
     api('/api/config').then((data) => { if (alive) setConfig(data); }).catch((failure) => { if (alive) setError(failure.message); });
     function connect() {
       if (!alive) return;
       setConnection('connecting');
       const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
       socket = new WebSocket(`${protocol}//${location.host}/api/events`);
-      socket.onopen = () => { if (alive) { setConnection('online'); loadData(); } };
-      socket.onmessage = () => { if (alive) loadData(); };
+      socket.onopen = () => { if (alive && authEpoch.current === auth) { setConnection('online'); loadData(); } };
+      socket.onmessage = () => { if (alive && authEpoch.current === auth) loadData(); };
       socket.onerror = () => { if (alive) setConnection('offline'); };
       socket.onclose = () => { if (alive) { setConnection('offline'); loadData(); retryTimer = setTimeout(connect, 3000); } };
     }
     connect();
     return () => { alive = false; clearTimeout(retryTimer); socket?.close(); };
-  }, [user, loadData]);
+  }, [user?.id, loadData]);
 
   async function login(username, password, remember, register) {
     setLoginBusy(true); setLoginError('');
@@ -418,43 +475,75 @@ export default function App() {
       const data = await api(register ? '/api/register' : '/api/session', { method: 'POST', body: JSON.stringify({ username, password, remember }) });
       try { if (remember) await rememberLogin(username, password); else await forgetLogin(); }
       catch { setToast('登录成功，但浏览器未允许保存账号密码'); }
-      setUser(data.user);
+      applyUser(data.user);
     }
     catch (failure) { setLoginError(failure.message); }
     finally { setLoginBusy(false); }
   }
   async function logout() {
-    try { await api('/api/session', { method: 'DELETE' }); setUser(null); setCases([]); setDefects([]); setFiles([]); setDetail(null); setForm(null); setUsersOpen(false); setPasswordOpen(false); }
+    try { await api('/api/session', { method: 'DELETE' }); applyUser(null); }
     catch (failure) { setError(failure.message); }
   }
-  function navigate(next) { setActive(next); setMobileOpen(false); setError(''); setDetail(null); }
-  function openForm(kind, record = null, sourceIndex = null, onSaved = null) { setForm({ kind, record, sourceIndex, onSaved }); setDetail(null); setFormError(''); }
+  function navigate(next) { contextRef.current.active = next; changeProject(null); setActive(next); setMobileOpen(false); }
+  function openForm(kind, record = null, projectId = selectedProjectId, sourceIndex = null, onSaved = null) {
+    if (!projectId || !projects.some((project) => project.id === projectId) || !permitted(user, kind, 'write')) return;
+    setForm({ kind, record, projectId, sourceIndex, onSaved }); setDetail(null); setFormError('');
+  }
   async function saveForm(values) {
     setFormBusy(true); setFormError('');
-    const { kind, record, sourceIndex, onSaved } = form;
+    const submittedForm = form;
+    const { kind, record, projectId, sourceIndex, onSaved } = submittedForm;
+    const auth = authEpoch.current; const scope = scopeEpoch.current;
+    const current = () => authEpoch.current === auth && scopeEpoch.current === scope;
     try {
       const isEdit = Boolean(record?.id);
-      const payload = { ...values };
+      const payload = { ...values, projectId };
       if (isEdit) payload.revision = record.revision;
       else delete payload.revision;
       await api(`/api/${kind}${isEdit ? `/${encodeURIComponent(record.id)}` : ''}`, { method: isEdit ? 'PUT' : 'POST', body: JSON.stringify(payload) });
+      if (!current()) return;
       setForm(null); setToast(isEdit ? '已保存修改' : kind === 'cases' ? '用例已添加' : '缺陷已添加');
       if (sourceIndex !== null) onSaved?.(sourceIndex);
       await loadData();
     } catch (failure) {
+      if (!current()) return;
       setFormError(failure.status === 409 ? '记录已被他人修改，请查看最新记录后重新编辑。' : failure.message);
       if (failure.status === 409) await loadData();
-    } finally { setFormBusy(false); }
+    } finally { if (current()) setFormBusy(false); }
   }
   async function deleteRecord(kind, record) {
     if (!window.confirm(`确定删除“${record.title}”吗？此操作无法撤销。`)) return;
-    try { await api(`/api/${kind}/${encodeURIComponent(record.id)}`, { method: 'DELETE', body: JSON.stringify({ revision: record.revision }) }); setDetail(null); setToast('记录已删除'); await loadData(); }
-    catch (failure) { if (failure.status === 409) await loadData(); setError(failure.status === 409 ? '记录已被他人修改，请查看最新内容后重新确认删除。' : failure.message); }
+    const auth = authEpoch.current; const scope = scopeEpoch.current;
+    const current = () => authEpoch.current === auth && scopeEpoch.current === scope;
+    try { await api(`/api/${kind}/${encodeURIComponent(record.id)}`, { method: 'DELETE', body: JSON.stringify({ revision: record.revision, projectId: record.projectId }) }); if (!current()) return; setDetail(null); setToast('记录已删除'); await loadData(); }
+    catch (failure) { if (!current()) return; if (failure.status === 409) await loadData(); if (current()) setError(failure.status === 409 ? '记录已被他人修改，请查看最新内容后重新确认删除。' : failure.message); }
   }
-  async function saveGenerated(record) {
-    const payload = { ...record }; delete payload.id; delete payload.revision; delete payload.createdAt; delete payload.updatedAt;
+  async function saveGenerated(record, projectId) {
+    if (!projectId || !projects.some((project) => project.id === projectId)) throw new Error('请先选择保存到的项目组');
+    const auth = authEpoch.current; const scope = scopeEpoch.current;
+    const payload = { ...record, projectId }; delete payload.id; delete payload.revision; delete payload.createdAt; delete payload.updatedAt;
     await api('/api/cases', { method: 'POST', body: JSON.stringify(payload) });
+    if (authEpoch.current !== auth || scopeEpoch.current !== scope) return;
     setToast('用例已添加'); await loadData();
+  }
+  async function createProject(name) {
+    const auth = authEpoch.current;
+    const result = await api('/api/projects', { method: 'POST', body: JSON.stringify({ name }) });
+    if (authEpoch.current === auth) { await loadData(); setToast('项目组已创建'); }
+    return result.project;
+  }
+  async function renameProject(project, name) {
+    const auth = authEpoch.current;
+    const result = await api(`/api/projects/${encodeURIComponent(project.id)}`, { method: 'PUT', body: JSON.stringify({ name, revision: project.revision }) });
+    if (authEpoch.current === auth) { await loadData(); setToast('项目组已重命名'); }
+    return result.project;
+  }
+  async function uploadProjectIcon(project, file) {
+    const auth = authEpoch.current;
+    const body = new FormData(); body.append('file', file); body.append('revision', String(project.revision));
+    const result = await api(`/api/projects/${encodeURIComponent(project.id)}/icon`, { method: 'POST', body });
+    if (authEpoch.current === auth) { await loadData(); setToast('项目图标已更新'); }
+    return result.project;
   }
   async function upload(file) {
     const body = new FormData(); body.append('file', file);
@@ -471,6 +560,8 @@ export default function App() {
   const currentNav = NAV.find((item) => item.id === active);
   const canView = permitted(user, active);
   const canWrite = permitted(user, active, 'write');
+  const selectedProject = projects.find((project) => project.id === selectedProjectId);
+  const formProject = form && projects.find((project) => project.id === form.projectId);
   const selectedRecord = detail && (detail.kind === 'cases' ? cases : defects).find((item) => item.id === detail.id);
   return <div className={`app-shell ${collapsed ? 'sidebar-collapsed' : ''} ${mobileOpen ? 'mobile-open' : ''}`}>
     {mobileOpen && <button type="button" className="mobile-shade" aria-label="关闭导航" onClick={() => setMobileOpen(false)} />}
@@ -478,13 +569,19 @@ export default function App() {
       <div className="sidebar-label">工作空间</div><nav aria-label="主导航">{NAV.filter(({ id }) => permitted(user, id)).map(({ id, label, icon: Icon }) => <button className={`nav-item ${active === id ? 'active' : ''}`} type="button" key={id} onClick={() => navigate(id)} title={collapsed ? label : undefined} aria-current={active === id ? 'page' : undefined}><Icon size={19} strokeWidth={1.8} /><span>{label}</span>{active === id && <span className="nav-active-dot" />}</button>)}</nav>
       <div className="sidebar-bottom"><div className="sidebar-hint"><ShieldCheck size={17} /><span>公司内网工作区</span></div><button type="button" className="collapse-control" title={collapsed ? '展开侧边栏' : '收起侧边栏'} aria-label={collapsed ? '展开侧边栏' : '收起侧边栏'} onClick={() => setCollapsed(!collapsed)}>{collapsed ? <PanelLeftOpen size={19} /> : <PanelLeftClose size={19} />}<span>收起侧边栏</span></button></div>
     </aside>
-      <div className="main-column"><header className="topbar"><div className="topbar-left"><IconButton icon={Menu} label="打开导航" className="mobile-menu" onClick={() => setMobileOpen(true)} /><span className="breadcrumb-parent">工作空间</span><ChevronRight size={15} className="breadcrumb-chevron" /><strong>{currentNav.label}</strong></div><div className="topbar-right"><div className={`connection ${connection}`} title={connection === 'online' ? '实时连接已建立' : '实时连接未建立，正在重试'}>{connection === 'online' ? <Wifi size={15} /> : <WifiOff size={15} />}<span>{connection === 'online' ? '实时在线' : connection === 'connecting' ? '连接中' : '重连中'}</span></div><span className="topbar-divider" /><div className="user-menu"><span className="avatar">{String(user.username || '用').slice(0, 1).toUpperCase()}</span><span className="user-name">{user.username}</span></div>{user.role === 'admin' && <IconButton icon={Users} label="账号管理" onClick={() => setUsersOpen(true)} />}<IconButton icon={KeyRound} label="修改我的密码" onClick={() => setPasswordOpen(true)} /><IconButton icon={LogOut} label="退出登录" onClick={logout} /></div></header>
+      <div className="main-column"><header className="topbar"><div className="topbar-left"><IconButton icon={Menu} label="打开导航" className="mobile-menu" onClick={() => setMobileOpen(true)} /><span className="breadcrumb-parent">工作空间</span><ChevronRight size={15} className="breadcrumb-chevron" /><strong>{currentNav.label}</strong>{selectedProject && <><ChevronRight size={15} className="breadcrumb-chevron" /><span className="breadcrumb-project"><ProjectIcon project={selectedProject} small /><strong title={selectedProject.name}>{selectedProject.name}</strong></span></>}</div><div className="topbar-right"><div className={`connection ${connection}`} title={connection === 'online' ? '实时连接已建立' : '实时连接未建立，正在重试'}>{connection === 'online' ? <Wifi size={15} /> : <WifiOff size={15} />}<span>{connection === 'online' ? '实时在线' : connection === 'connecting' ? '连接中' : '重连中'}</span></div><span className="topbar-divider" /><div className="user-menu"><span className="avatar">{String(user.username || '用').slice(0, 1).toUpperCase()}</span><span className="user-name">{user.username}</span></div>{user.role === 'admin' && <IconButton icon={Users} label="账号管理" onClick={() => setUsersOpen(true)} />}<IconButton icon={KeyRound} label="修改我的密码" onClick={() => setPasswordOpen(true)} /><IconButton icon={LogOut} label="退出登录" onClick={logout} /></div></header>
       {error && <div className="global-error"><AlertCircle size={17} /><span>{error}</span><IconButton icon={X} label="关闭错误提示" onClick={() => setError('')} /></div>}
-      <main className={`content ${canWrite ? '' : 'read-only-module'}`}>{!canView ? <Empty icon={ShieldCheck} title="暂未开放模块权限" detail="请联系管理员分配工作区权限。" action={<button className="button secondary" type="button" onClick={() => setPasswordOpen(true)}><KeyRound size={16} />修改我的密码</button>} /> : active === 'cases' || active === 'defects' ? <RecordPage canWrite={canWrite} key={active} kind={active} items={active === 'cases' ? cases : defects} loading={loading} onNew={() => canWrite && openForm(active)} onSelect={(record) => setDetail({ kind: active, id: record.id })} onRefresh={loadData} /> : active === 'ai' ? <AiPage canWrite={canWrite} canSave={permitted(user, 'cases', 'write')} config={config} onSave={saveGenerated} onEdit={(record, index, onSaved) => permitted(user, 'cases', 'write') && openForm('cases', record, index, onSaved)} showError={setError} /> : <FilesPage canWrite={canWrite} files={files} loading={loading} maxUploadMb={config.maxUploadMb} onUpload={upload} onDelete={deleteFile} onRefresh={loadData} showError={setError} />}</main>
+      <main className={`content ${canWrite ? '' : 'read-only-module'}`}>
+        {!canView ? <Empty icon={ShieldCheck} title="暂未开放模块权限" detail="请联系管理员分配工作区权限。" action={<button className="button secondary" type="button" onClick={() => setPasswordOpen(true)}><KeyRound size={16} />修改我的密码</button>} />
+          : active === 'cases' || active === 'defects' ? selectedProject ? <><ProjectContext project={selectedProject} onBack={() => changeProject(null)} /><RecordPage canWrite={canWrite} key={`${active}-${selectedProject.id}`} kind={active} items={active === 'cases' ? cases : defects} loading={loading} onNew={() => canWrite && openForm(active)} onSelect={(record) => setDetail({ kind: active, id: record.id })} onRefresh={loadData} /></>
+            : <ProjectsPage key={active} kind={active} projects={projects} loading={loading} canManage={user.role === 'admin'} onSelect={(project) => changeProject(project.id)} onRefresh={loadData} onCreate={createProject} onRename={renameProject} onUpload={uploadProjectIcon} />
+          : active === 'ai' ? <AiPage canWrite={canWrite} canSave={permitted(user, 'cases', 'write')} config={config} projects={projects} onSave={saveGenerated} onEdit={(record, projectId, index, onSaved) => permitted(user, 'cases', 'write') && openForm('cases', record, projectId, index, onSaved)} showError={setError} />
+            : <FilesPage canWrite={canWrite} files={files} loading={loading} maxUploadMb={config.maxUploadMb} onUpload={upload} onDelete={deleteFile} onRefresh={loadData} showError={setError} />}
+      </main>
       {toast && <div className="toast" role="status"><Check size={17} />{toast}</div>}
     </div>
     {selectedRecord && permitted(user, detail.kind) && <RecordDetail kind={detail.kind} record={selectedRecord} canWrite={permitted(user, detail.kind, 'write')} onClose={() => setDetail(null)} onEdit={() => openForm(detail.kind, selectedRecord)} onDelete={() => deleteRecord(detail.kind, selectedRecord)} />}
-    {form && <RecordForm key={`${form.kind}-${form.record?.id || 'new'}-${form.sourceIndex ?? ''}`} kind={form.kind} initial={form.record} mode={form.record?.id ? 'edit' : 'new'} onClose={() => setForm(null)} onSave={saveForm} busy={formBusy} error={formError} onReload={() => setForm(null)} />}
+    {form && formProject && <RecordForm key={`${form.kind}-${form.projectId}-${form.record?.id || 'new'}-${form.sourceIndex ?? ''}`} kind={form.kind} initial={form.record} project={formProject} mode={form.record?.id ? 'edit' : 'new'} onClose={() => { if (!formBusy) setForm(null); }} onSave={saveForm} busy={formBusy} error={formError} onReload={() => setForm(null)} />}
     {passwordOpen && <PasswordDialog onClose={() => setPasswordOpen(false)} onSaved={() => { setPasswordOpen(false); setToast('密码已修改，请在下次登录时使用新密码'); }} />}
     {usersOpen && user.role === 'admin' && <UsersDialog onClose={() => setUsersOpen(false)} onChanged={loadData} />}
   </div>;
