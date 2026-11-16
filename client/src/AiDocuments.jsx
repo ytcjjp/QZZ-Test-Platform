@@ -103,7 +103,6 @@ export default function AiDocuments({ config = {}, projects = [], canWrite, canS
     const selected = files ? Array.from(files) : [];
     if (!selected.length && !link?.trim()) return;
     if (selected.length + documents.length + (link ? 1 : 0) > 5) { setError('每次最多使用 5 份策划文档'); return; }
-    if (selected.some((file) => file.size > 20 * 1024 * 1024)) { setError('策划文档不能超过 20 MB'); return; }
     if (selected.some((file) => !/\.(docx?|pdf|md|markdown|txt)$/i.test(file.name))) { setError('请选择 Word、PDF、Markdown 或 TXT 文档'); return; }
     const token = ++operation.current;
     locked.current = true; setBusy('import'); setError('');
@@ -176,7 +175,7 @@ export default function AiDocuments({ config = {}, projects = [], canWrite, canS
       <input ref={input} type="file" accept=".doc,.docx,.pdf,.md,.markdown,.txt" multiple hidden onChange={(event) => importSources(event.target.files)} />
       <div className={`ai-document-drop ${dragging ? 'dragging' : ''}`} onDragOver={(event) => { event.preventDefault(); if (canWrite && !busy) setDragging(true); }} onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setDragging(false); }} onDrop={drop}>
         {busy === 'import' ? <LoaderCircle size={27} className="spin" /> : <Upload size={27} />}
-        <strong>{busy === 'import' ? '正在读取策划文档…' : '拖入策划文档或飞书地址'}</strong><span>Word / PDF / Markdown / TXT · 最大 20 MB</span>
+        <strong>{busy === 'import' ? '正在读取策划文档…' : '拖入策划文档或飞书地址'}</strong><span>Word / PDF / Markdown / TXT</span>
         <button type="button" className="button secondary" disabled={!canWrite || Boolean(busy) || documents.length >= 5} onClick={() => input.current?.click()}><Plus size={16} />选择文档</button>
       </div>
       <form className="ai-link-form" onSubmit={(event) => { event.preventDefault(); importSources(null, url); }}>

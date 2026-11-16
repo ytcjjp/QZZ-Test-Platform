@@ -78,7 +78,7 @@ AI 用例生成默认关闭。配置 `AI_API_KEY`、`AI_MODEL`，以及可选的
 入口仅接收策划文档，不再接受手写 `requirements`。`POST /api/ai/documents`
 上传 multipart `file`（Word `.doc/.docx`、PDF、Markdown、TXT），或 JSON `{url}`
 导入飞书 / Lark 的 `docx/docs/wiki` 地址，返回 `{document:{id,name,text,chars}}`。
-每份文档最多 20 MB、10 万字符，PDF 最多 300 页；扫描版 PDF 无 OCR，
+策划文档上传不设置固定文件大小上限；解析后的正文最多 10 万字符，PDF 最多 300 页；扫描版 PDF 无 OCR，
 无可读文字时明确拒绝，不会用空文档生成。暂存文档按账号隔离、24 小时过期，
 可用 `DELETE /api/ai/documents/:id` 移除。文件只用于提取，原二进制不持久保存。
 

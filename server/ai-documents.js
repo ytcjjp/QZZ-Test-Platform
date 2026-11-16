@@ -11,7 +11,6 @@ import { loadPasswordKey, encryptPassword, decryptPassword } from './passwords.j
 import { normalizeTree } from './mindmap-formats.js';
 import { uploadFilename } from './upload-name.js';
 
-const MAX_BYTES = 20 * 1024 * 1024;
 const MAX_CHARS = 100000;
 const DOCUMENT_TTL = 24 * 60 * 60 * 1000;
 const BRANCHES = ['主流程', 'UI', '异常与边界', '受影响模块'];
@@ -34,7 +33,6 @@ export function documentName(original) {
 
 export async function extractDocument(file) {
   if (!file?.buffer?.length) throw new DocumentError('请选择策划文档');
-  if (file.buffer.length > MAX_BYTES) throw new DocumentError('策划文档不能超过 20 MB', 413);
   const extension = path.extname(file.originalname || '').toLowerCase();
   let text;
   try {
@@ -231,11 +229,11 @@ export function registerAiRoutes(app, { db, dataDir, sendError, inputError, auth
       .map((document) => ({ ...document, name: documentName(document.name), chars: document.text.length }));
     res.json({ documents });
   });
-  const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_BYTES, files: 1, fields: 0 } });
+  const upload = multer({ storage: multer.memoryStorage(), limits: { files: 1, fields: 0 } });
   let parsing = 0;
   app.post('/api/ai/documents', (req, res, next) => {
     if (!req.is('multipart/form-data')) return next();
-    upload.single('file')(req, res, (error) => error ? sendError(res, error.code === 'LIMIT_FILE_SIZE' ? 413 : 400, 'upload_error', error.code === 'LIMIT_FILE_SIZE' ? '策划文档不能超过 20 MB' : '请选择一个有效的策划文档') : next());
+    upload.single('file')(req, res, (error) => error ? sendError(res, 400, 'upload_error', '请选择一个有效的策划文档') : next());
   }, async (req, res) => {
     if (parsing >= 3) return sendError(res, 429, 'busy', '当前正在读取较多文档，请稍后重试');
     parsing += 1;
