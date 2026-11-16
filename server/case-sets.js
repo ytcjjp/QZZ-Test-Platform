@@ -54,7 +54,7 @@ export function registerCaseSetRoutes(app, { db, projects, sendError, inputError
       const selection = selected(req.body);
       const action = req.body.action;
       if (action !== 'delete' && !(table === 'defects' && action === 'status')) throw inputError('批量操作不正确');
-      if (action === 'status' && !['待处理', '处理中', '待验证', '已解决', '已关闭'].includes(req.body.status)) throw inputError('缺陷状态不正确');
+      if (action === 'status' && !['待处理', '处理中', '待验证', '已解决', '已关闭', '搁置'].includes(req.body.status)) throw inputError('缺陷状态不正确');
       const rows = currentItems(req, res, table, selection);
       if (!rows) return;
       const now = new Date().toISOString();

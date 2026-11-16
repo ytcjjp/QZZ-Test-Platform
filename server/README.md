@@ -65,10 +65,11 @@ AI 生成草稿无需项目，保存进用例库时必须选择所属项目。
 
 - `/api/cases` 的一条记录现在代表一个用例集，保留原有字段，并新增 `tree`：`{id,title,children:[...]}`。`POST` 仅传 `{projectId,title}` 即创建只有中心主题的空白导图；`PUT /api/cases/:id` 传 `{projectId,revision,title?,tree?}` 保存，修订冲突返回 409。旧用例在迁移中转成包含模块、优先级、状态、前置条件、步骤、预期、标签和备注的导图，原字段、ID、修订和时间均保留。
 - 节点 ID 只接受 1-100 位字母、数字、下划线或连字符，单图不允许重复。导图上限为 5000 节点、64 层、50 万字符，单节点 3 万字符；JSON 请求上限 4 MB。
+- 节点可带 `style`，支持 `fontSize`（12-48 的整数加 `px`）、`color`/`background`（六位十六进制色）、`fontWeight`（`normal`/`bold`）、`fontStyle`（`normal`/`italic`）、`textDecoration`（`none`/`underline`）。保存、版本检查和现代 XMind 显式节点样式往返均保留这些字段；空对象或省略 `style` 恢复默认。拒绝其他 CSS 属性和值。Markdown 仍只保留主题文字与层级。
 - `POST /api/cases/import`：multipart 字段 `projectId`、`file`，支持 UTF-8 `.md/.markdown` 和 `.xmind`，返回 `{cases}`。多个一级标题或 XMind 多画布导入为多个用例集；导入一次最多 100 个用例集。XMind 支持现代 `content.json` 和旧版 `content.xml`，读取主题文本和层级，不导入原应用的主题样式、画布坐标、图片附件等。文件上限 10 MB；Markdown 文字上限 2 MB，归档目录和解压内容另有上限。
 - `POST /api/cases/export`：JSON `{projectId,items:[{id,revision}],format:"md"|"xmind"}`，有用例查看权限即可导出。单个 Markdown 返回 `.md`，多个返回包含独立 `.md` 的 ZIP；XMind 返回真实的多画布 `.xmind` ZIP。一次导出最多 1000 个用例集、8 MB UTF-8 导图内容；XMind 另限 100 个画布，含格式结构的 `content.json` 也不能超过 8 MB，以保证可重新导入。超限返回 413 并提示分批；单个 Markdown 转义后的文字也须符合 2 MB 限制。失效修订拒绝导出。
 - `POST /api/cases/batch`：`{projectId,items:[{id,revision}],action:"delete"}`。
-- `POST /api/defects/batch`：同上，支持 `action:"delete"` 或 `action:"status",status:"待处理"|"处理中"|"待验证"|"已解决"|"已关闭"`。单条列表状态修改同样使用此接口，`items` 只有一条。
+- `POST /api/defects/batch`：同上，支持 `action:"delete"` 或 `action:"status",status:"待处理"|"处理中"|"待验证"|"搁置"|"已解决"|"已关闭"`。单条列表状态修改同样使用此接口，`items` 只有一条。
 - 批量操作须有相应模块写权限，最多 1000 条，不接受重复 ID。先校验全部项目归属和修订，再在事务内整体提交；任一条过期返回 409、跨项目或不存在返回 404，不会部分成功。成功返回 `{ok:true,count}`，逐记录发送原有实时事件。记录删除不可恢复，网页需要用户确认；项目组删除则可从已删除项目恢复。
 
 AI 用例生成默认关闭。配置 `AI_API_KEY`、`AI_MODEL`，以及可选的

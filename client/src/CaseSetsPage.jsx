@@ -2,9 +2,9 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import MindElixir from 'mind-elixir';
 import 'mind-elixir/style.css';
 import {
-  AlertCircle, ArrowLeft, Check, ChevronRight, Download, GitBranch,
-  Maximize, Pencil, Plus, Redo2, RefreshCw, Save, Search, Trash2,
-  Undo2, Upload, X, ZoomIn, ZoomOut,
+  AlertCircle, ArrowLeft, Bold, Check, ChevronRight, Download, Eraser, GitBranch,
+  Italic, Maximize, PaintBucket, Pencil, Plus, Redo2, RefreshCw, Save, Search,
+  Trash2, Type, Underline, Undo2, Upload, X, ZoomIn, ZoomOut,
 } from 'lucide-react';
 import './case-sets.css';
 
@@ -24,18 +24,71 @@ async function request(url, options = {}) {
 
 const nodeId = () => globalThis.crypto?.randomUUID?.() || `node-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 const blankTree = (title) => ({ id: nodeId(), title, children: [] });
-const toMindNode = (tree) => ({ id: tree.id, topic: tree.title, children: (tree.children || []).map(toMindNode), expanded: true });
-const fromMindNode = (node) => ({ id: node.id, title: node.topic, children: (node.children || []).map(fromMindNode) });
+const STYLE_RULES = {
+  fontSize: /^(?:1[2-9]|[23]\d|4[0-8])px$/,
+  color: /^#[\da-f]{6}$/i, background: /^#[\da-f]{6}$/i,
+  fontWeight: /^(normal|bold)$/, fontStyle: /^(normal|italic)$/, textDecoration: /^(none|underline)$/,
+};
+function nodeStyle(style) {
+  const result = {};
+  for (const [key, pattern] of Object.entries(STYLE_RULES)) {
+    if (typeof style?.[key] === 'string' && pattern.test(style[key])) result[key] = style[key].toLowerCase();
+  }
+  return Object.keys(result).length ? result : undefined;
+}
+const styleField = (style) => { const value = nodeStyle(style); return value ? { style: value } : {}; };
+const toMindNode = (tree) => ({ id: tree.id, topic: tree.title, children: (tree.children || []).map(toMindNode), ...styleField(tree.style), expanded: true });
+const fromMindNode = (node) => ({ id: node.id, title: node.topic, children: (node.children || []).map(fromMindNode), ...styleField(node.style) });
+const canonicalTree = (tree) => ({ id: tree.id, title: tree.title, children: (tree.children || []).map(canonicalTree), ...styleField(tree.style) });
 const countNodes = (tree) => tree ? 1 + (tree.children || []).reduce((sum, node) => sum + countNodes(node), 0) : 0;
-const signature = (title, tree) => JSON.stringify([title, tree]);
+const signature = (title, tree) => JSON.stringify([title, canonicalTree(tree)]);
+const FONT_SIZES = Array.from({ length: 19 }, (_, index) => `${12 + index * 2}px`);
+const EMPTY_FORMAT = { fontSize: null, color: null, background: null, bold: false, italic: false, underline: false };
+const CLEAR_STYLE_PROPERTIES = ['font-size', 'color', 'background', 'font-weight', 'font-style', 'text-decoration'];
+
+function cssColorHex(value, fallback) {
+  if (/^#[\da-f]{6}$/i.test(value)) return value.toLowerCase();
+  const rgb = value.match(/^rgba?\(\s*(\d+)\D+(\d+)\D+(\d+)(?:\s*[,/]\s*([\d.]+))?\s*\)$/);
+  if (!rgb || (rgb[4] !== undefined && Number(rgb[4]) === 0)) return fallback;
+  return `#${rgb.slice(1, 4).map((channel) => Math.min(255, Number(channel)).toString(16).padStart(2, '0')).join('')}`;
+}
+
+function selectedFormat(nodes) {
+  if (!nodes.length) return EMPTY_FORMAT;
+  const formats = nodes.map((node) => {
+    const computed = getComputedStyle(node);
+    return {
+      fontSize: `${Math.max(12, Math.min(48, Math.round(parseFloat(computed.fontSize) || 16)))}px`,
+      color: cssColorHex(computed.color, '#29413d'),
+      background: cssColorHex(computed.backgroundColor, '#ffffff'),
+      bold: computed.fontWeight === 'bold' || Number(computed.fontWeight) >= 600,
+      italic: computed.fontStyle === 'italic', underline: computed.textDecorationLine.includes('underline'),
+    };
+  });
+  return Object.fromEntries(Object.keys(EMPTY_FORMAT).map((key) => {
+    const value = formats[0][key];
+    return [key, formats.every((format) => format[key] === value) ? value : ['bold', 'italic', 'underline'].includes(key) ? 'mixed' : null];
+  }));
+}
 
 function dateLabel(value) {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? '-' : new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(date);
 }
 
-function Tool({ icon: Icon, label, onClick, disabled, danger = false }) {
-  return <button type="button" className={`icon-button ${danger ? 'danger' : ''}`} title={label} aria-label={label} onClick={onClick} disabled={disabled}><Icon size={17} /></button>;
+function Tool({ icon: Icon, label, onClick, disabled, danger = false, pressed }) {
+  return <button type="button" className={`icon-button ${danger ? 'danger' : ''} ${pressed === true ? 'case-format-active' : ''} ${pressed === 'mixed' ? 'case-format-mixed' : ''}`} title={label} aria-label={label} aria-pressed={pressed} onClick={onClick} disabled={disabled}><Icon size={17} /></button>;
+}
+
+function ColorTool({ icon: Icon, label, value, disabled, onChange }) {
+  const lastApplied = useRef(value);
+  useEffect(() => { lastApplied.current = value; }, [value]);
+  function apply(event) {
+    const color = event.currentTarget.value;
+    if (color === lastApplied.current) return;
+    lastApplied.current = color; onChange(color);
+  }
+  return <label className={`case-format-color ${disabled ? 'disabled' : ''}`} title={value ? label : `${label}：多种颜色`}><Icon size={16} /><span className={`case-color-swatch ${value ? '' : 'mixed'}`} style={value ? { backgroundColor: value } : undefined} /><input type="color" aria-label={label} value={value || '#ffffff'} disabled={disabled} onInput={apply} onChange={apply} /></label>;
 }
 
 function NameDialog({ initial = '', title, onClose, onSave }) {
@@ -71,6 +124,8 @@ function MindMapEditor({ record, latest, canWrite, projectId, onBack, onSaved, o
   const [nodeCount, setNodeCount] = useState(countNodes(record.tree));
   const [mapReady, setMapReady] = useState(false);
   const [history, setHistory] = useState({ undo: false, redo: false });
+  const [format, setFormat] = useState(EMPTY_FORMAT);
+  const [selectedCount, setSelectedCount] = useState(0);
   currentTitle.current = title;
   writable.current = canWrite;
   state.current = { dirty, saving };
@@ -80,6 +135,10 @@ function MindMapEditor({ record, latest, canWrite, projectId, onBack, onSaved, o
     const tree = fromMindNode(mind.current.getData().nodeData);
     setDirty(signature(currentTitle.current, tree) !== baseline.current);
     setNodeCount(countNodes(tree));
+  }, []);
+  const updateFormat = useCallback(() => {
+    const nodes = mind.current?.currentNodes || [];
+    setSelectedCount(nodes.length); setFormat(selectedFormat(nodes));
   }, []);
 
   useEffect(() => {
@@ -103,8 +162,8 @@ function MindMapEditor({ record, latest, canWrite, projectId, onBack, onSaved, o
     mind.current = instance;
     const startingTree = record.tree || blankTree(record.title);
     baseline.current = signature(record.title, startingTree);
-    const operation = () => { updateDirty(); };
-    const selection = () => { const nodes = instance.currentNodes; setSelected(Boolean(nodes.length)); setIsRoot(!nodes.length || nodes.some((node) => !node.nodeObj.parent)); };
+    const operation = () => { updateDirty(); updateFormat(); };
+    const selection = () => { const nodes = instance.currentNodes; setSelected(Boolean(nodes.length)); setIsRoot(!nodes.length || nodes.some((node) => !node.nodeObj.parent)); updateFormat(); };
     const typing = () => setDirty(true);
     instance.bus.addListener('operation', operation);
     instance.bus.addListener('selectNodes', selection);
@@ -130,14 +189,14 @@ function MindMapEditor({ record, latest, canWrite, projectId, onBack, onSaved, o
       if (failure instanceof Error) throw failure;
       ready.current = true; setMapReady(true); setNodeCount(countNodes(startingTree));
       unsubscribeHistory = instance.historyStack?.subscribe(() => {
-        updateDirty(); setHistory({ undo: instance.historyStack.canUndo, redo: instance.historyStack.canRedo });
+        updateDirty(); updateFormat(); setHistory({ undo: instance.historyStack.canUndo, redo: instance.historyStack.canRedo });
       }) || (() => {});
       instance.scaleFit();
       const root = instance.findEle(startingTree.id);
       if (root) instance.selectNode(root);
     }).catch((failure) => { if (mounted.current) setError(`思维导图加载失败：${failure.message}`); });
     return () => { mounted.current = false; ready.current = false; mind.current = null; resizeObserver.disconnect(); cancelAnimationFrame(resizeFrame); unsubscribeHistory(); instance.nodes.removeEventListener('input', typing); instance.destroy(); };
-  }, [record.id, updateDirty]);
+  }, [record.id, updateDirty, updateFormat]);
 
   useEffect(() => {
     if (!mind.current || !ready.current) return;
@@ -167,8 +226,26 @@ function MindMapEditor({ record, latest, canWrite, projectId, onBack, onSaved, o
   }
   async function act(action) {
     if (!canWrite || !ready.current || saving) return;
-    try { mind.current.container.focus(); await action(mind.current); if (mounted.current) updateDirty(); }
+    try { mind.current.container.focus(); await action(mind.current); if (mounted.current) { updateDirty(); updateFormat(); } }
     catch (failure) { if (mounted.current) setError(failure.message || '操作未完成'); }
+  }
+  async function applyFormat(patch) {
+    if (!writable.current || !ready.current || state.current.saving) return;
+    const instance = mind.current;
+    const nodes = [...instance.currentNodes];
+    if (!nodes.length) return;
+    container.current.querySelector('#input-box')?.blur();
+    try {
+      for (const node of nodes) {
+        if (patch) await instance.reshapeNode(node, { style: { ...patch } });
+        else if (node.nodeObj.style) {
+          await instance.reshapeNode(node, { style: undefined });
+          // The library records style removal but leaves existing inline CSS in this operation.
+          CLEAR_STYLE_PROPERTIES.forEach((property) => node.style.removeProperty(property));
+        }
+      }
+      if (mounted.current) { updateDirty(); updateFormat(); }
+    } catch (failure) { if (mounted.current) setError(failure.message || '格式修改失败'); }
   }
   async function save(asCopy = false) {
     if (!canWrite || !ready.current || state.current.saving || !title.trim()) return;
@@ -223,6 +300,10 @@ function MindMapEditor({ record, latest, canWrite, projectId, onBack, onSaved, o
     {remoteChanged && <div className="case-editor-warning" role="status"><AlertCircle size={16} /><span>{latest ? '此用例集已有其他人的更新。' : '此用例集已不在当前列表中。'}当前编辑已保留。</span>{latest && <button type="button" className="text-button" onClick={reloadLatest} disabled={saving || !mapReady}>载入最新版本</button>}{canWrite && <button type="button" className="text-button" onClick={() => save(true)} disabled={saving || !mapReady || !title.trim()}>另存为新用例集</button>}</div>}
     {error && <div className="inline-error" role="alert"><AlertCircle size={16} />{error}</div>}
     <div className="case-map-toolbar" aria-label="思维导图工具栏"><div>{canWrite && <><Tool icon={GitBranch} label="添加子主题" disabled={!mapReady || saving || !selected} onClick={() => act((instance) => instance.addChild())} /><Tool icon={Plus} label="添加同级主题" disabled={!mapReady || saving || !selected || isRoot} onClick={() => act((instance) => instance.insertSibling('after'))} /><Tool icon={Pencil} label="编辑主题" disabled={!mapReady || saving || !selected} onClick={() => act((instance) => instance.beginEdit())} /><Tool icon={Trash2} label="删除选中主题" danger disabled={!mapReady || saving || !selected || isRoot} onClick={() => act((instance) => instance.removeNodes(instance.currentNodes))} /><span className="case-tool-divider" /><Tool icon={Undo2} label="撤销" disabled={!mapReady || saving || !history.undo} onClick={() => act((instance) => instance.undo())} /><Tool icon={Redo2} label="重做" disabled={!mapReady || saving || !history.redo} onClick={() => act((instance) => instance.redo())} /></>}</div><div><Tool icon={ZoomOut} label="缩小" disabled={!mapReady} onClick={() => changeZoom(-0.1)} /><span className="case-zoom-value">{zoom}%</span><Tool icon={ZoomIn} label="放大" disabled={!mapReady} onClick={() => changeZoom(0.1)} /><Tool icon={Maximize} label="适应画布" disabled={!mapReady} onClick={() => { mind.current.scaleFit(); setZoom(Math.round(mind.current.scaleVal * 100)); }} /></div></div>
+    {canWrite && <div className="case-format-toolbar" role="toolbar" aria-label="主题格式工具栏">
+      <div className="case-format-group"><select aria-label="字体大小" title="字体大小" value={format.fontSize || ''} disabled={!mapReady || saving || !selected} onChange={(event) => applyFormat({ fontSize: event.target.value })}><option value="" disabled>{selected ? '混合' : '字号'}</option>{[...new Set([...FONT_SIZES, ...(format.fontSize ? [format.fontSize] : [])])].sort((a, b) => parseInt(a) - parseInt(b)).map((value) => <option key={value} value={value}>{parseInt(value)} px</option>)}</select><Tool icon={Bold} label="加粗" pressed={format.bold} disabled={!mapReady || saving || !selected} onClick={() => applyFormat({ fontWeight: format.bold === true ? 'normal' : 'bold' })} /><Tool icon={Italic} label="斜体" pressed={format.italic} disabled={!mapReady || saving || !selected} onClick={() => applyFormat({ fontStyle: format.italic === true ? 'normal' : 'italic' })} /><Tool icon={Underline} label="下划线" pressed={format.underline} disabled={!mapReady || saving || !selected} onClick={() => applyFormat({ textDecoration: format.underline === true ? 'none' : 'underline' })} /></div>
+      <span className="case-tool-divider" /><div className="case-format-group"><ColorTool icon={Type} label="文字颜色" value={format.color} disabled={!mapReady || saving || !selected} onChange={(value) => applyFormat({ color: value })} /><ColorTool icon={PaintBucket} label="背景颜色" value={format.background} disabled={!mapReady || saving || !selected} onChange={(value) => applyFormat({ background: value })} /><Tool icon={Eraser} label="清除格式" disabled={!mapReady || saving || !selected} onClick={() => applyFormat(null)} /></div>{selectedCount > 1 && <span className="case-format-selection">{selectedCount} 个主题</span>}
+    </div>}
     <div className="case-map-canvas" ref={container} role="region" aria-label="用例思维导图" />
     <div className="case-editor-footer"><span>{nodeCount} 个主题</span><span>{canWrite ? '可编辑' : '只读'} · 版本 {base.current.revision}</span></div>
   </section>;

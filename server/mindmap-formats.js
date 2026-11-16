@@ -8,6 +8,59 @@ export const TREE_LIMITS = { nodes: 5000, depth: 64, text: 500000, topic: 30000 
 export const FORMAT_LIMITS = { contentBytes: 8 * 1024 * 1024, markdownChars: 2 * 1024 * 1024, sheets: 100 };
 export const blankTree = (title) => ({ id: crypto.randomUUID(), title, children: [] });
 
+const STYLE_RULES = {
+  fontSize: /^(?:1[2-9]|[23][0-9]|4[0-8])px$/,
+  color: /^#[0-9a-f]{6}$/i,
+  background: /^#[0-9a-f]{6}$/i,
+  fontWeight: /^(?:normal|bold)$/,
+  fontStyle: /^(?:normal|italic)$/,
+  textDecoration: /^(?:none|underline)$/,
+};
+
+function normalizeStyle(value) {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('思维导图节点样式格式不正确');
+  const result = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (!Object.hasOwn(STYLE_RULES, key) || typeof item !== 'string' || item !== item.trim() || !STYLE_RULES[key].test(item)) throw new Error('思维导图节点样式包含不支持的属性或值');
+    result[key] = key === 'color' || key === 'background' ? item.toLowerCase() : item;
+  }
+  return Object.keys(result).length ? result : undefined;
+}
+
+function importXmindStyle(properties) {
+  if (!properties || typeof properties !== 'object' || Array.isArray(properties)) return undefined;
+  const style = {};
+  const fontSize = properties['fo:font-size'];
+  let pixels;
+  if (typeof fontSize === 'number') pixels = fontSize;
+  else if (typeof fontSize === 'string') {
+    const match = fontSize.trim().match(/^(\d+(?:\.\d+)?)(px|pt)?$/);
+    if (match) pixels = Number(match[1]) * (match[2] === 'pt' ? 4 / 3 : 1);
+  }
+  if (Number.isFinite(pixels)) {
+    pixels = Math.round(pixels);
+    if (pixels >= 12 && pixels <= 48) style.fontSize = `${pixels}px`;
+  }
+  for (const [key, property] of Object.entries({ color: 'fo:color', background: 'svg:fill', fontWeight: 'fo:font-weight', fontStyle: 'fo:font-style', textDecoration: 'fo:text-decoration' })) {
+    const raw = properties[property];
+    const value = typeof raw === 'string' ? raw.trim() : raw;
+    if (typeof value === 'string' && STYLE_RULES[key].test(value)) style[key] = value;
+    else if (key === 'fontWeight' && [400, 500, 600, 700, 800, 900].includes(Number(value))) style.fontWeight = Number(value) >= 600 ? 'bold' : 'normal';
+  }
+  return normalizeStyle(style);
+}
+
+function exportXmindStyle(style) {
+  const normalized = normalizeStyle(style);
+  if (!normalized) return undefined;
+  const properties = {};
+  for (const [key, property] of Object.entries({ fontSize: 'fo:font-size', color: 'fo:color', background: 'svg:fill', fontWeight: 'fo:font-weight', fontStyle: 'fo:font-style', textDecoration: 'fo:text-decoration' })) {
+    if (normalized[key] !== undefined) properties[property] = key === 'fontSize' ? `${Number.parseInt(normalized[key], 10) * 3 / 4}pt` : normalized[key];
+  }
+  return { id: crypto.randomUUID(), type: 'topic', properties };
+}
+
 function transferLimit(message) { const error = new Error(message); error.status = 413; return error; }
 
 export function assertTransferSize(sets, reimportIds = false) {
@@ -33,7 +86,8 @@ export function normalizeTree(value) {
     if (typeof id !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(id) || ids.has(id)) throw new Error('思维导图节点 ID 重复或格式不正确');
     ids.add(id);
     if (node.children !== undefined && !Array.isArray(node.children)) throw new Error('思维导图子节点格式不正确');
-    return { id, title: node.title, children: (node.children || []).map((child) => visit(child, depth + 1)) };
+    const style = normalizeStyle(node.style);
+    return { id, title: node.title, children: (node.children || []).map((child) => visit(child, depth + 1)), ...(style ? { style } : {}) };
   }
   return visit(value, 0);
 }
@@ -140,7 +194,8 @@ export function importXmind(bytes) {
       if (!node || depth > TREE_LIMITS.depth || typeof node.title !== 'string') throw new Error('XMind 节点格式不正确');
       const children = [...(node.children?.attached || []), ...(node.children?.detached || [])];
       if (children.length > TREE_LIMITS.nodes) throw new Error('XMind 节点过多');
-      return { id: crypto.randomUUID(), title: node.title, children: children.map((child) => topic(child, depth + 1)) };
+      const style = importXmindStyle(node.style?.properties);
+      return { id: crypto.randomUUID(), title: node.title, children: children.map((child) => topic(child, depth + 1)), ...(style ? { style } : {}) };
     }
     sheets = content.map((sheet) => { count = 0; return { title: String(sheet.title || sheet.rootTopic?.title || '导入用例集').slice(0, 200), tree: normalizeTree(topic(sheet.rootTopic)) }; });
   } else if (files['content.xml']) {
@@ -168,7 +223,10 @@ export function exportXmind(sets) {
   if (!sets.length || sets.length > FORMAT_LIMITS.sheets) throw transferLimit('XMind 一次最多导出 100 个画布，请分批导出');
   assertTransferSize(sets);
   assertTransferSize(sets, true);
-  function topic(node) { return { id: crypto.randomUUID(), class: 'topic', title: node.title, ...(node.children.length ? { children: { attached: node.children.map(topic) } } : {}) }; }
+  function topic(node) {
+    const style = exportXmindStyle(node.style);
+    return { id: crypto.randomUUID(), class: 'topic', title: node.title, ...(style ? { style } : {}), ...(node.children.length ? { children: { attached: node.children.map(topic) } } : {}) };
+  }
   const sheets = sets.map((set) => ({ id: crypto.randomUUID(), class: 'sheet', title: set.title, rootTopic: { ...topic(set.tree), structureClass: 'org.xmind.ui.map.unbalanced' } }));
   const content = strToU8(JSON.stringify(sheets));
   if (content.byteLength > FORMAT_LIMITS.contentBytes) throw transferLimit('XMind 主题内容超过 8 MB，请分批导出');

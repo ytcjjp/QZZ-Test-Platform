@@ -67,6 +67,31 @@ test('Markdown and real multi-sheet XMind roundtrip nested titles and reject inv
   assert.throws(() => normalizeTree(over));
 });
 
+test('node styles validate a strict CSS subset and survive real XMind while Markdown stays plain', () => {
+  const style = { fontSize: '24px', color: '#aa1122', background: '#ddeeff', fontWeight: 'bold', fontStyle: 'italic', textDecoration: 'underline' };
+  const tree = normalizeTree({ ...blankTree('带格式用例集'), style: { ...style, color: '#AA1122' }, children: [{ ...blankTree('常规节点'), style: { fontSize: '12px', fontWeight: 'normal', fontStyle: 'normal', textDecoration: 'none' } }, { ...blankTree('默认节点'), style: {} }] });
+  assert.deepEqual(tree.style, style);
+  assert.ok(!Object.hasOwn(tree.children[1], 'style'));
+  for (const invalid of [{ fontSize: '11px' }, { fontSize: '49px' }, { fontSize: '24.5px' }, { fontSize: 24 }, { color: '#fff' }, { background: 'url(https://example.test/a)' }, { fontWeight: '700' }, { fontStyle: 'oblique' }, { textDecoration: 'line-through' }, { fontFamily: 'Arial' }, { color: '#aabbcc\n' }, { constructor: 'bad' }]) {
+    assert.throws(() => normalizeTree({ ...blankTree('invalid'), style: invalid }), /样式/);
+  }
+  const output = exportXmind([{ title: '样式集', tree }]);
+  const content = JSON.parse(new TextDecoder().decode(unzipSync(output)['content.json']));
+  assert.deepEqual(content[0].rootTopic.style.properties, { 'fo:font-size': '18pt', 'fo:color': '#aa1122', 'svg:fill': '#ddeeff', 'fo:font-weight': 'bold', 'fo:font-style': 'italic', 'fo:text-decoration': 'underline' });
+  const imported = importXmind(output)[0].tree;
+  assert.deepEqual(imported.style, style);
+  assert.deepEqual(imported.children[0].style, tree.children[0].style);
+  assert.ok(!Object.hasOwn(imported.children[1], 'style'));
+  const plain = importMarkdown(exportMarkdown(tree))[0].tree;
+  assert.deepEqual(titles(plain), titles(tree));
+  assert.ok(!Object.hasOwn(plain, 'style'));
+  content[0].rootTopic.style.properties = { 'fo:font-size': '18pt', 'fo:color': 'url(evil)', 'svg:fill': '#AABBCC', 'fo:font-style': 'italic', 'fo:font-family': 'unsupported' };
+  const external = importXmind(zipSync({ 'content.json': strToU8(JSON.stringify(content)) }))[0].tree;
+  assert.deepEqual(external.style, { fontSize: '24px', background: '#aabbcc', fontStyle: 'italic' });
+  const oddSize = { ...blankTree('非整数字号换算'), style: { fontSize: '13px' } };
+  assert.equal(importXmind(exportXmind([{ title: '字号', tree: oddSize }]))[0].tree.style.fontSize, '13px');
+});
+
 test('export budgets reject highly compressed multi-sheet maps before producing files that cannot be reimported', () => {
   const tree = blankTree('大用例集');
   tree.children = Array.from({ length: 17 }, () => blankTree('a'.repeat(29400)));
@@ -132,9 +157,17 @@ test('set CRUD/import/export, atomic batches, read-only export and project delet
     let set = created.body.case;
     assert.equal(set.tree.title, '空白用例集'); assert.deepEqual(set.tree.children, []);
     assert.equal((await call('/api/cases', { title: '无项目' })).status, 400);
-    const tree = { ...set.tree, children: [blankTree('主流程')] };
+    const tree = { ...set.tree, style: { fontSize: '24px', color: '#112233', background: '#ddeeff', fontWeight: 'bold', fontStyle: 'italic', textDecoration: 'underline' }, children: [blankTree('主流程')] };
     const edited = await call('/api/cases/' + set.id, { projectId, revision: set.revision, tree }, 'PUT');
     assert.equal(edited.status, 200); set = edited.body.case;
+    assert.deepEqual(set.tree.style, tree.style);
+    assert.deepEqual((await call('/api/cases?projectId=' + projectId, undefined, 'GET')).body.cases[0].tree.style, tree.style);
+    assert.equal((await call('/api/cases/' + set.id, { projectId, revision: set.revision, tree: { ...tree, style: { background: 'url(https://example.test)' } } }, 'PUT')).status, 400);
+    const clearedTree = structuredClone(tree); delete clearedTree.style;
+    const cleared = await call('/api/cases/' + set.id, { projectId, revision: set.revision, tree: clearedTree }, 'PUT');
+    assert.equal(cleared.status, 200); assert.ok(!Object.hasOwn(cleared.body.case.tree, 'style'));
+    const restyled = await call('/api/cases/' + set.id, { projectId, revision: cleared.body.case.revision, tree }, 'PUT');
+    assert.equal(restyled.status, 200); set = restyled.body.case;
     assert.equal((await call('/api/cases/' + set.id, { projectId, revision: 1, title: '丢失更新' }, 'PUT')).status, 409);
     assert.equal((await call('/api/cases/' + set.id, { projectId: projectB.id, revision: set.revision, tree }, 'PUT')).status, 404);
     const selected = [{ id: set.id, revision: set.revision }];
@@ -144,6 +177,7 @@ test('set CRUD/import/export, atomic batches, read-only export and project delet
     const imported = await call('/api/cases/import', form);
     assert.equal(imported.status, 201); assert.equal(imported.body.cases.length, 1);
     assert.deepEqual(titles(imported.body.cases[0].tree), titles(set.tree));
+    assert.deepEqual(imported.body.cases[0].tree.style, tree.style);
     const malformed = new FormData(); malformed.append('projectId', projectId); malformed.append('file', new Blob(['bad']), 'bad.xmind');
     assert.equal((await call('/api/cases/import', malformed)).status, 400);
     const mdform = new FormData(); mdform.append('projectId', projectId); mdform.append('file', new Blob(['- 主流程\n  - 展示\n    - 预期结果：正确']), '中文用例集.md');
@@ -156,9 +190,10 @@ test('set CRUD/import/export, atomic batches, read-only export and project delet
     assert.equal((await call('/api/defects/batch', { projectId, items: [{ id: defect.id, revision: defect.revision }, { id: defect2.id, revision: 99 }], action: 'status', status: '处理中' })).status, 409);
     let defects = (await call('/api/defects?projectId=' + projectId, undefined, 'GET')).body.defects;
     assert.equal(defects.find((item) => item.id === defect.id).revision, 1);
-    assert.equal((await call('/api/defects/batch', { projectId, items: defects.map(({ id, revision }) => ({ id, revision })), action: 'status', status: '处理中' })).status, 200);
+    assert.equal((await call('/api/defects/batch', { projectId, items: defects.map(({ id, revision }) => ({ id, revision })), action: 'status', status: '搁置' })).status, 200);
     defects = (await call('/api/defects?projectId=' + projectId, undefined, 'GET')).body.defects;
-    assert.ok(defects.every((item) => item.status === '处理中' && item.revision === 2));
+    assert.ok(defects.every((item) => item.status === '搁置' && item.revision === 2));
+    assert.equal((await call('/api/defects/batch', { projectId, items: [{ id: defect.id, revision: 1 }], action: 'status', status: '搁置' })).status, 409);
     assert.equal((await call('/api/defects/batch', { projectId, items: [{ id: defect.id, revision: 2 }], action: 'status', status: 'unknown' })).status, 400);
     assert.equal((await call('/api/cases/batch', { projectId: projectB.id, items: selected, action: 'delete' })).status, 404);
     assert.equal((await call('/api/cases/batch', { projectId, items: [selected[0], { id: imported.body.cases[0].id, revision: 99 }], action: 'delete' })).status, 409);

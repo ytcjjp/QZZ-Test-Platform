@@ -4,6 +4,7 @@ import ProjectsPage, { ProjectContext, ProjectIcon } from './Projects';
 import CaseSetsPage from './CaseSetsPage';
 import DefectsPage from './DefectsPage';
 import AiDocuments from './AiDocuments';
+import { DEFECT_STATUSES, defectStatusClass } from './defect-status';
 import {
   AlertCircle, ArrowDownToLine, ArrowUpRight, Bot, Bug, Check, Copy,
   ChevronDown, ChevronRight, CircleHelp, CloudUpload, Database,
@@ -37,7 +38,7 @@ const DEFECT_FIELDS = [
   { key: 'module', label: '所属模块', required: true, placeholder: '例如：活动中心' },
   { key: 'version', label: '发现版本', placeholder: '例如：1.0.0' },
   { key: 'severity', label: '严重程度', type: 'select', options: ['致命', '严重', '一般', '轻微'] },
-  { key: 'status', label: '处理状态', type: 'select', options: ['待处理', '处理中', '待验证', '已解决', '已关闭'] },
+  { key: 'status', label: '处理状态', type: 'select', options: DEFECT_STATUSES },
   { key: 'assignee', label: '负责人', placeholder: '姓名或账号' },
   { key: 'reproSteps', label: '复现步骤', type: 'textarea', required: true, placeholder: '环境、前置条件和复现路径', wide: true },
   { key: 'expected', label: '预期表现', type: 'textarea', placeholder: '正确行为', wide: true },
@@ -91,6 +92,8 @@ function prepareGenerated(record, module) {
 
 function Tone({ children, value }) {
   const text = String(value || children || '');
+  const statusClass = defectStatusClass(text);
+  if (statusClass) return <span className={`tone ${statusClass}`}>{children || value}</span>;
   let tone = 'neutral';
   if (/^(P0|致命|失败)$/.test(text)) tone = 'danger';
   else if (/^(P1|严重|阻塞|待处理)$/.test(text)) tone = 'warning';
@@ -158,7 +161,7 @@ function RecordForm({ kind, initial, mode, project, onClose, onSave, busy, error
           {field.type === 'textarea'
             ? <textarea value={values[field.key] ?? ''} onChange={(e) => setValues({ ...values, [field.key]: e.target.value })} placeholder={field.placeholder} rows={field.key === 'steps' || field.key === 'reproSteps' ? 4 : 3} required={field.required} />
             : field.type === 'select'
-              ? <select value={values[field.key] || field.options[0]} onChange={(e) => setValues({ ...values, [field.key]: e.target.value })}>{field.options.map((option) => <option key={option}>{option}</option>)}</select>
+              ? <select className={kind === 'defects' && field.key === 'status' ? defectStatusClass(values[field.key] || field.options[0]) : undefined} value={values[field.key] || field.options[0]} onChange={(e) => setValues({ ...values, [field.key]: e.target.value })}>{field.options.map((option) => <option key={option}>{option}</option>)}</select>
               : <input value={values[field.key] ?? ''} onChange={(e) => setValues({ ...values, [field.key]: e.target.value })} placeholder={field.placeholder} required={field.required} />}
         </label>)}</div>
         {error && <div className="inline-error"><AlertCircle size={16} /><span>{error}</span>{error.includes('最新') && <button type="button" className="text-button" onClick={onReload}>查看最新记录</button>}</div>}

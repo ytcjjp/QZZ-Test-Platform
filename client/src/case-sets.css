@@ -32,6 +32,19 @@
 .case-editor-warning .text-button { white-space: nowrap; }
 .case-map-toolbar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; border: 1px solid #dce6df; border-bottom: 0; background: white; min-height: 46px; padding: 7px 10px; }
 .case-map-toolbar > div { display: flex; align-items: center; gap: 4px; }
+.case-format-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; padding: 6px 10px; min-height: 43px; border: 1px solid #dce6df; border-bottom: 0; background: #fbfcfb; }
+.case-format-group { display: flex; align-items: center; gap: 4px; flex: none; }
+.case-format-toolbar .icon-button { width: 29px; height: 29px; }
+.case-format-toolbar .icon-button.case-format-active { background: #dcefe7; color: #196f5e; }
+.case-format-toolbar .icon-button.case-format-mixed { box-shadow: inset 0 0 0 1px #9caea5; background: #eef3f0; color: #536d61; }
+.case-format-toolbar select { width: 67px; min-width: 0; height: 29px; border: 1px solid #d8e2dc; border-radius: 4px; background: white; padding: 0 4px; color: #4d6659; font-size: 11px; }
+.case-format-color { position: relative; display: flex; align-items: center; gap: 4px; padding: 4px; height: 29px; color: #61796d; cursor: pointer; }
+.case-format-color.disabled { opacity: .45; cursor: not-allowed; }
+.case-color-swatch { position: relative; display: block; width: 16px; height: 16px; flex: none; border: 1px solid #a3b4a8; border-radius: 2px; }
+.case-color-swatch.mixed { background: repeating-linear-gradient(135deg, #fff 0, #fff 4px, #d7e1db 4px, #d7e1db 8px); }
+.case-format-color input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; padding: 0; border: 0; cursor: inherit; }
+.case-format-color:focus-within { outline: 2px solid #22a596; outline-offset: 1px; border-radius: 3px; }
+.case-format-selection { margin-left: auto; color: #7c8f83; font-size: 11px; white-space: nowrap; }
 .case-tool-divider { display: inline-block; width: 1px; height: 20px; background: #dce5df; margin: 0 4px; flex: none; }
 .case-zoom-value { display: inline-block; width: 39px; text-align: center; font-size: 11px; color: #70857d; font-variant-numeric: tabular-nums; }
 .case-map-canvas { width: 100%; height: clamp(360px, calc(100dvh - 345px), 1000px); min-width: 0; min-height: 0; position: relative; overflow: hidden; border: 1px solid #dce6df; background: white; }

@@ -1,0 +1,7 @@
+.defect-status.defect-status-pending { background: #fde7e6; color: #ae2d2a; border-color: #edb9b7; }
+.defect-status.defect-status-progress { background: #e8effb; color: #365f9a; border-color: #c2d1eb; }
+.defect-status.defect-status-verify { background: #e3f3f1; color: #246e67; border-color: #b5dbd6; }
+.defect-status.defect-status-onhold { background: #fff6cf; color: #806412; border-color: #eadb9f; }
+.defect-status.defect-status-resolved { background: #e1f3e6; color: #28683d; border-color: #afd4bc; }
+.defect-status.defect-status-closed { background: #eaeef0; color: #5e6870; border-color: #cbd1d5; }
+.defect-status option { color: #29423c; background: white; }
