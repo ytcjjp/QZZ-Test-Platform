@@ -252,15 +252,20 @@ export async function generateDocumentCases(documents, {
   return result;
 }
 
+export function loadFeishuConfig(dataDir) {
+  const configFile = path.join(dataDir, 'feishu-config.json');
+  if (!fs.existsSync(configFile)) return { appId: process.env.FEISHU_APP_ID || '', appSecret: process.env.FEISHU_APP_SECRET || '' };
+  const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+  return { appId: config.appId || '', appSecret: config.encryptedSecret ? decryptPassword(config.encryptedSecret, loadPasswordKey(dataDir, true)) : '' };
+}
+
 export function registerAiRoutes(app, { db, dataDir, sendError, inputError, authenticate, loadProvider = loadAiProvider, generateCases = generateDocumentCases }) {
   db.exec(`CREATE TABLE IF NOT EXISTS ai_documents (
     id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, name TEXT NOT NULL, text TEXT NOT NULL, created_at INTEGER NOT NULL
   ); CREATE INDEX IF NOT EXISTS ai_documents_owner_idx ON ai_documents(owner_id, created_at)`);
   const configFile = path.join(dataDir, 'feishu-config.json');
   function readConfig() {
-    if (!fs.existsSync(configFile)) return { appId: process.env.FEISHU_APP_ID || '', appSecret: process.env.FEISHU_APP_SECRET || '' };
-    const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
-    return { appId: config.appId || '', appSecret: config.encryptedSecret ? decryptPassword(config.encryptedSecret, loadPasswordKey(dataDir, true)) : '' };
+    return loadFeishuConfig(dataDir);
   }
   function requireAdmin(req, res, next) {
     if (req.user.role !== 'admin') return sendError(res, 403, 'forbidden', '仅管理员可配置飞书应用');

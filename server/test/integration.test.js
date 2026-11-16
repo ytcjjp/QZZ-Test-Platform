@@ -466,13 +466,157 @@ test('projects isolate both modules, validate icons and enforce shared-group per
     await new Promise((resolve) => ws.once('close', resolve));
     ws = null;
 
-    await request(url, `/api/users/${viewerId}`, cookie, { method: 'PUT', body: { permissions: { cases: { view: false }, defects: { view: false } } } });
+    await request(url, `/api/users/${viewerId}`, cookie, { method: 'PUT', body: { permissions: Object.fromEntries(['cases', 'defects', 'ai', 'requirements', 'knowledge'].map((module) => [module, { view: false }])) } });
     const deniedLogin = await request(url, '/api/session', null, { method: 'POST', body: { username: 'viewer', password: 'viewer123' } });
     const deniedCookie = deniedLogin.response.headers.get('set-cookie').split(';')[0];
     assert.equal((await request(url, '/api/projects', deniedCookie)).status, 403);
     assert.equal((await fetch(`${url}${viewerProject.iconUrl}`, { headers: { cookie: deniedCookie } })).status, 403);
   } finally {
     if (ws) ws.terminate();
+    if (child) await new Promise((resolve) => { child.once('exit', resolve); child.kill(); });
+    await rm(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
+test('workspace integration preserves requirement links and legacy records while enforcing module and WebSocket visibility', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'qzz-workspace-integration-'));
+  let child;
+  const sockets = [];
+  const legacyPermissions = {
+    cases: { view: true, write: true }, defects: { view: true, write: true },
+    ai: { view: false, write: false }, files: { view: false, write: false },
+  };
+  const legacy = {
+    id: 'legacy-set', title: '历史用例', module: '背包', priority: 'P1', status: '未执行',
+    preconditions: '历史账号', steps: '打开背包', expected: '展示历史道具', notes: '保留历史内容',
+    tags: '["历史"]', revision: 7, created_by: 'legacy-member', created_at: '2026-01-01T00:00:00.000Z', updated_at: '2026-01-02T00:00:00.000Z',
+  };
+  const seeded = new Database(path.join(dataDir, 'platform.db'));
+  seeded.exec(`CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT UNIQUE, password_hash TEXT, role TEXT, created_at TEXT, permissions TEXT);
+    CREATE TABLE cases (id TEXT PRIMARY KEY, title TEXT, module TEXT, priority TEXT, status TEXT, preconditions TEXT, steps TEXT, expected TEXT, notes TEXT, tags TEXT, revision INTEGER, created_by TEXT, created_at TEXT, updated_at TEXT);`);
+  seeded.prepare('INSERT INTO users VALUES (?,?,?,?,?,?)').run('legacy-admin', 'admin', hashPassword('AdminPassword123456'), 'admin', legacy.created_at, null);
+  seeded.prepare('INSERT INTO users VALUES (?,?,?,?,?,?)').run('legacy-member', 'old-member', hashPassword('OldMemberPassword123'), 'member', legacy.created_at, JSON.stringify(legacyPermissions));
+  seeded.prepare('INSERT INTO cases VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(...Object.values(legacy));
+  seeded.close();
+  try {
+    let started = await launch(dataDir); child = started.child;
+    let url = started.url;
+    async function login(username, password) {
+      const response = await request(url, '/api/session', null, { method: 'POST', body: { username, password } });
+      assert.equal(response.status, 200);
+      return { cookie: response.response.headers.get('set-cookie').split(';')[0], user: response.body.user };
+    }
+    const admin = await login('admin', 'AdminPassword123456');
+    const oldMember = await login('old-member', 'OldMemberPassword123');
+    assert.deepEqual(oldMember.user.permissions.requirements, { view: true, write: true });
+    assert.deepEqual(oldMember.user.permissions.knowledge, { view: true, write: true });
+    assert.deepEqual(oldMember.user.permissions.ai, legacyPermissions.ai);
+    const project = (await request(url, '/api/projects', admin.cookie)).body.projects[0];
+    const projectId = project.id;
+    const other = (await request(url, '/api/projects', admin.cookie, { method: 'POST', body: { name: '另一个项目' } })).body.project;
+    const initialLegacy = (await request(url, `/api/cases?projectId=${projectId}`, oldMember.cookie)).body.cases[0];
+    assert.equal(initialLegacy.id, legacy.id); assert.equal(initialLegacy.revision, 7); assert.equal(initialLegacy.requirementId, null);
+    assert.equal((await request(url, `/api/requirements?projectId=${projectId}`, oldMember.cookie)).status, 200);
+    assert.equal((await request(url, `/api/knowledge-bases?projectId=${projectId}`, oldMember.cookie)).status, 200);
+    const requirementResponse = await request(url, '/api/requirements', oldMember.cookie, { method: 'POST', body: { projectId, title: '活动奖励需求', body: '领取活动奖励后，道具进入背包。' } });
+    assert.equal(requirementResponse.status, 201);
+    let requirement = requirementResponse.body.requirement;
+    const otherRequirement = (await request(url, '/api/requirements', admin.cookie, { method: 'POST', body: { projectId: other.id, title: '另一组需求', body: '独立规则。' } })).body.requirement;
+    const tree = { id: 'root-integration', title: '奖励用例集', children: [{ id: 'child-integration', title: '领取奖励', children: [] }] };
+    const linked = await request(url, '/api/cases', oldMember.cookie, { method: 'POST', body: { projectId, requirementId: requirement.id, title: '奖励用例集', tree } });
+    assert.equal(linked.status, 201); let linkedSet = linked.body.case;
+    assert.equal(linkedSet.requirementId, requirement.id);
+    const edited = await request(url, '/api/cases/' + linkedSet.id, oldMember.cookie, { method: 'PUT', body: { projectId, revision: linkedSet.revision, notes: '仅编辑备注，需求关联和导图保持' } });
+    assert.equal(edited.status, 200); linkedSet = edited.body.case;
+    assert.equal(linkedSet.requirementId, requirement.id); assert.deepEqual(linkedSet.tree, tree);
+    const filtered = await request(url, `/api/cases?projectId=${projectId}&requirementId=${requirement.id}`, oldMember.cookie);
+    assert.equal(filtered.status, 200); assert.deepEqual(filtered.body.cases.map((item) => item.id), [linkedSet.id]);
+    for (const route of [`/api/cases?projectId=${projectId}&requirementId=${otherRequirement.id}`, `/api/cases?projectId=${other.id}&requirementId=${requirement.id}`]) assert.equal((await request(url, route, oldMember.cookie)).status, 400);
+    assert.equal((await request(url, '/api/cases', oldMember.cookie, { method: 'POST', body: { projectId, requirementId: otherRequirement.id, title: '不得串组' } })).status, 400);
+    assert.equal((await request(url, '/api/cases/' + linkedSet.id, oldMember.cookie, { method: 'PUT', body: { projectId, revision: linkedSet.revision, requirementId: otherRequirement.id } })).status, 400);
+    const planResponse = await request(url, '/api/test-plans', oldMember.cookie, { method: 'POST', body: { projectId, requirementId: requirement.id, title: '活动测试计划', version: '1.0', iteration: '第一轮', content: '# 范围\n活动与背包。' } });
+    assert.equal(planResponse.status, 201); const plan = planResponse.body.plan;
+    const kbResponse = await request(url, '/api/knowledge-bases', oldMember.cookie, { method: 'POST', body: { projectId, name: '活动知识', description: '项目技术资料' } });
+    assert.equal(kbResponse.status, 201); let kb = kbResponse.body.knowledgeBase;
+    const knowledgeDocument = await request(url, `/api/knowledge-bases/${kb.id}/documents`, oldMember.cookie, { method: 'POST', body: { projectId, title: '奖励技术约定', body: '奖励入账后更新背包道具数量。' } });
+    assert.equal(knowledgeDocument.status, 201);
+    async function observerUser(username, allowed) {
+      const created = await request(url, '/api/users', admin.cookie, { method: 'POST', body: { username, password: 'ObserverPassword123' } });
+      assert.equal(created.status, 201);
+      const permissions = Object.fromEntries(['cases', 'defects', 'ai', 'files', 'requirements', 'knowledge'].map((module) => [module, { view: module === 'cases' || allowed && ['requirements', 'knowledge'].includes(module), write: false }]));
+      assert.equal((await request(url, `/api/users/${created.body.user.id}`, admin.cookie, { method: 'PUT', body: { permissions } })).status, 200);
+      return login(username, 'ObserverPassword123');
+    }
+    const reader = await observerUser('workspace-reader', true);
+    const denied = await observerUser('workspace-denied', false);
+    for (const [route, method, body] of [
+      ['/api/requirements', 'POST', { projectId, title: 'no', body: 'no' }],
+      [`/api/requirements/${requirement.id}`, 'PUT', { projectId, revision: requirement.revision, body: 'no' }],
+      [`/api/test-plans`, 'POST', { projectId, requirementId: requirement.id, title: 'no' }],
+      [`/api/test-plans/${plan.id}`, 'PUT', { projectId, revision: plan.revision, content: 'no' }],
+      ['/api/knowledge-bases', 'POST', { projectId, name: 'no' }],
+      [`/api/knowledge-bases/${kb.id}/reindex`, 'POST', { projectId, revision: kb.revision }],
+    ]) assert.equal((await request(url, route, reader.cookie, { method, body })).status, 403, `reader cannot ${method} ${route}`);
+    assert.equal((await request(url, `/api/test-plans?projectId=${projectId}`, reader.cookie)).status, 200);
+    assert.equal((await request(url, `/api/test-plans/${plan.id}?projectId=${projectId}`, reader.cookie)).status, 200);
+    assert.equal((await request(url, `/api/knowledge-bases/${kb.id}/search`, reader.cookie, { method: 'POST', body: { projectId, query: '奖励' } })).status, 200);
+    for (const route of [`/api/requirements?projectId=${projectId}`, `/api/test-plans?projectId=${projectId}`, `/api/test-plans/${plan.id}?projectId=${projectId}`, `/api/knowledge-bases?projectId=${projectId}`]) assert.equal((await request(url, route, denied.cookie)).status, 403);
+    assert.equal((await request(url, '/api/test-plans', denied.cookie, { method: 'POST', body: { projectId, requirementId: requirement.id, title: '不得绕过' } })).status, 403);
+    assert.equal((await request(url, `/api/knowledge-bases/${kb.id}/search`, denied.cookie, { method: 'POST', body: { projectId, query: '奖励' } })).status, 403);
+    async function observe(cookie) {
+      const socket = new WebSocket(url.replace('http:', 'ws:') + '/api/events', { headers: { cookie, origin: url } });
+      sockets.push(socket); const events = [];
+      socket.on('message', (data) => events.push(JSON.parse(data.toString())));
+      await new Promise((resolve, reject) => { socket.once('open', resolve); socket.once('error', reject); });
+      return { socket, events };
+    }
+    const permittedObserver = await observe(reader.cookie);
+    const deniedObserver = await observe(denied.cookie);
+    requirement = (await request(url, '/api/requirements/' + requirement.id, admin.cookie, { method: 'PUT', body: { projectId, revision: requirement.revision, analysis: '# 功能清单\n活动领奖' } })).body.requirement;
+    const eventPlan = await request(url, '/api/test-plans', admin.cookie, { method: 'POST', body: { projectId, requirementId: requirement.id, title: '事件测试计划', content: '验证事件可见性' } });
+    assert.equal(eventPlan.status, 201);
+    kb = (await request(url, '/api/knowledge-bases/' + kb.id, admin.cookie, { method: 'PUT', body: { projectId, revision: kb.revision, description: '更新知识库事件' } })).body.knowledgeBase;
+    const marker = await request(url, '/api/cases', admin.cookie, { method: 'POST', body: { projectId, title: 'WebSocket 屏障' } });
+    assert.equal(marker.status, 201);
+    async function waitMarker(observer) {
+      const isMarker = (item) => item.type === 'case.created' && item.case?.id === marker.body.case.id;
+      if (observer.events.some(isMarker)) return;
+      await new Promise((resolve, reject) => {
+        const cleanup = () => { clearTimeout(timer); observer.socket.off('message', listener); };
+        const listener = (data) => { if (isMarker(JSON.parse(data.toString()))) { cleanup(); resolve(); } };
+        const timer = setTimeout(() => { cleanup(); reject(new Error('WebSocket marker not received')); }, 5000);
+        observer.socket.on('message', listener);
+      });
+    }
+    await Promise.all([waitMarker(permittedObserver), waitMarker(deniedObserver)]);
+    for (const category of ['requirement', 'plan', 'knowledge']) {
+      assert.ok(permittedObserver.events.some((item) => item.type.startsWith(category + '.')), `viewer receives ${category} events`);
+      assert.ok(!deniedObserver.events.some((item) => item.type.startsWith(category + '.')), `denied viewer must not receive ${category} events`);
+    }
+    await Promise.all(sockets.map((socket) => new Promise((resolve) => { socket.once('close', resolve); socket.close(); })));
+    sockets.length = 0;
+    assert.equal((await request(url, '/api/requirements/' + requirement.id, oldMember.cookie, { method: 'DELETE', body: { projectId, revision: requirement.revision } })).status, 200);
+    let retained = (await request(url, `/api/cases?projectId=${projectId}`, oldMember.cookie)).body.cases.find((item) => item.id === linkedSet.id);
+    assert.equal(retained.requirementId, null); assert.deepEqual(retained.tree, tree);
+    assert.equal((await request(url, `/api/test-plans/${plan.id}?projectId=${projectId}`, oldMember.cookie)).body.plan.content, plan.content);
+    await new Promise((resolve) => { child.once('exit', resolve); child.kill(); }); child = null;
+    started = await launch(dataDir); child = started.child; url = started.url;
+    const relogin = await login('old-member', 'OldMemberPassword123');
+    assert.deepEqual(relogin.user.permissions.requirements, { view: true, write: true });
+    assert.deepEqual(relogin.user.permissions.knowledge, { view: true, write: true });
+    const persisted = (await request(url, `/api/cases?projectId=${projectId}`, relogin.cookie)).body.cases;
+    retained = persisted.find((item) => item.id === linkedSet.id);
+    assert.equal(retained.requirementId, null); assert.deepEqual(retained.tree, tree);
+    assert.deepEqual(persisted.find((item) => item.id === legacy.id), initialLegacy);
+    assert.equal((await request(url, `/api/test-plans/${plan.id}?projectId=${projectId}`, relogin.cookie)).body.plan.requirementId, requirement.id);
+    const verify = new Database(path.join(dataDir, 'platform.db'), { readonly: true });
+    try {
+      const row = verify.prepare('SELECT * FROM cases WHERE id=?').get(legacy.id);
+      for (const [key, value] of Object.entries(legacy)) assert.equal(row[key], value, `legacy ${key} survives migration/restart`);
+      assert.deepEqual(JSON.parse(verify.prepare('SELECT permissions FROM users WHERE id=?').get('legacy-member').permissions), legacyPermissions);
+    } finally { verify.close(); }
+  } finally {
+    for (const socket of sockets) socket.terminate();
     if (child) await new Promise((resolve) => { child.once('exit', resolve); child.kill(); });
     await rm(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }

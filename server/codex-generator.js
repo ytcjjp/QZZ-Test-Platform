@@ -3,10 +3,13 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { collectProjectContext } from './project-context.js';
+import Ajv from 'ajv';
+import sharp from 'sharp';
 
 const BRANCHES = ['主流程', 'UI', '异常与边界', '受影响模块'];
 const MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
 const MAX_LOG_BYTES = 64 * 1024;
+export const VISION_LIMITS = { images: 64, bytes: 64 * 1024 * 1024, pixels: 40000000 };
 
 export class CodexGenerationError extends Error {
   constructor(message, code, status = 502) { super(message); this.name = 'CodexGenerationError'; this.code = code; this.status = status; this.publicMessage = message; }
@@ -35,7 +38,7 @@ export const CODEX_OUTPUT_SCHEMA = {
   },
 };
 
-function invalidOutput() { return new CodexGenerationError('本机 Codex 未返回有效的用例结构，请重试。', 'CODEX_INVALID_OUTPUT'); }
+function invalidOutput() { return new CodexGenerationError('本机 Codex 未返回有效的结构化结果，请重试。', 'CODEX_INVALID_OUTPUT'); }
 
 function checkedResult(value) {
   const object = (item, keys) => item && typeof item === 'object' && !Array.isArray(item) && Object.keys(item).every((key) => keys.includes(key));
@@ -112,7 +115,7 @@ function exitError(logs) {
   return new CodexGenerationError('本机 Codex 生成失败，请检查模型、网关配置或稍后重试。', 'CODEX_EXIT');
 }
 
-export async function generateWithCodex(documents, { title = '', clarifications = '', confirmed = false, skill, config, signal, projectContext } = {}, dependencies = {}) {
+export async function runCodexData({ prompt, schema, config, signal, projectContext, images = [] } = {}, dependencies = {}) {
   const spawnProcess = dependencies.spawn || spawn;
   const killTree = dependencies.killTree || terminateTree;
   if (signal?.aborted) throw new CodexGenerationError('本次用例生成已取消。', 'CODEX_ABORTED', 499);
@@ -120,7 +123,11 @@ export async function generateWithCodex(documents, { title = '', clarifications 
   let baseUrl;
   try { baseUrl = new URL(config.baseUrl); } catch { throw new CodexGenerationError('本机 Codex 服务地址配置不正确。', 'CODEX_CONFIG', 503); }
   if (!['https:', 'http:'].includes(baseUrl.protocol) || baseUrl.username || baseUrl.password || baseUrl.search || baseUrl.hash) throw new CodexGenerationError('本机 Codex 服务地址配置不正确。', 'CODEX_CONFIG', 503);
-  if (!Array.isArray(documents) || !documents.length || documents.length > 5 || documents.some((doc) => typeof doc?.name !== 'string' || typeof doc?.text !== 'string' || !doc.text.trim()) || documents.reduce((sum, doc) => sum + doc.text.length, 0) > 100000 || typeof skill !== 'string' || !skill.trim() || skill.length > 100000 || typeof title !== 'string' || title.length > 200 || typeof clarifications !== 'string' || clarifications.length > 12000 || typeof confirmed !== 'boolean') throw new CodexGenerationError('策划文档或用例生成参数不正确，请重新导入。', 'CODEX_INPUT', 400);
+  if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 600000 || !schema || typeof schema !== 'object' || Array.isArray(schema) || schema.type !== 'object' || JSON.stringify(schema).length > 100000 || !Array.isArray(images)) throw new CodexGenerationError('生成资料、图片数量或输出结构不符合限制，请拆分资料后重试。', 'CODEX_INPUT', 400);
+  if (images.length > VISION_LIMITS.images) throw new CodexGenerationError('一次最多分析 64 张图片，请拆分需求后重试；本次不会截断图片。', 'CODEX_IMAGE_BUDGET', 413);
+  let validate;
+  try { validate = new Ajv({ allErrors: false, strict: false, validateFormats: false }).compile(schema); }
+  catch { throw new CodexGenerationError('结构化输出协议不正确，请联系管理员。', 'CODEX_INPUT', 400); }
   const timeoutMs = config.timeoutMs ?? 15 * 60 * 1000;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60 * 60 * 1000) throw new CodexGenerationError('本机 Codex 超时配置不正确。', 'CODEX_CONFIG', 503);
   const projectRoot = path.resolve(config.projectRoot);
@@ -130,21 +137,26 @@ export async function generateWithCodex(documents, { title = '', clarifications 
   let child;
   try {
     if (!(await fs.stat(projectRoot)).isDirectory()) throw new Error('project unavailable');
-    const context = projectContext ?? await collectProjectContext(projectRoot, documents, { signal });
     signal?.throwIfAborted();
-    if (!context || context.projectName !== '点点消' || !Array.isArray(context.files) || context.files.length > 12 || context.files.some((file) => typeof file.path !== 'string' || typeof file.content !== 'string' || file.content.length > 16000) || context.files.reduce((sum, file) => sum + file.content.length, 0) > 100000) throw new CodexGenerationError('提供的源码上下文不符合只读证据限制。', 'CODEX_INPUT', 400);
+    if (projectContext && (!Array.isArray(projectContext.files) || projectContext.files.length > 12 || projectContext.files.some((file) => typeof file.path !== 'string' || typeof file.content !== 'string' || file.content.length > 16000) || projectContext.files.reduce((sum, file) => sum + file.content.length, 0) > 100000)) throw new CodexGenerationError('提供的源码上下文不符合只读证据限制。', 'CODEX_INPUT', 400);
     await fs.mkdir(codexHomeDir, { recursive: true });
     await fs.mkdir(jobDir, { recursive: true });
     const schemaFile = path.join(jobDir, 'output-schema.json');
     const outputFile = path.join(jobDir, 'result.json');
-    const prompt = promptFor(documents, { title, clarifications, confirmed, skill, projectRoot, projectContext: context });
-    await fs.writeFile(schemaFile, JSON.stringify(CODEX_OUTPUT_SCHEMA), { mode: 0o600 });
+    await fs.writeFile(schemaFile, JSON.stringify(schema), { mode: 0o600 });
     await fs.writeFile(path.join(jobDir, 'prompt.txt'), prompt, { mode: 0o600 });
-    await fs.writeFile(path.join(jobDir, 'project-context.json'), JSON.stringify(context), { mode: 0o600 });
+    if (projectContext) await fs.writeFile(path.join(jobDir, 'project-context.json'), JSON.stringify(projectContext), { mode: 0o600 });
     const args = [
       'exec', '--ignore-user-config', '--ignore-rules', '--ephemeral', '--sandbox', 'read-only', '--cd', jobDir, '--skip-git-repo-check',
       '--model', config.model, '--output-schema', schemaFile, '--output-last-message', outputFile, '--json', '--color', 'never',
     ];
+    const imageFiles = await prepareVisionImages(images, config.dataDir, signal);
+    for (const [index, image] of imageFiles.entries()) {
+      signal?.throwIfAborted();
+      const imageFile = path.join(jobDir, `image-${index + 1}.${image.extension}`);
+      await fs.writeFile(imageFile, image.buffer, { mode: 0o600 });
+      args.push('--image', imageFile);
+    }
     const settings = [
       'approval_policy="never"',
       'model_provider="qzz_gateway"',
@@ -166,6 +178,7 @@ export async function generateWithCodex(documents, { title = '', clarifications 
     const childEnv = { ...process.env, CODEX_HOME: codexHomeDir, QZZ_CODEX_API_KEY: config.apiKey };
     delete childEnv.OPENAI_API_KEY;
     delete childEnv.OPENAI_BASE_URL;
+    signal?.throwIfAborted();
     try { child = spawnProcess(config.codexBinary || 'codex', args, { cwd: jobDir, env: childEnv, windowsHide: true, shell: false, detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'] }); }
     catch { throw new CodexGenerationError('无法启动本机 Codex，请检查程序路径和运行权限。', 'CODEX_START', 503); }
     await new Promise((resolve, reject) => {
@@ -206,7 +219,8 @@ export async function generateWithCodex(documents, { title = '', clarifications 
       if (!stat.isFile() || stat.size > MAX_OUTPUT_BYTES) throw invalidOutput();
       result = JSON.parse(await fs.readFile(outputFile, 'utf8'));
     } catch { throw invalidOutput(); }
-    return checkedResult(result);
+    if (!validate(result)) throw invalidOutput();
+    return result;
   } catch (error) {
     if (signal?.aborted) throw new CodexGenerationError('本次用例生成已取消。', 'CODEX_ABORTED', 499);
     if (error instanceof CodexGenerationError) throw error;
@@ -214,4 +228,60 @@ export async function generateWithCodex(documents, { title = '', clarifications 
   } finally {
     await fs.rm(jobDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }).catch(() => {});
   }
+}
+
+export async function prepareVisionImages(images, dataDir, signal) {
+  if (!Array.isArray(images)) throw new CodexGenerationError('需求图片参数不正确。', 'CODEX_INPUT', 400);
+  if (images.length > VISION_LIMITS.images) throw new CodexGenerationError('一次最多分析 64 张图片，请拆分需求后重试；本次不会截断图片。', 'CODEX_IMAGE_BUDGET', 413);
+  if (!images.length) return [];
+  const root = await fs.realpath(dataDir);
+  const results = [];
+  let totalBytes = 0;
+  for (const image of images) {
+    signal?.throwIfAborted();
+    let handle;
+    try {
+      const filename = typeof image === 'string' ? image : image?.path;
+      if (typeof filename !== 'string' || !path.isAbsolute(filename)) throw new Error();
+      const original = await fs.lstat(filename);
+      const real = await fs.realpath(filename);
+      const relative = path.relative(root, real);
+      if (!original.isFile() || original.isSymbolicLink() || !relative || relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) throw new Error();
+      handle = await fs.open(real, 'r');
+      const stat = await handle.stat();
+      if (!stat.isFile() || stat.ino !== original.ino || stat.dev !== original.dev) throw new Error();
+      totalBytes += stat.size;
+      if (totalBytes > VISION_LIMITS.bytes) throw new CodexGenerationError('本轮模型图片输入合计超过 64 MiB，请压缩图片或拆分需求；原件上传大小不受此预算限制。', 'CODEX_IMAGE_BUDGET', 413);
+      const buffer = await handle.readFile();
+      if (buffer.length !== stat.size) throw new Error('image changed while reading');
+      let extension; let mimeType;
+      if (buffer.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex'))) { extension = 'png'; mimeType = 'image/png'; }
+      else if (buffer.subarray(0, 3).equals(Buffer.from('ffd8ff', 'hex'))) { extension = 'jpg'; mimeType = 'image/jpeg'; }
+      else if (buffer.subarray(0, 4).toString() === 'RIFF' && buffer.subarray(8, 12).toString() === 'WEBP') { extension = 'webp'; mimeType = 'image/webp'; }
+      else throw new Error();
+      await sharp(buffer, { limitInputPixels: VISION_LIMITS.pixels, pages: 1, failOn: 'warning' }).resize(1, 1).raw().toBuffer();
+      results.push({ buffer, extension, mimeType });
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      if (error instanceof CodexGenerationError) throw error;
+      throw new CodexGenerationError('需求图片不可读取或不在平台的安全资料目录中，请重新导入。', 'CODEX_IMAGE', 400);
+    } finally { await handle?.close().catch(() => {}); }
+  }
+  return results;
+}
+
+export async function generateWithCodex(documents, { title = '', clarifications = '', confirmed = false, skill, config, signal, projectContext } = {}, dependencies = {}) {
+  if (!Array.isArray(documents) || !documents.length || documents.length > 5 || documents.some((doc) => typeof doc?.name !== 'string' || typeof doc?.text !== 'string' || !doc.text.trim()) || documents.reduce((sum, doc) => sum + doc.text.length, 0) > 100000 || typeof skill !== 'string' || !skill.trim() || skill.length > 100000 || typeof title !== 'string' || title.length > 200 || typeof clarifications !== 'string' || clarifications.length > 12000 || typeof confirmed !== 'boolean') throw new CodexGenerationError('策划文档或用例生成参数不正确，请重新导入。', 'CODEX_INPUT', 400);
+  if (!config || !path.isAbsolute(config.projectRoot || '')) throw new CodexGenerationError('本机 Codex 项目配置不完整，请联系管理员。', 'CODEX_CONFIG', 503);
+  if (signal?.aborted) throw new CodexGenerationError('本次用例生成已取消。', 'CODEX_ABORTED', 499);
+  let context;
+  try { context = projectContext ?? await collectProjectContext(config.projectRoot, documents, { signal }); }
+  catch (error) {
+    if (signal?.aborted) throw new CodexGenerationError('本次用例生成已取消。', 'CODEX_ABORTED', 499);
+    throw new CodexGenerationError(error.publicMessage || '本机游戏源码上下文不可读取。', 'CODEX_RUNTIME', 503);
+  }
+  if (signal?.aborted) throw new CodexGenerationError('本次用例生成已取消。', 'CODEX_ABORTED', 499);
+  if (!context || context.projectName !== '点点消') throw new CodexGenerationError('提供的源码上下文不符合只读证据限制。', 'CODEX_INPUT', 400);
+  const prompt = promptFor(documents, { title, clarifications, confirmed, skill, projectRoot: config.projectRoot, projectContext: context });
+  return checkedResult(await runCodexData({ prompt, schema: CODEX_OUTPUT_SCHEMA, config, signal, projectContext: context }, dependencies));
 }

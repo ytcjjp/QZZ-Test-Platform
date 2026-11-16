@@ -3,7 +3,8 @@ import { forgetLogin, readRememberedLogin, rememberLogin } from './remembered-lo
 import ProjectsPage, { ProjectContext, ProjectIcon } from './Projects';
 import CaseSetsPage from './CaseSetsPage';
 import DefectsPage from './DefectsPage';
-import AiDocuments from './AiDocuments';
+import AiWorkspace from './AiWorkspace';
+import { RequirementsPage, KnowledgePage } from './WorkspaceDocuments';
 import { DEFECT_STATUSES, defectStatusClass } from './defect-status';
 import {
   AlertCircle, ArrowDownToLine, ArrowUpRight, Bot, Bug, Check, Copy,
@@ -15,6 +16,8 @@ import {
 } from 'lucide-react';
 
 const NAV = [
+  { id: 'requirements', label: '需求管理', icon: FileText },
+  { id: 'knowledge', label: '项目知识库', icon: FolderOpen },
   { id: 'cases', label: '测试用例库', icon: Database },
   { id: 'defects', label: '当前缺陷', icon: Bug },
   { id: 'ai', label: 'AI 用例生成', icon: Sparkles },
@@ -302,6 +305,9 @@ export default function App() {
   const [formError, setFormError] = useState('');
   const [usersOpen, setUsersOpen] = useState(false);
   const [passwordOpen, setPasswordOpen] = useState(false);
+  const [dataVersion, setDataVersion] = useState(0);
+  const [aiRequirement, setAiRequirement] = useState(null);
+  const [caseRequirementFilter, setCaseRequirementFilter] = useState(null);
   const contextRef = useRef({ user, active, projectId: selectedProjectId });
   const authEpoch = useRef(0);
   const scopeEpoch = useRef(0);
@@ -312,6 +318,7 @@ export default function App() {
     scopeEpoch.current += 1; loadSequence.current += 1;
     contextRef.current.projectId = projectId;
     setSelectedProjectId(projectId); setCases([]); setDefects([]);
+    setAiRequirement(null); setCaseRequirementFilter(null);
     setDetail(null); setForm(null); setFormError(''); setFormBusy(false); setError('');
   }, []);
 
@@ -358,7 +365,7 @@ export default function App() {
       if (!currentUser) { applyUser(null); return []; }
       applyUser(currentUser);
       if (!current()) return [];
-      const canLoadProjects = currentUser.role === 'admin' || permitted(currentUser, 'cases') || permitted(currentUser, 'defects');
+      const canLoadProjects = currentUser.role === 'admin' || ['cases', 'defects', 'requirements', 'knowledge', 'ai'].some((module) => permitted(currentUser, module));
       const scoped = ['cases', 'defects'].includes(snapshot.active) && snapshot.projectId && permitted(currentUser, snapshot.active);
       const [projectData, recordData, fileData] = await Promise.all([
         canLoadProjects ? api('/api/projects') : Promise.resolve({ projects: [] }),
@@ -372,6 +379,7 @@ export default function App() {
       setCases(snapshot.active === 'cases' ? recordData.cases || [] : []);
       setDefects(snapshot.active === 'defects' ? recordData.defects || [] : []);
       setFiles(fileData.files || []);
+      setDataVersion((value) => value + 1);
       setError('');
       return latestProjects;
     } catch (failure) {
@@ -422,6 +430,18 @@ export default function App() {
   }
   function navigate(next) { if (!window.dispatchEvent(new Event('qzz-before-navigate', { cancelable: true }))) return; contextRef.current.active = next; changeProject(null); setActive(next); setMobileOpen(false); }
   function selectProject(projectId) { if (window.dispatchEvent(new Event('qzz-before-navigate', { cancelable: true }))) changeProject(projectId); }
+  function openRequirementAi(requirement) {
+    if (!permitted(user, 'ai') || !window.dispatchEvent(new Event('qzz-before-navigate', { cancelable: true }))) return;
+    contextRef.current.active = 'ai'; setAiRequirement(requirement); setCaseRequirementFilter(null); setActive('ai');
+  }
+  function openRequirementCases(requirementId) {
+    if (!permitted(user, 'cases') || !window.dispatchEvent(new Event('qzz-before-navigate', { cancelable: true }))) return;
+    contextRef.current.active = 'cases'; setCaseRequirementFilter(requirementId); setActive('cases');
+  }
+  function openRequirements() {
+    if (!permitted(user, 'requirements') || !window.dispatchEvent(new Event('qzz-before-navigate', { cancelable: true }))) return;
+    contextRef.current.active = 'requirements'; setActive('requirements');
+  }
   function openForm(kind, record = null, projectId = selectedProjectId, sourceIndex = null, onSaved = null) {
     if (!projectId || !projects.some((project) => project.id === projectId) || !permitted(user, kind, 'write')) return;
     setForm({ kind, record, projectId, sourceIndex, onSaved }); setDetail(null); setFormError('');
@@ -521,10 +541,9 @@ export default function App() {
       {error && <div className="global-error"><AlertCircle size={17} /><span>{error}</span><IconButton icon={X} label="关闭错误提示" onClick={() => setError('')} /></div>}
       <main className={`content ${canWrite ? '' : 'read-only-module'}`}>
         {!canView ? <Empty icon={ShieldCheck} title="暂未开放模块权限" detail="请联系管理员分配工作区权限。" action={<button className="button secondary" type="button" onClick={() => setPasswordOpen(true)}><KeyRound size={16} />修改我的密码</button>} />
-          : active === 'cases' || active === 'defects' ? selectedProject ? <><ProjectContext project={selectedProject} onBack={() => selectProject(null)} />{active === 'cases' ? <CaseSetsPage key={`cases-${selectedProject.id}`} project={selectedProject} items={cases} loading={loading} canWrite={canWrite} onRefresh={loadData} showError={setError} onNotice={setToast} /> : <DefectsPage key={`defects-${selectedProject.id}`} project={selectedProject} items={defects} loading={loading} canWrite={canWrite} onNew={() => canWrite && openForm('defects')} onSelect={(record) => setDetail({ kind: 'defects', id: record.id })} onRefresh={loadData} showError={setError} onNotice={setToast} />}</>
+          : ['cases', 'defects', 'requirements', 'knowledge', 'ai'].includes(active) ? selectedProject ? <><ProjectContext project={selectedProject} onBack={() => selectProject(null)} />{active === 'cases' ? <>{caseRequirementFilter && <div className="project-context"><FileText size={16} /><span>仅查看此需求关联的用例集</span><button type="button" className="text-button" onClick={() => setCaseRequirementFilter(null)}>显示全部</button></div>}<CaseSetsPage key={`cases-${selectedProject.id}-${caseRequirementFilter || 'all'}`} project={selectedProject} items={caseRequirementFilter ? cases.filter((item) => item.requirementId === caseRequirementFilter) : cases} loading={loading} canWrite={canWrite} onRefresh={loadData} showError={setError} onNotice={setToast} /></> : active === 'defects' ? <DefectsPage key={`defects-${selectedProject.id}`} project={selectedProject} items={defects} loading={loading} canWrite={canWrite} onNew={() => canWrite && openForm('defects')} onSelect={(record) => setDetail({ kind: 'defects', id: record.id })} onRefresh={loadData} showError={setError} onNotice={setToast} /> : active === 'requirements' ? <RequirementsPage key={`requirements-${selectedProject.id}`} project={selectedProject} canWrite={canWrite} canAi={permitted(user, 'ai', 'write')} canCasesView={permitted(user, 'cases')} canGenerate={permitted(user, 'ai')} config={config} onGenerate={openRequirementAi} onOpenCases={openRequirementCases} refreshToken={dataVersion} onNotice={setToast} showError={setError} /> : active === 'knowledge' ? <KnowledgePage key={`knowledge-${selectedProject.id}`} project={selectedProject} canWrite={canWrite} config={config} refreshToken={dataVersion} onNotice={setToast} showError={setError} /> : <AiWorkspace key={`ai-${user.id}-${selectedProject.id}-${aiRequirement?.id || 'default'}`} project={selectedProject} projects={projects} isAdmin={user.role === 'admin'} canWrite={canWrite} canSave={permitted(user, 'cases', 'write')} canRequirements={permitted(user, 'requirements')} canKnowledge={permitted(user, 'knowledge')} config={config} initialRequirement={aiRequirement} refreshToken={dataVersion} onCreateRequirement={openRequirements} onRefresh={loadData} showError={setError} onNotice={setToast} />}</>
             : <ProjectsPage key={active} kind={active} projects={projects} loading={loading} canManage={user.role === 'admin'} onSelect={(project) => selectProject(project.id)} onRefresh={loadData} onCreate={createProject} onRename={renameProject} onUpload={uploadProjectIcon} onDelete={deleteProject} onRestore={restoreProject} onListArchived={listArchivedProjects} />
-          : active === 'ai' ? <AiDocuments key={`ai-${user.id}`} isAdmin={user.role === 'admin'} canWrite={canWrite} canSave={permitted(user, 'cases', 'write')} config={config} projects={projects} onRefresh={loadData} showError={setError} onNotice={setToast} />
-            : <FilesPage canWrite={canWrite} files={files} loading={loading} maxUploadMb={config.maxUploadMb} onUpload={upload} onDelete={deleteFile} onRefresh={loadData} showError={setError} />}
+          : <FilesPage canWrite={canWrite} files={files} loading={loading} maxUploadMb={config.maxUploadMb} onUpload={upload} onDelete={deleteFile} onRefresh={loadData} showError={setError} />}
       </main>
       {toast && <div className="toast" role="status"><Check size={17} />{toast}</div>}
     </div>

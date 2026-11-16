@@ -36,7 +36,7 @@ export function initializeProjects(db, dataDir) {
 
 export function createProjectService({ db, iconDir, sendError, inputError, authenticate }) {
   const getProject = db.prepare('SELECT * FROM projects WHERE id = ?');
-  const canView = (user) => user.permissions.cases.view || user.permissions.defects.view;
+  const canView = (user) => ['cases', 'defects', 'ai', 'requirements', 'knowledge'].some((name) => user.permissions[name]?.view);
 
   function mapProject(row, user) {
     return {

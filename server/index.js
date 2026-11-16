@@ -10,7 +10,9 @@ import { WebSocketServer } from 'ws';
 import { initializeProjects, createProjectService } from './projects.js';
 import { loadAiProvider, publicAiProvider } from './ai-provider.js';
 import { initializeCaseSets, caseTree, registerCaseSetRoutes } from './case-sets.js';
-import { registerAiRoutes } from './ai-documents.js';
+import { registerAiRoutes, loadFeishuConfig } from './ai-documents.js';
+import { initializeWorkspaceDocuments, registerWorkspaceDocumentRoutes } from './workspace-documents.js';
+import { registerAiWorkspaceRoutes } from './ai-workspace.js';
 import { hashPassword, verifyPassword, loadPasswordKey,
   encryptPassword as encryptWithKey, decryptPassword as decryptWithKey } from './passwords.js';
 
@@ -69,6 +71,8 @@ db.exec(`
 `);
 const projectIconDir = initializeProjects(db, dataDir);
 initializeCaseSets(db);
+const workspaceDocuments = initializeWorkspaceDocuments(db, dataDir);
+if (!db.prepare('PRAGMA table_info(cases)').all().some((column) => column.name === 'requirement_id')) db.exec('ALTER TABLE cases ADD COLUMN requirement_id TEXT REFERENCES requirements(id) ON DELETE SET NULL');
 
 const userColumns = db.prepare('PRAGMA table_info(users)').all().map((column) => column.name);
 for (const [name, definition] of Object.entries({
@@ -81,7 +85,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS account_audit (
   action TEXT NOT NULL, created_at TEXT NOT NULL
 )`);
 const passwordKey = loadPasswordKey(dataDir, Boolean(db.prepare('SELECT 1 FROM users WHERE password_encrypted IS NOT NULL').get()));
-const permissionModules = ['cases', 'defects', 'ai', 'files'];
+const permissionModules = ['cases', 'defects', 'ai', 'files', 'requirements', 'knowledge'];
 
 function normalizePermissions(value) {
   if (value != null && (typeof value !== 'object' || Array.isArray(value))) throw new InputError('权限格式不正确');
@@ -423,6 +427,21 @@ function readRevision(value) {
   return value;
 }
 
+function requirePermission(module, action) {
+  return (req, res, next) => {
+    if (req.user?.role === 'admin' || req.user?.permissions?.[module]?.[action]) return next();
+    return sendError(res, 403, 'forbidden', '没有此模块的操作权限');
+  };
+}
+
+function caseRequirement(value, projectId, req, previous = null) {
+  if (value === undefined) return previous;
+  if (value === null || value === '') return null;
+  if (!req.user.permissions.requirements.view) throw new InputError('没有关联需求的查看权限');
+  if (typeof value !== 'string' || !workspaceDocuments.getRequirement(projectId, value)) throw new InputError('关联需求不存在或不属于当前项目');
+  return value;
+}
+
 function normalizeCase(body, previous = {}) {
   const source = body || {};
   const tags = source.tags === undefined ? previous.tags || [] : source.tags;
@@ -452,7 +471,7 @@ function mapCase(row) {
     status: row.status, preconditions: row.preconditions, steps: row.steps,
     expected: row.expected, notes: row.notes, tags: JSON.parse(row.tags), tree: JSON.parse(row.tree),
     revision: row.revision, createdBy: row.creator_name, createdAt: row.created_at,
-    updatedAt: row.updated_at,
+    updatedAt: row.updated_at, requirementId: row.requirement_id || null,
   };
 }
 
@@ -462,18 +481,23 @@ const getCase = db.prepare(`${caseSelect} WHERE cases.id = ?`);
 
 app.get('/api/cases', (req, res) => {
   const projectId = projects.requireProject(req.query.projectId);
+  if (req.query.requirementId !== undefined) {
+    const requirementId = caseRequirement(req.query.requirementId, projectId, req);
+    return res.json({ cases: db.prepare(`${caseSelect} WHERE cases.project_id = ? AND cases.requirement_id = ? ORDER BY cases.updated_at DESC, cases.id DESC`).all(projectId, requirementId).map(mapCase) });
+  }
   res.json({ cases: db.prepare(`${caseSelect} WHERE cases.project_id = ? ORDER BY cases.updated_at DESC, cases.id DESC`).all(projectId).map(mapCase) });
 });
 
 app.post('/api/cases', (req, res) => {
   const projectId = projects.requireProject(req.body?.projectId);
   const value = normalizeCase(req.body);
+  const requirementId = caseRequirement(req.body?.requirementId, projectId, req);
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
   db.prepare(`INSERT INTO cases (id, title, module, priority, status, preconditions, steps, expected, notes, tags,
-    revision, created_by, created_at, updated_at, project_id, tree) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`)
+    revision, created_by, created_at, updated_at, project_id, tree, requirement_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)`)
     .run(id, value.title, value.module, value.priority, value.status, value.preconditions,
-      value.steps, value.expected, value.notes, JSON.stringify(value.tags), req.user.id, now, now, projectId, JSON.stringify(value.tree));
+      value.steps, value.expected, value.notes, JSON.stringify(value.tags), req.user.id, now, now, projectId, JSON.stringify(value.tree), requirementId);
   const record = mapCase(getCase.get(id));
   broadcast('case.created', { case: record, projectId });
   res.status(201).json({ case: record });
@@ -488,10 +512,11 @@ app.put('/api/cases/:id', (req, res) => {
     return res.status(409).json({ error: 'conflict', message: '用例已被其他人修改，请刷新后重试', case: mapCase(current) });
   }
   const value = normalizeCase(req.body, mapCase(current));
+  const requirementId = caseRequirement(req.body?.requirementId, projectId, req, current.requirement_id);
   const result = db.prepare(`UPDATE cases SET title=?, module=?, priority=?, status=?, preconditions=?,
-    steps=?, expected=?, notes=?, tags=?, tree=?, revision=revision+1, updated_at=?
+    steps=?, expected=?, notes=?, tags=?, tree=?, requirement_id=?, revision=revision+1, updated_at=?
     WHERE id=? AND revision=?`).run(value.title, value.module, value.priority, value.status,
-      value.preconditions, value.steps, value.expected, value.notes, JSON.stringify(value.tags), JSON.stringify(value.tree),
+      value.preconditions, value.steps, value.expected, value.notes, JSON.stringify(value.tags), JSON.stringify(value.tree), requirementId,
       new Date().toISOString(), current.id, revision);
   if (!result.changes) return res.status(409).json({ error: 'conflict', message: '用例已被其他人修改', case: mapCase(getCase.get(current.id)) });
   const record = mapCase(getCase.get(current.id));
@@ -675,6 +700,8 @@ app.delete('/api/files/:id', (req, res) => {
 
 registerCaseSetRoutes(app, { db, projects, sendError, inputError: (message) => new InputError(message), readRevision, mapCase, mapDefect, getCase, getDefect, broadcast });
 registerAiRoutes(app, { db, dataDir, sendError, inputError: (message) => new InputError(message), authenticate: userFromRequest, requireProject: projects.requireProject });
+registerWorkspaceDocumentRoutes(app, { db, dataDir, requirePermission, requireProject: projects.requireProject, broadcast, authenticate: userFromRequest, readFeishuConfig: () => loadFeishuConfig(dataDir) });
+registerAiWorkspaceRoutes(app, { dataDir, workspace: workspaceDocuments, requireProject: projects.requireProject, authenticate: userFromRequest, sendError });
 
 app.use('/api', (req, res) => sendError(res, 404, 'not_found', '接口不存在'));
 
@@ -725,7 +752,7 @@ function broadcast(type, details) {
       WHERE token_hash = ? AND expires_at > ? AND disabled = 0`)
       .get(client.tokenHash, Date.now());
     const category = type.split('.')[0];
-    const module = { case: 'cases', defect: 'defects', file: 'files' }[category];
+    const module = { case: 'cases', defect: 'defects', file: 'files', requirement: 'requirements', plan: 'requirements', knowledge: 'knowledge' }[category];
     const user = session && mapUser(session);
     if (user && category === 'project') {
       if (projects.canView(user)) client.send(JSON.stringify({ type, project: projects.mapProject(projects.getProject.get(details.project.id), user) }));
