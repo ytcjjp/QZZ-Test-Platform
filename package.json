@@ -1,0 +1,15 @@
+{
+  "name": "qzz-test-platform",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "client",
+    "server"
+  ],
+  "scripts": {
+    "build": "npm run build -w qzz-platform-client",
+    "start": "npm run start -w qzz-platform-server",
+    "dev:server": "npm run dev -w qzz-platform-server",
+    "dev:client": "npm run dev -w qzz-platform-client"
+  }
+}
