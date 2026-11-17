@@ -152,7 +152,7 @@ stdout/stderr 原文。页面错误可附诊断编号；记录写入失败不会
 `GET /api/config` 只返回已配置标记、模型、档位和模式，不返回密钥。
 入口仅接收策划文档，不再接受手写 `requirements`。`POST /api/ai/documents`
 上传 multipart `file`（Word `.doc/.docx`、PDF、Markdown、TXT），或 JSON `{url}`
-导入飞书 / Lark 的 `docx/docs/wiki` 地址，返回 `{document:{id,name,text,chars}}`。
+导入飞书 / Lark 的 `docx/docs/wiki` 地址，返回 `{document:{id,name,text,chars,warnings}}`。
 策划文档上传不设置固定文件大小上限；解析后的正文最多 10 万字符，PDF 最多 300 页；扫描版 PDF 无 OCR，
 无可读文字时明确拒绝，不会用空文档生成。暂存文档按账号隔离、24 小时过期，
 可用 `DELETE /api/ai/documents/:id` 移除。文件只用于提取，原二进制不持久保存。
@@ -164,18 +164,16 @@ stdout/stderr 原文。页面错误可附诊断编号；记录写入失败不会
 文档正文作为待分析资料发送，不作为系统指令；生成结果不会自动入库，需要选择项目组并保存。
 未配置 AI 时返回 503，不会伪装生成结果。
 
-飞书须由管理员从需求管理页头、来源导入弹窗或 AI 来源入口的“飞书文档连接”配置
-`appId`、`appSecret`，或设置环境变量
-`FEISHU_APP_ID`、`FEISHU_APP_SECRET`，并在飞书为应用开通相应文档读取权限、
-发布应用及授权访问文档。QZZ 管理员身份不等于飞书企业审批或文档访问权限。
-参考飞书官方[纯文本接口说明](https://open.feishu.cn/document/server-docs/docs/docs/docx-v1/document/raw_content)
-及[云文档权限帮助](https://www.feishu.cn/hc/zh-CN/articles/360044508113-%E4%BA%91%E6%96%87%E6%A1%A3%E6%9D%83%E9%99%90%E5%B8%B8%E8%A7%81%E9%97%AE%E9%A2%98)。
-网页 API 为仅管理员可访问的 `GET/PUT /api/ai/feishu-config`，GET/PUT 仅返回应用 ID 和已配置标记，
-`appSecret` 不返回；同 App ID 留空保留原凭据，更换 App ID 需要新 Secret。
-本地配置 `data/feishu-config.json` 中的密钥使用原有 `password-key` 加密。
-服务仅请求固定的飞书 / Lark 官方 API 域名，不直接抓取任意传入地址。
-缺少授权会提示下载 Word/PDF 后导入；需求/知识来源读取网络失败返回受控 502，超时返回 504。
-本轮飞书测试使用请求替身，尚未配置真实租户，不能声明企业权限和文档共享已实测。
+飞书读取由服务器电脑上的 Chrome 扩展执行，使用该浏览器已登录账号的实际权限，不需要
+App ID / App Secret。管理员可以在“飞书文档连接”中下载扩展 ZIP、生成一次性配对码或断开连接。
+`GET /api/feishu-browser/status` 供登录用户查看状态；`POST /api/feishu-browser/pair`、
+`DELETE /api/feishu-browser/disconnect` 和 `GET /api/feishu-browser/extension.zip` 仅管理员可用。
+扩展仅从本机 `127.0.0.1` 连接 `/api/feishu-browser/events`，配对令牌在平台仅存哈希。
+旧 `/api/ai/feishu-config` 已下线；旧配置文件如有保留在本地但不再读取。
+导入需求/知识来源时保存正文、实际取得的图片附件及完整性警告，部分读取不能宣称已分析所有内容；
+AI 临时来源仅保存正文，图片应导入项目需求或知识库后参与图文分析。错误返回受控信息，
+超过 180 秒自动取消。安装及边界见 [浏览器导入说明](../docs/browser-import.md)。
+本轮仅用模拟扩展与 DOM 测试，尚未验证真实飞书页面及企业账号权限。
 
 工具云盘上传上限默认 100 MB，可用 `MAX_UPLOAD_MB` 调整；此设置不改变上述导入限制。
 新上传文件名统一修复 multipart UTF-8 被按 Latin-1 解码的问题，保留原生 Unicode 文件名，

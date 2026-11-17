@@ -1,0 +1,8 @@
+{
+  "name": "qzz-feishu-browser-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test test/*.test.js", "package": "powershell -NoProfile -ExecutionPolicy Bypass -File ./package.ps1" },
+  "devDependencies": { "linkedom": "0.18.15" }
+}

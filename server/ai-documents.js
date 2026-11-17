@@ -7,7 +7,6 @@ import mammoth from 'mammoth';
 import WordExtractor from 'word-extractor';
 import { PDFParse } from 'pdf-parse';
 import { unzipSync } from 'fflate';
-import { loadPasswordKey, encryptPassword, decryptPassword } from './passwords.js';
 import { normalizeTree } from './mindmap-formats.js';
 import { uploadFilename } from './upload-name.js';
 import { loadAiProvider, publicAiProvider } from './ai-provider.js';
@@ -69,19 +68,6 @@ export async function extractDocument(file) {
   return checkedText(text);
 }
 
-export function parseFeishuUrl(value) {
-  let url;
-  try { url = new URL(value); } catch { throw new DocumentError('请输入有效的飞书云文档地址'); }
-  const host = url.hostname.toLowerCase();
-  const china = host === 'feishu.cn' || host.endsWith('.feishu.cn');
-  const global = host === 'larksuite.com' || host.endsWith('.larksuite.com');
-  const match = url.pathname.match(/^\/(docx|docs|wiki)\/([A-Za-z0-9_-]{1,200})\/?$/);
-  if (url.protocol !== 'https:' || url.port || url.username || url.password || (!china && !global) || !match) {
-    throw new DocumentError('仅支持 HTTPS 飞书 / Lark 的 docx、docs 或 wiki 文档地址');
-  }
-  return { host: china ? 'https://open.feishu.cn' : 'https://open.larksuite.com', type: match[1], token: match[2] };
-}
-
 async function limitedJson(response, maxBytes = 2 * 1024 * 1024) {
   if (Number(response.headers.get('content-length')) > maxBytes) throw new DocumentError('外部服务返回内容过大', 502);
   let length = 0; const chunks = [];
@@ -92,32 +78,6 @@ async function limitedJson(response, maxBytes = 2 * 1024 * 1024) {
   }
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); }
   catch { throw new DocumentError('外部服务没有返回有效数据', 502); }
-}
-
-export async function readFeishuDocument(value, { appId, appSecret, request = fetch } = {}) {
-  const source = parseFeishuUrl(value);
-  if (!appId || !appSecret) throw new DocumentError('请管理员先配置飞书应用，并为应用授予文档读取权限；也可以下载 Word / PDF 后导入。', 503);
-  async function call(endpoint, options = {}) {
-    const response = await request(source.host + '/open-apis/' + endpoint, { ...options, redirect: 'error', signal: AbortSignal.timeout(20000) });
-    const payload = await limitedJson(response);
-    if (!response.ok || payload.code !== 0) throw new DocumentError('飞书文档读取失败：请检查应用凭据、文档读取权限，并将文档共享给应用。', 422);
-    return payload;
-  }
-  const auth = await call('auth/v3/tenant_access_token/internal', {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
-  });
-  if (typeof auth.tenant_access_token !== 'string') throw new DocumentError('飞书应用认证失败', 422);
-  const headers = { authorization: `Bearer ${auth.tenant_access_token}` };
-  let type = source.type; let token = source.token;
-  if (type === 'wiki') {
-    const wiki = await call(`wiki/v2/spaces/get_node?token=${encodeURIComponent(token)}`, { headers });
-    type = wiki.data?.node?.obj_type;
-    token = wiki.data?.node?.obj_token;
-    if (!['docx', 'doc'].includes(type) || !/^[A-Za-z0-9_-]{1,200}$/.test(token || '')) throw new DocumentError('该知识库节点不是可读取的文字文档');
-  }
-  const endpoint = type === 'docx' ? `docx/v1/documents/${token}/raw_content` : `doc/v2/${token}/raw_content`;
-  const result = await call(endpoint, { headers });
-  return { text: checkedText(result.data?.content), name: `飞书策划案-${source.token.slice(0, 16)}` };
 }
 
 function shortText(value, label, max = 2000) {
@@ -252,41 +212,10 @@ export async function generateDocumentCases(documents, {
   return result;
 }
 
-export function loadFeishuConfig(dataDir) {
-  const configFile = path.join(dataDir, 'feishu-config.json');
-  if (!fs.existsSync(configFile)) return { appId: process.env.FEISHU_APP_ID || '', appSecret: process.env.FEISHU_APP_SECRET || '' };
-  const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
-  return { appId: config.appId || '', appSecret: config.encryptedSecret ? decryptPassword(config.encryptedSecret, loadPasswordKey(dataDir, true)) : '' };
-}
-
-export function registerAiRoutes(app, { db, dataDir, sendError, inputError, authenticate, loadProvider = loadAiProvider, generateCases = generateDocumentCases }) {
+export function registerAiRoutes(app, { db, dataDir, sendError, authenticate, browserService, loadProvider = loadAiProvider, generateCases = generateDocumentCases }) {
   db.exec(`CREATE TABLE IF NOT EXISTS ai_documents (
     id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, name TEXT NOT NULL, text TEXT NOT NULL, created_at INTEGER NOT NULL
   ); CREATE INDEX IF NOT EXISTS ai_documents_owner_idx ON ai_documents(owner_id, created_at)`);
-  const configFile = path.join(dataDir, 'feishu-config.json');
-  function readConfig() {
-    return loadFeishuConfig(dataDir);
-  }
-  function requireAdmin(req, res, next) {
-    if (req.user.role !== 'admin') return sendError(res, 403, 'forbidden', '仅管理员可配置飞书应用');
-    next();
-  }
-  const publicConfig = (config) => ({ appId: config.appId, configured: Boolean(config.appId && config.appSecret) });
-  app.get('/api/ai/feishu-config', requireAdmin, (req, res) => res.json(publicConfig(readConfig())));
-  app.put('/api/ai/feishu-config', requireAdmin, (req, res) => {
-    const existing = readConfig();
-    const appId = req.body?.clear === true ? '' : req.body?.appId?.trim();
-    const secret = req.body?.appSecret;
-    if (typeof appId !== 'string' || (appId && !/^cli_[A-Za-z0-9_-]{1,120}$/.test(appId))) throw inputError('请输入正确的飞书 App ID');
-    if (secret !== undefined && (typeof secret !== 'string' || secret.length > 500)) throw inputError('飞书 App Secret 格式不正确');
-    const appSecret = req.body?.clear === true ? '' : secret || (appId === existing.appId ? existing.appSecret : '');
-    if (!req.body?.clear && (!appId || !appSecret)) throw inputError('首次配置或更换 App ID 时，需要同时填写 App Secret');
-    const stored = { appId, encryptedSecret: appSecret ? encryptPassword(appSecret, loadPasswordKey(dataDir)) : '' };
-    const temporary = configFile + '.' + crypto.randomUUID() + '.tmp';
-    try { fs.writeFileSync(temporary, JSON.stringify(stored), { mode: 0o600 }); fs.renameSync(temporary, configFile); }
-    finally { if (fs.existsSync(temporary)) fs.unlinkSync(temporary); }
-    res.json(publicConfig({ appId, appSecret }));
-  });
   function freshWriter(req) {
     const user = authenticate(req);
     if (!user || user.id !== req.user.id) throw new DocumentError('登录已失效，请重新登录', 401);
@@ -307,23 +236,32 @@ export function registerAiRoutes(app, { db, dataDir, sendError, inputError, auth
     upload.single('file')(req, res, (error) => error ? sendError(res, 400, 'upload_error', '请选择一个有效的策划文档') : next());
   }, async (req, res) => {
     if (parsing >= 3) return sendError(res, 429, 'busy', '当前正在读取较多文档，请稍后重试');
+    const controller = new AbortController();
+    const disconnected = () => { if (!res.writableEnded) controller.abort(); };
+    res.on('close', disconnected);
     parsing += 1;
     try {
+      freshWriter(req);
       cleanDocuments();
       if (db.prepare('SELECT count(*) AS count FROM ai_documents WHERE owner_id = ?').get(req.user.id).count >= 20) throw new DocumentError('已导入较多策划文档，请移除不用的文档后重试', 429);
       if (db.prepare('SELECT count(*) AS count FROM ai_documents').get().count >= 500) throw new DocumentError('暂存文档数量已达上限，请稍后重试', 429);
       const extracted = req.file
-        ? { name: documentName(req.file.originalname), text: await extractDocument(req.file) }
-        : await readFeishuDocument(req.body?.url, readConfig());
+        ? { name: documentName(req.file.originalname), text: await extractDocument(req.file), warnings: [] }
+        : await browserService?.read(req.body?.url, { requester: req.user, signal: controller.signal });
+      if (!extracted) throw new DocumentError('请管理员先连接服务器 Chrome 浏览器扩展，再导入飞书文档。', 503);
       freshWriter(req);
-      const document = { id: crypto.randomUUID(), name: extracted.name, text: extracted.text, chars: extracted.text.length };
+      if (!extracted.text.trim()) throw new DocumentError('AI 临时文档需要可读正文；仅含图片的飞书资料请导入项目需求后分析。');
+      const warnings = [...(extracted.warnings || [])];
+      if (extracted.images?.length) warnings.push('AI 临时文档仅保存正文；图片请导入项目需求或知识库后进行图文分析。');
+      const document = { id: crypto.randomUUID(), name: documentName(extracted.name), text: extracted.text, chars: extracted.text.length, warnings };
       db.prepare('INSERT INTO ai_documents VALUES (?, ?, ?, ?, ?)').run(document.id, req.user.id, document.name, document.text, Date.now());
       res.status(201).json({ document });
     } catch (error) {
-      if (error instanceof DocumentError) return sendError(res, error.status, 'document_error', error.message);
+      if (error instanceof DocumentError || error.publicMessage) return sendError(res, error.status || 400, 'document_error', error.publicMessage || error.message);
+      if (controller.signal.aborted) return;
       console.error('Document extraction failed:', error.name);
       sendError(res, 502, 'document_error', '文档读取失败，请稍后重试或下载为 Word / PDF 导入');
-    } finally { parsing -= 1; }
+    } finally { res.off('close', disconnected); parsing -= 1; }
   });
   app.delete('/api/ai/documents/:id', (req, res) => {
     db.prepare('DELETE FROM ai_documents WHERE id = ? AND owner_id = ?').run(req.params.id, req.user.id);

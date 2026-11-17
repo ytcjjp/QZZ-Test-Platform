@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "QZZ 飞书文档导入",
+  "version": "1.0.0",
+  "minimum_chrome_version": "120",
+  "description": "通过当前 Chrome 已登录的飞书页面，为本机 QZZ 测试平台导入文档。",
+  "permissions": ["storage", "tabs", "scripting", "alarms"],
+  "host_permissions": [
+    "https://*.feishu.cn/*",
+    "https://*.feishucdn.com/*",
+    "https://*.larksuite.com/*",
+    "https://*.larksuitecdn.com/*",
+    "http://127.0.0.1/*"
+  ],
+  "background": { "service_worker": "service-worker.js", "type": "module" },
+  "action": { "default_popup": "popup.html", "default_title": "QZZ 飞书导入" },
+  "content_security_policy": { "extension_pages": "script-src 'self'; object-src 'none'; connect-src ws://127.0.0.1:* https://*.feishu.cn https://*.feishucdn.com https://*.larksuite.com https://*.larksuitecdn.com; base-uri 'none'" }
+}

@@ -222,20 +222,17 @@ test('chunk windows overlap predictably and heading mode respects sections witho
   assert.throws(() => splitKnowledgeText('x'.repeat(20000), { chunkSize: 100, chunkOverlap: 99 }), /10000/);
 });
 
-test('Feishu imports use mocked official APIs, retain source text, and recheck permission/project after asynchronous reads', async () => {
+test('Feishu browser imports retain text, real image files, warnings, and recheck permission/project', async () => {
   let mode = 'ok'; let afterRead = () => {};
   const calls = [];
-  const config = { appId: 'cli_mock', appSecret: 'mock-secret', request: async (url, options) => {
-    calls.push(url);
-    assert.ok(url.startsWith('https://open.feishu.cn/open-apis/'));
+  const png = await sharp({ create: { width: 2, height: 2, channels: 4, background: '#20aa33' } }).png().toBuffer();
+  const browserService = { read: async (url, { requester }) => {
+    calls.push({ url, user: requester.id });
     if (mode === 'network') throw new TypeError('private upstream network diagnostic');
     if (mode === 'timeout') throw new DOMException('private timeout diagnostic', 'TimeoutError');
-    if (url.includes('/auth/')) return Response.json({ code: 0, tenant_access_token: 'mock-token' });
-    assert.equal(options.headers.authorization, 'Bearer mock-token');
-    if (mode === 'denied') return Response.json({ code: 99991663 }, { status: 403 });
-    if (url.includes('get_node')) return Response.json({ code: 0, data: { node: { obj_type: 'docx', obj_token: 'ResolvedDocument' } } });
+    if (mode === 'denied') throw Object.assign(new Error('无权限访问飞书文档'), { status: 422 });
     afterRead();
-    return Response.json({ code: 0, data: { content: '# 飞书需求\n领取奖励后更新背包。' } });
+    return { name: '飞书需求', text: '# 飞书需求\n领取奖励后更新背包。', warnings: ['折叠块未采集'], completeness: 'partial', images: [{ name: '规则图', mimeType: 'image/png', buffer: png }] };
   } };
   await fixture(async ({ call, db, users, service }) => {
     const sourceUrl = 'https://team.feishu.cn/wiki/MockNode';
@@ -243,11 +240,19 @@ test('Feishu imports use mocked official APIs, retain source text, and recheck p
     assert.equal(created.status, 201);
     assert.equal(created.body.requirement.sourceUrl, sourceUrl);
     assert.match(created.body.requirement.body, /更新背包/);
-    assert.ok(service.getRequirementEvidence('a', created.body.requirement.id).warnings.some((warning) => /文字接口/.test(warning)));
-    assert.ok(calls.some((url) => url.includes('wiki/v2/spaces/get_node')));
+    assert.equal(created.body.requirement.sourceCompleteness, 'partial');
+    assert.deepEqual(created.body.requirement.sourceWarnings, ['折叠块未采集']);
+    assert.equal(created.body.requirement.attachments.length, 1);
+    assert.equal(created.body.requirement.attachments[0].mimeType, 'image/png');
+    assert.equal((await call(created.body.requirement.attachments[0].downloadUrl, undefined, 'GET')).body.length, png.length);
+    assert.equal(service.getRequirementEvidence('a', created.body.requirement.id).images.length, 1);
+    assert.ok(service.getRequirementEvidence('a', created.body.requirement.id).warnings.includes('折叠块未采集'));
+    assert.deepEqual(calls[0], { url: sourceUrl, user: 'writer' });
     const kb = (await call('/api/knowledge-bases', { projectId: 'a', name: '飞书知识' })).body.knowledgeBase;
     assert.equal((await call(`/api/knowledge-bases/${kb.id}/documents`, { projectId: 'a', title: '飞书技术资料', sourceUrl: 'https://team.feishu.cn/docx/Source' })).status, 201);
     assert.ok(service.getKnowledgeContext('a', [kb.id], '背包').chunks.length > 0);
+    assert.equal(service.getKnowledgeContext('a', [kb.id], '背包').images.length, 1);
+    assert.ok(service.getKnowledgeContext('a', [kb.id], '背包').warnings.some((warning) => warning.includes('折叠块未采集')));
     const count = db.prepare('SELECT count(*) n FROM requirements').get().n;
     mode = 'denied';
     assert.equal((await call('/api/requirements', { projectId: 'a', title: '不可读取', sourceUrl })).status, 422);
@@ -263,5 +268,5 @@ test('Feishu imports use mocked official APIs, retain source text, and recheck p
     afterRead = () => { db.prepare('UPDATE projects SET deleted_at=? WHERE id=?').run('2026-11-17', 'a'); };
     assert.equal((await call('/api/requirements', { projectId: 'a', title: '项目已删除', sourceUrl })).status, 400);
     assert.equal(db.prepare('SELECT count(*) n FROM requirements').get().n, count);
-  }, { readFeishuConfig: () => config });
+  }, { browserService });
 });

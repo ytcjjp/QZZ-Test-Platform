@@ -30,7 +30,7 @@ import {
   X,
 } from "lucide-react";
 import "./workspace-documents.css";
-import FeishuConnection, { FeishuConnectionHelp } from "./FeishuConnection";
+import FeishuConnection, { FeishuBrowserStatus, FeishuConnectionHelp } from "./FeishuConnection";
 const markdown = new MarkdownIt({ html: false, linkify: false, breaks: true });
 const REQUIREMENT_STATUSES = ["草稿", "已确认", "已归档"];
 const PRIORITIES = ["P0", "P1", "P2", "P3"];
@@ -341,7 +341,7 @@ function SourceDialog({
   project,
   canWrite,
   isAdmin = false,
-  onConfigureFeishu,
+  onConfigureFeishu: configureExternal,
   record,
   knowledgeBase,
   onClose,
@@ -359,6 +359,8 @@ function SourceDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [conflict, setConflict] = useState(false);
+  const [feishuOpen, setFeishuOpen] = useState(false);
+  const onConfigureFeishu = configureExternal || (() => setFeishuOpen(true));
   const baseline = useRef(
     JSON.stringify([title, body, status, priority, sourceUrl, category]),
   );
@@ -595,17 +597,7 @@ function SourceDialog({
           />
         </label>
         <div className="feishu-source-help">
-          {isAdmin && onConfigureFeishu && (
-            <button
-              type="button"
-              className="text-button"
-              disabled={busy}
-              onClick={onConfigureFeishu}
-            >
-              <Link2 size={14} />
-              飞书文档连接设置
-            </button>
-          )}
+          <FeishuBrowserStatus isAdmin={isAdmin} onConfigure={onConfigureFeishu} disabled={busy} />
           <FeishuConnectionHelp
             isAdmin={isAdmin}
             onConfigure={onConfigureFeishu}
@@ -662,14 +654,14 @@ function SourceDialog({
           </div>
         )}
         <ErrorMessage error={error}>
-          {isAdmin && onConfigureFeishu && /飞书|权限|应用/.test(error) && (
+          {onConfigureFeishu && /飞书|浏览器|Chrome|连接|登录|权限/.test(error) && (
             <button
               type="button"
               className="text-button"
               disabled={busy}
               onClick={onConfigureFeishu}
             >
-              配置飞书连接
+              查看浏览器连接
             </button>
           )}
           {conflict && (
@@ -714,6 +706,7 @@ function SourceDialog({
           </button>
         </div>
       </form>
+      {feishuOpen && <FeishuConnection isAdmin={isAdmin} onClose={() => setFeishuOpen(false)} />}
     </Modal>
   );
 }
@@ -1292,9 +1285,6 @@ function RequirementsPage({
     setFeishuOpen(false);
   }, [project.id, canWrite]);
   useEffect(() => {
-    if (!isAdmin) setFeishuOpen(false);
-  }, [isAdmin]);
-  useEffect(() => {
     load();
   }, [load, canWrite, refreshToken]);
   useEffect(() => {
@@ -1407,14 +1397,14 @@ function RequirementsPage({
           <p>{project.name}</p>
         </div>
         <div className="heading-actions">
-          {isAdmin && (
+          {(
             <button
               type="button"
-              className="button secondary"
+              className="button secondary browser-connection-entry"
               onClick={() => setFeishuOpen(true)}
             >
               <Link2 size={16} />
-              飞书文档连接
+              飞书浏览器连接
             </button>
           )}
           <Icon
@@ -1615,11 +1605,12 @@ function RequirementsPage({
           }}
         />
       )}
-      {feishuOpen && isAdmin && (
+      {feishuOpen && (
         <FeishuConnection
+          isAdmin={isAdmin}
           onClose={() => setFeishuOpen(false)}
           onSaved={() =>
-            onNotice?.("飞书应用配置已保存，请确认飞书侧授权后再导入文档")
+            onNotice?.("飞书浏览器连接状态已更新")
           }
         />
       )}
@@ -1956,6 +1947,7 @@ function KnowledgeContents({
   project,
   knowledgeBase,
   canWrite,
+  isAdmin = false,
   onChanged,
   onNotice,
   refreshToken,
@@ -2363,6 +2355,7 @@ function KnowledgeContents({
         <SourceDialog
           project={project}
           canWrite={canWrite}
+          isAdmin={isAdmin}
           knowledgeBase={knowledgeBase}
           onClose={() => setUploadOpen(false)}
           onSaved={() => {
@@ -2416,6 +2409,7 @@ function KnowledgeContents({
 function KnowledgePage({
   project,
   canWrite,
+  isAdmin = false,
   onNotice,
   showError,
   refreshToken,
@@ -2582,6 +2576,7 @@ function KnowledgePage({
             project={project}
             knowledgeBase={selected}
             canWrite={canWrite}
+            isAdmin={isAdmin}
             onChanged={load}
             onNotice={onNotice}
             refreshToken={refreshToken}

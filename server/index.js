@@ -10,7 +10,9 @@ import { WebSocketServer } from 'ws';
 import { initializeProjects, createProjectService } from './projects.js';
 import { loadAiProvider, publicAiProvider } from './ai-provider.js';
 import { initializeCaseSets, caseTree, registerCaseSetRoutes } from './case-sets.js';
-import { registerAiRoutes, loadFeishuConfig } from './ai-documents.js';
+import { registerCaseExecutionRoutes } from './case-executions.js';
+import { registerAiRoutes } from './ai-documents.js';
+import { createFeishuBrowserService, registerFeishuBrowserRoutes } from './feishu-browser.js';
 import { initializeWorkspaceDocuments, registerWorkspaceDocumentRoutes } from './workspace-documents.js';
 import { registerAiWorkspaceRoutes } from './ai-workspace.js';
 import { uploadFilename } from './upload-name.js';
@@ -73,6 +75,7 @@ db.exec(`
 const projectIconDir = initializeProjects(db, dataDir);
 initializeCaseSets(db);
 const workspaceDocuments = initializeWorkspaceDocuments(db, dataDir);
+const feishuBrowser = createFeishuBrowserService({ dataDir });
 if (!db.prepare('PRAGMA table_info(cases)').all().some((column) => column.name === 'requirement_id')) db.exec('ALTER TABLE cases ADD COLUMN requirement_id TEXT REFERENCES requirements(id) ON DELETE SET NULL');
 
 const userColumns = db.prepare('PRAGMA table_info(users)').all().map((column) => column.name);
@@ -479,6 +482,7 @@ function mapCase(row) {
 const caseSelect = `SELECT cases.*, users.username AS creator_name FROM cases
   JOIN users ON users.id = cases.created_by`;
 const getCase = db.prepare(`${caseSelect} WHERE cases.id = ?`);
+const caseExecutions = registerCaseExecutionRoutes(app, { db, projects, requirePermission, broadcast, sendError });
 
 app.get('/api/cases', (req, res) => {
   const projectId = projects.requireProject(req.query.projectId);
@@ -520,6 +524,7 @@ app.put('/api/cases/:id', (req, res) => {
       value.preconditions, value.steps, value.expected, value.notes, JSON.stringify(value.tags), JSON.stringify(value.tree), requirementId,
       new Date().toISOString(), current.id, revision);
   if (!result.changes) return res.status(409).json({ error: 'conflict', message: '用例已被其他人修改', case: mapCase(getCase.get(current.id)) });
+  caseExecutions.prune(current.id, value.tree);
   const record = mapCase(getCase.get(current.id));
   broadcast('case.updated', { case: record, projectId });
   res.json({ case: record });
@@ -700,8 +705,15 @@ app.delete('/api/files/:id', (req, res) => {
 });
 
 registerCaseSetRoutes(app, { db, projects, sendError, inputError: (message) => new InputError(message), readRevision, mapCase, mapDefect, getCase, getDefect, broadcast });
-registerAiRoutes(app, { db, dataDir, sendError, inputError: (message) => new InputError(message), authenticate: userFromRequest, requireProject: projects.requireProject });
-registerWorkspaceDocumentRoutes(app, { db, dataDir, requirePermission, requireProject: projects.requireProject, broadcast, authenticate: userFromRequest, readFeishuConfig: () => loadFeishuConfig(dataDir) });
+registerFeishuBrowserRoutes(app, { service: feishuBrowser, requireAdmin, sendError });
+app.get('/api/feishu-browser/extension.zip', requireAdmin, (req, res) => {
+  const archive = path.join(projectDir, 'browser-extension', 'dist', 'QZZ-Feishu-Browser.zip');
+  if (!fs.existsSync(archive)) return sendError(res, 503, 'extension_missing', '浏览器扩展未打包，请在服务器运行扩展打包命令。');
+  res.set('Cache-Control', 'no-store');
+  res.download(archive, 'QZZ-Feishu-Browser.zip');
+});
+registerAiRoutes(app, { db, dataDir, sendError, authenticate: userFromRequest, browserService: feishuBrowser, requireProject: projects.requireProject });
+registerWorkspaceDocumentRoutes(app, { db, dataDir, requirePermission, requireProject: projects.requireProject, broadcast, authenticate: userFromRequest, browserService: feishuBrowser });
 registerAiWorkspaceRoutes(app, { dataDir, workspace: workspaceDocuments, requireProject: projects.requireProject, authenticate: userFromRequest, sendError });
 
 app.use('/api', (req, res) => sendError(res, 404, 'not_found', '接口不存在'));
@@ -730,6 +742,7 @@ app.use((error, req, res, next) => {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
+  if (feishuBrowser.handleUpgrade(req, socket, head)) return;
   const protocol = trustProxy && req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
   const expectedOrigin = `${protocol}://${req.headers.host}`;
   if (req.url !== '/api/events' || !userFromRequest(req) ||
@@ -768,5 +781,5 @@ server.listen(port, '0.0.0.0', () => {
   console.log(`QZZ test platform listening on http://0.0.0.0:${server.address().port}`);
 });
 
-process.on('SIGINT', () => { server.close(); wss.close(); db.close(); process.exit(0); });
-process.on('SIGTERM', () => { server.close(); wss.close(); db.close(); process.exit(0); });
+process.on('SIGINT', () => { feishuBrowser.close(); server.close(); wss.close(); db.close(); process.exit(0); });
+process.on('SIGTERM', () => { feishuBrowser.close(); server.close(); wss.close(); db.close(); process.exit(0); });

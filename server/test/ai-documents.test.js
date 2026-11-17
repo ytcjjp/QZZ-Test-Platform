@@ -7,7 +7,8 @@ import { test } from 'node:test';
 import Database from 'better-sqlite3';
 import express from 'express';
 import { strToU8, zipSync } from 'fflate';
-import { documentName, extractDocument, generateDocumentCases, normalizeAiResult, parseFeishuUrl, readFeishuDocument, registerAiRoutes } from '../ai-documents.js';
+import { documentName, extractDocument, generateDocumentCases, normalizeAiResult, registerAiRoutes } from '../ai-documents.js';
+import { normalizeFeishuBrowserUrl } from '../feishu-browser.js';
 import { saveAiProvider } from '../ai-provider.js';
 
 function fakeDocx(text) {
@@ -66,26 +67,11 @@ test('document names repair multipart UTF-8 decoded as Latin-1 while preserving 
   assert.equal(documentName('planner-ASCII.md'), 'planner-ASCII.md');
 });
 
-test('Feishu links use only fixed official API hosts and resolve knowledge-base nodes with authenticated raw content', async () => {
+test('Feishu browser imports accept only supported HTTPS document URLs', () => {
   for (const url of ['http://tenant.feishu.cn/docx/token', 'https://tenant.feishu.cn.evil.test/docx/token', 'https://127.0.0.1/docx/token', 'https://tenant.feishu.cn:123/docx/token', 'https://u:p@tenant.feishu.cn/docx/token']) {
-    assert.throws(() => parseFeishuUrl(url));
+    assert.throws(() => normalizeFeishuBrowserUrl(url));
   }
-  assert.equal(parseFeishuUrl('https://tenant.larksuite.com/docx/Token?from=share').host, 'https://open.larksuite.com');
-  await assert.rejects(readFeishuDocument('https://tenant.feishu.cn/docx/token'), /管理员先配置/);
-  const calls = [];
-  const request = async (url, options) => {
-    calls.push({ url, options });
-    if (url.endsWith('/internal')) return Response.json({ code: 0, tenant_access_token: 'test-token' });
-    assert.equal(options.headers.authorization, 'Bearer test-token');
-    if (url.includes('get_node')) return Response.json({ code: 0, data: { node: { obj_type: 'docx', obj_token: 'ActualDocument' } } });
-    return Response.json({ code: 0, data: { content: '活动奖励规则。' } });
-  };
-  const result = await readFeishuDocument('https://tenant.feishu.cn/wiki/WikiToken', { appId: 'cli_test', appSecret: 'test-secret', request });
-  assert.equal(result.text, '活动奖励规则。');
-  assert.equal(calls.length, 3);
-  assert.ok(calls.every((call) => call.url.startsWith('https://open.feishu.cn/open-apis/')));
-  assert.match(calls[2].url, /docx\/v1\/documents\/ActualDocument\/raw_content$/);
-  await assert.rejects(readFeishuDocument('https://tenant.feishu.cn/docx/token', { appId: 'cli_test', appSecret: 'test', request: async () => Response.json({ code: 99991663 }, { status: 403 }) }), /共享给应用/);
+  assert.equal(normalizeFeishuBrowserUrl('https://tenant.larksuite.com/docx/Token?from=share').url, 'https://tenant.larksuite.com/docx/Token');
 });
 
 test('AI generation loads the actual skill, keeps open questions outside the tree, validates three-field cases and sends only source documents', async () => {
@@ -187,7 +173,7 @@ test('provider failures identify authentication, endpoint, model and timeout err
   await assert.rejects(generateDocumentCases(documents, { provider, signal: canceled.signal, request: async () => { throw new Error('must not run'); } }), (error) => error.name === 'AbortError');
 });
 
-test('document routes isolate users, deny raw requirements, and keep admin Feishu secrets encrypted and out of responses', async () => {
+test('document routes isolate users, deny raw requirements, and import browser text with explicit image warnings', async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'qzz-ai-documents-'));
   const db = new Database(':memory:');
   const app = express(); app.use(express.json());
@@ -197,10 +183,11 @@ test('document routes isolate users, deny raw requirements, and keep admin Feish
     two: { id: 'two', role: 'member', permissions: { ai: { view: true, write: true } } },
   };
   app.use((req, res, next) => { req.user = users[req.headers['x-user'] || 'one']; next(); });
-  let generateStub;
+  let generateStub; const browserCalls = [];
   registerAiRoutes(app, {
     db, dataDir: directory, authenticate: (req) => users[req.headers['x-user'] || 'one'],
     inputError: (message) => new Error(message), sendError: (res, status, error, message) => res.status(status).json({ error, message }),
+    browserService: { read: async (url, { requester }) => { browserCalls.push({ url, requester: requester.id }); return { name: '飞书需求', text: '领取奖励后进入背包。', warnings: ['折叠块未读取'], images: [{ name: '图.png', buffer: Buffer.from('image/png') }] }; } },
     generateCases: (sources, options) => generateStub ? generateStub(sources, options) : generateDocumentCases(sources, options),
   });
   app.use((error, req, res, next) => res.status(400).json({ message: error.message }));
@@ -208,15 +195,14 @@ test('document routes isolate users, deny raw requirements, and keep admin Feish
   const base = `http://127.0.0.1:${server.address().port}`;
   const originalKey = process.env.AI_API_KEY; const originalModel = process.env.AI_MODEL;
   try {
-    assert.equal((await fetch(base + '/api/ai/feishu-config')).status, 403);
-    const configResponse = await fetch(base + '/api/ai/feishu-config', { method: 'PUT', headers: { 'x-user': 'admin', 'content-type': 'application/json' }, body: JSON.stringify({ appId: 'cli_example', appSecret: 'sensitive-app-secret' }) });
-    assert.equal(configResponse.status, 200);
-    const config = await configResponse.json();
-    assert.deepEqual(config, { appId: 'cli_example', configured: true });
-    const persisted = await fs.readFile(path.join(directory, 'feishu-config.json'), 'utf8');
-    assert.equal(persisted.includes('sensitive-app-secret'), false);
-    const getConfig = await fetch(base + '/api/ai/feishu-config', { headers: { 'x-user': 'admin' } });
-    assert.deepEqual(await getConfig.json(), config);
+    assert.equal((await fetch(base + '/api/ai/feishu-config')).status, 404);
+    const browserImport = await fetch(base + '/api/ai/documents', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url: 'https://team.feishu.cn/docx/Example' }) });
+    assert.equal(browserImport.status, 201);
+    const { document: browserDocument } = await browserImport.json();
+    assert.equal(browserDocument.name, '飞书需求');
+    assert.deepEqual(browserDocument.warnings, ['折叠块未读取', 'AI 临时文档仅保存正文；图片请导入项目需求或知识库后进行图文分析。']);
+    assert.deepEqual(browserCalls, [{ url: 'https://team.feishu.cn/docx/Example', requester: 'one' }]);
+    await fetch(base + '/api/ai/documents/' + browserDocument.id, { method: 'DELETE' });
     const form = new FormData(); form.append('file', new Blob(['# 活动\n奖励领取后进入背包。']), '活动策划-smoke.md');
     const imported = await fetch(base + '/api/ai/documents', { method: 'POST', body: form });
     assert.equal(imported.status, 201);

@@ -3,7 +3,7 @@ import MindElixir from 'mind-elixir';
 import 'mind-elixir/style.css';
 import {
   AlertCircle, ArrowLeft, Bold, Check, ChevronRight, Download, Eraser, GitBranch,
-  Italic, Maximize, PaintBucket, Pencil, Plus, Redo2, RefreshCw, Save, Search,
+  Italic, List, Maximize, PaintBucket, Pencil, Plus, Redo2, RefreshCw, Save, Search,
   Trash2, Type, Underline, Undo2, Upload, X, ZoomIn, ZoomOut,
 } from 'lucide-react';
 import './case-sets.css';
@@ -17,6 +17,7 @@ async function request(url, options = {}) {
     const body = await response.json().catch(() => ({}));
     const error = new Error(body.message || '请求失败，请稍后重试');
     error.status = response.status;
+    if (body.nodeStatus) error.nodeStatus = body.nodeStatus;
     throw error;
   }
   return response.json();
@@ -45,6 +46,96 @@ const signature = (title, tree) => JSON.stringify([title, canonicalTree(tree)]);
 const FONT_SIZES = Array.from({ length: 19 }, (_, index) => `${12 + index * 2}px`);
 const EMPTY_FORMAT = { fontSize: null, color: null, background: null, bold: false, italic: false, underline: false };
 const CLEAR_STYLE_PROPERTIES = ['font-size', 'color', 'background', 'font-weight', 'font-style', 'text-decoration'];
+export const TEST_STATUSES = ['待测试', '测试通过', '跳过'];
+const CASE_FIELDS = [
+  ['preconditions', /^(?:前置条件|前提条件|前置)(?:[：:]\s*([\s\S]*))?$/],
+  ['steps', /^(?:执行步骤|操作步骤|测试步骤|步骤)(?:[：:]\s*([\s\S]*))?$/],
+  ['expected', /^(?:预期结果|预期表现|期望结果|预期)(?:[：:]\s*([\s\S]*))?$/],
+];
+
+export function collectCaseRows(tree) {
+  if (!tree) return [];
+  const rows = [];
+  const text = (node) => [node.title, ...(node.children || []).map(text)].filter(Boolean).join('\n');
+  function visit(node, path, isRoot = false) {
+    const children = node.children || [];
+    const fields = {};
+    for (const child of children) for (const [name, pattern] of CASE_FIELDS) {
+      const match = String(child.title || '').trim().match(pattern);
+      if (match) fields[name] = [match[1], ...(child.children || []).map(text)].filter(Boolean).join('\n');
+    }
+    if (Object.keys(fields).length) {
+      rows.push({ id: node.id, title: node.title, path: path.join(' / '), preconditions: '', steps: '', expected: '', ...fields });
+      return;
+    }
+    if (!children.length) {
+      if (!isRoot && !(path.length === 0 && ['主流程', 'UI', '异常与边界', '受影响模块'].includes(node.title))) rows.push({ id: node.id, title: node.title, path: path.join(' / '), preconditions: '', steps: '', expected: '' });
+      return;
+    }
+    for (const child of children) visit(child, isRoot ? [] : [...path, node.title]);
+  }
+  visit(tree, [], true);
+  return rows;
+}
+
+export function normalizeNodeStatuses(rows) {
+  return Object.fromEntries((Array.isArray(rows) ? rows : []).filter((row) => row && typeof row.nodeId === 'string' && TEST_STATUSES.includes(row.status) && Number.isSafeInteger(row.revision) && row.revision >= 0).map((row) => [row.nodeId, row]));
+}
+
+export function fetchCaseNodeStatuses(caseId, projectId, signal) {
+  return request(`/api/cases/${encodeURIComponent(caseId)}/node-statuses?projectId=${encodeURIComponent(projectId)}`, { signal });
+}
+
+export function persistCaseNodeStatus(caseId, projectId, id, status, revision, signal) {
+  return request(`/api/cases/${encodeURIComponent(caseId)}/node-statuses/${encodeURIComponent(id)}`, { method: 'PUT', signal, body: JSON.stringify({ projectId, status, revision }) });
+}
+
+function statusSignal(signal) {
+  return globalThis.AbortSignal?.any && AbortSignal.timeout ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : signal;
+}
+
+function visibleMap(instance) {
+  return instance?.container?.offsetWidth > 0 && instance.container.offsetHeight > 0 && instance.nodes?.offsetWidth > 0 && instance.nodes.offsetHeight > 0;
+}
+
+export function fitMindMap(instance) {
+  if (!visibleMap(instance)) return false;
+  // scaleFit uses the center of all nodes. Keep the same transform origin for
+  // later button/wheel zooms; the library's default root alignment changes it.
+  instance.alignment = 'nodes'; instance.linkDiv?.(); instance.scaleFit();
+  return Number.isFinite(instance.scaleVal) && instance.scaleVal > 0;
+}
+
+export function zoomMindMap(instance, delta) {
+  if (!visibleMap(instance)) return false;
+  const current = Number.isFinite(instance.scaleVal) && instance.scaleVal > 0 ? instance.scaleVal : 1;
+  const minimum = instance.scaleMin || 0.2;
+  if (delta < 0 && current <= minimum) return true;
+  const value = Math.round(Math.max(minimum, Math.min(instance.scaleMax || 2, current + delta)) * 1000) / 1000;
+  instance.alignment = 'nodes';
+  const selected = instance.currentNodes?.[0]?.getBoundingClientRect?.();
+  const viewport = instance.container.getBoundingClientRect();
+  const anchor = selected && selected.right > viewport.left && selected.left < viewport.right && selected.bottom > viewport.top && selected.top < viewport.bottom ? { x: (selected.left + selected.right) / 2, y: (selected.top + selected.bottom) / 2 } : undefined;
+  instance.scale(value, anchor);
+  return true;
+}
+
+function CaseExecutionList({ tree, statuses, statusLoading, statusError, writeError, pending, canWrite, savedIds, saving, onChange, onReload, onDismissError }) {
+  const [query, setQuery] = useState('');
+  const [filter, setFilter] = useState('');
+  const rows = useMemo(() => collectCaseRows(tree), [tree]);
+  const counts = Object.fromEntries(TEST_STATUSES.map((status) => [status, rows.filter((row) => (statuses[row.id]?.status || '待测试') === status).length]));
+  const visible = rows.filter((row) => (!filter || (statuses[row.id]?.status || '待测试') === filter) && [row.title, row.path, row.preconditions, row.steps, row.expected].some((value) => value.toLowerCase().includes(query.trim().toLowerCase())));
+  const unsavedRows = rows.some((row) => !savedIds.has(row.id));
+  return <div className="case-execution-list" role="region" aria-label="用例列表视图">
+    <div className="case-execution-toolbar"><div className="search-box"><Search size={16} /><input aria-label="搜索用例内容" placeholder="搜索用例或分组" value={query} onChange={(event) => setQuery(event.target.value)} /></div><select aria-label="筛选测试状态" value={filter} onChange={(event) => setFilter(event.target.value)}><option value="">全部状态</option>{TEST_STATUSES.map((status) => <option key={status}>{status}</option>)}</select><Tool icon={RefreshCw} label="刷新测试状态" disabled={statusLoading || pending.size > 0} onClick={onReload} /></div>
+    <div className="case-execution-summary"><span>共 {rows.length} 条用例</span>{TEST_STATUSES.map((status, index) => <span className={`case-execution-count status-${index}`} key={status}>{status} {counts[status]}</span>)}{statusLoading && <span role="status"><RefreshCw size={13} className="spin" />正在加载状态…</span>}</div>
+    {statusError && <div className="inline-error" role="alert"><AlertCircle size={15} />{statusError}<button type="button" className="text-button" disabled={statusLoading} onClick={onReload}>重试</button></div>}
+    {writeError && <div className="inline-error" role="alert"><AlertCircle size={15} />{writeError}<button type="button" className="text-button" onClick={onDismissError}>关闭</button></div>}
+    {unsavedRows && <div className="case-execution-hint">新增用例请先保存，再记录测试状态。</div>}
+    {!rows.length ? <div className="empty-state"><List size={25} /><h3>暂无可执行用例</h3><p>在脑图中添加用例主题后，可在这里查看并记录测试状态。</p></div> : !visible.length ? <div className="empty-state"><Search size={24} /><h3>没有匹配的用例</h3></div> : <div className="case-execution-scroll"><table className="case-execution-table"><thead><tr><th>序号</th><th>用例</th><th>前置条件</th><th>执行步骤</th><th>预期结果</th><th>测试状态</th></tr></thead><tbody>{visible.map((row, index) => <tr key={row.id}><td>{index + 1}</td><td><strong>{row.title}</strong>{row.path && <small>{row.path}</small>}</td><td>{row.preconditions || '—'}</td><td>{row.steps || '—'}</td><td>{row.expected || '—'}</td><td><select aria-label={`${row.title} 的测试状态`} className={`case-node-status status-${TEST_STATUSES.indexOf(statuses[row.id]?.status || '待测试')}`} value={statuses[row.id]?.status || '待测试'} disabled={!canWrite || saving || statusLoading || Boolean(statusError) || pending.has(row.id) || !savedIds.has(row.id)} onChange={(event) => onChange(row.id, event.target.value)}>{TEST_STATUSES.map((status) => <option key={status}>{status}</option>)}</select>{pending.has(row.id) && <small role="status">保存中…</small>}{!savedIds.has(row.id) && <small>主题尚未保存</small>}</td></tr>)}</tbody></table></div>}
+  </div>;
+}
 
 function cssColorHex(value, fallback) {
   if (/^#[\da-f]{6}$/i.test(value)) return value.toLowerCase();
@@ -103,7 +194,7 @@ function NameDialog({ initial = '', title, onClose, onSave }) {
   return <div className="modal-backdrop"><div className="modal case-set-name-dialog" role="dialog" aria-modal="true" aria-labelledby="case-set-dialog-title"><div className="modal-head"><h2 id="case-set-dialog-title">{title}</h2><Tool icon={X} label="关闭" disabled={busy} onClick={onClose} /></div><form className="modal-form" onSubmit={submit}><label className="field"><span>用例集名称</span><input autoFocus aria-label="用例集名称" value={name} maxLength={200} required disabled={busy} onChange={(event) => setName(event.target.value)} placeholder="输入用例集名称" /></label>{error && <div className="inline-error" role="alert"><AlertCircle size={16} />{error}</div>}<div className="modal-actions"><button type="button" className="button secondary" disabled={busy} onClick={onClose}>取消</button><button type="submit" className="button primary" disabled={busy || !name.trim()}>{busy ? '保存中…' : '保存'}</button></div></form></div></div>;
 }
 
-function MindMapEditor({ record, latest, canWrite, canLinkRequirements = true, projectId, onBack, onSaved, onRefresh, onNotice }) {
+function MindMapEditor({ record, latest, canWrite, canLinkRequirements = true, projectId, refreshToken, onBack, onSaved, onRefresh, onNotice }) {
   const container = useRef(null);
   const mind = useRef(null);
   const ready = useRef(false);
@@ -126,6 +217,18 @@ function MindMapEditor({ record, latest, canWrite, canLinkRequirements = true, p
   const [history, setHistory] = useState({ undo: false, redo: false });
   const [format, setFormat] = useState(EMPTY_FORMAT);
   const [selectedCount, setSelectedCount] = useState(0);
+  const [view, setView] = useState('map');
+  const [liveTree, setLiveTree] = useState(record.tree || blankTree(record.title));
+  const [statuses, setStatuses] = useState({});
+  const statusRef = useRef({});
+  const statusRead = useRef(0);
+  const statusMutation = useRef(0);
+  const statusRequests = useRef(new Set());
+  const statusWrites = useRef(new Map());
+  const [statusLoading, setStatusLoading] = useState(true);
+  const [statusError, setStatusError] = useState('');
+  const [statusWriteError, setStatusWriteError] = useState('');
+  const [pendingStatuses, setPendingStatuses] = useState(new Set());
   currentTitle.current = title;
   writable.current = canWrite;
   state.current = { dirty, saving };
@@ -135,6 +238,7 @@ function MindMapEditor({ record, latest, canWrite, canLinkRequirements = true, p
     const tree = fromMindNode(mind.current.getData().nodeData);
     setDirty(signature(currentTitle.current, tree) !== baseline.current);
     setNodeCount(countNodes(tree));
+    setLiveTree(tree);
   }, []);
   const updateFormat = useCallback(() => {
     const nodes = mind.current?.currentNodes || [];
@@ -147,6 +251,7 @@ function MindMapEditor({ record, latest, canWrite, canLinkRequirements = true, p
       el: container.current, direction: MindElixir.RIGHT, editable: canWrite,
       toolBar: false, keypress: canWrite, contextMenu: false, allowUndo: true,
       newTopicName: '新主题', scaleMin: 0.2, scaleMax: 2,
+      alignment: 'nodes',
       theme: {
         ...MindElixir.THEME, name: 'QZZ',
         palette: ['#238d7d', '#df775e', '#638bc4', '#a676ae', '#78a666'],
@@ -180,7 +285,7 @@ function MindMapEditor({ record, latest, canWrite, canLinkRequirements = true, p
       canvasWidth = width; canvasHeight = height;
       cancelAnimationFrame(resizeFrame);
       resizeFrame = requestAnimationFrame(() => {
-        if (mounted.current && ready.current && mind.current === instance) instance.scaleFit();
+        if (mounted.current && ready.current && mind.current === instance) fitMindMap(instance);
       });
     });
     resizeObserver.observe(container.current);
@@ -191,12 +296,71 @@ function MindMapEditor({ record, latest, canWrite, canLinkRequirements = true, p
       unsubscribeHistory = instance.historyStack?.subscribe(() => {
         updateDirty(); updateFormat(); setHistory({ undo: instance.historyStack.canUndo, redo: instance.historyStack.canRedo });
       }) || (() => {});
-      instance.scaleFit();
+      fitMindMap(instance);
       const root = instance.findEle(startingTree.id);
       if (root) instance.selectNode(root);
     }).catch((failure) => { if (mounted.current) setError(`思维导图加载失败：${failure.message}`); });
     return () => { mounted.current = false; ready.current = false; mind.current = null; resizeObserver.disconnect(); cancelAnimationFrame(resizeFrame); unsubscribeHistory(); instance.nodes.removeEventListener('input', typing); instance.destroy(); };
   }, [record.id, updateDirty, updateFormat]);
+
+  const reloadStatuses = useCallback(async () => {
+    const sequence = ++statusRead.current;
+    const mutation = statusMutation.current;
+    const controller = new AbortController(); statusRequests.current.add(controller);
+    setStatusLoading(true);
+    try {
+      const result = await fetchCaseNodeStatuses(record.id, projectId, statusSignal(controller.signal));
+      if (!mounted.current || controller.signal.aborted || sequence !== statusRead.current || mutation !== statusMutation.current || statusWrites.current.size) return;
+      const values = normalizeNodeStatuses(result.statuses); statusRef.current = values; setStatuses(values); setStatusError('');
+    } catch (failure) {
+      if (mounted.current && !controller.signal.aborted && sequence === statusRead.current) setStatusError(failure.name === 'TimeoutError' ? '测试状态加载超时，请重试。' : failure.message || '测试状态加载失败');
+    } finally {
+      statusRequests.current.delete(controller);
+      if (mounted.current && sequence === statusRead.current) setStatusLoading(false);
+    }
+  }, [record.id, projectId]);
+
+  useEffect(() => {
+    void reloadStatuses();
+  }, [reloadStatuses, refreshToken, latest]);
+
+  useEffect(() => {
+    const focus = () => { if (!statusWrites.current.size) void reloadStatuses(); };
+    window.addEventListener('focus', focus);
+    return () => { window.removeEventListener('focus', focus); statusRead.current += 1; for (const controller of statusRequests.current) controller.abort(); for (const controller of statusWrites.current.values()) controller.abort(); };
+  }, [reloadStatuses]);
+
+  useEffect(() => {
+    if (!canWrite) for (const controller of statusWrites.current.values()) controller.abort();
+  }, [canWrite]);
+
+  useEffect(() => {
+    if (view !== 'map' || !mapReady) return;
+    const frame = requestAnimationFrame(() => { if (ready.current && mind.current) fitMindMap(mind.current); });
+    return () => cancelAnimationFrame(frame);
+  }, [view, mapReady]);
+
+  async function changeStatus(id, value) {
+    if (!writable.current || state.current.saving || statusWrites.current.has(id) || !TEST_STATUSES.includes(value)) return;
+    const original = statusRef.current[id] || { revision: 0, status: '待测试' };
+    if (original.status === value) return;
+    const controller = new AbortController(); statusWrites.current.set(id, controller); statusMutation.current += 1;
+    setPendingStatuses(new Set(statusWrites.current.keys())); setStatusWriteError('');
+    try {
+      const result = await persistCaseNodeStatus(record.id, projectId, id, value, original.revision, statusSignal(controller.signal));
+      if (!mounted.current || controller.signal.aborted) return;
+      const next = normalizeNodeStatuses([result.nodeStatus])[id];
+      if (!next) throw new Error('测试状态保存结果无效，请刷新后重试');
+      statusRef.current = { ...statusRef.current, [id]: next }; setStatuses(statusRef.current);
+    } catch (failure) {
+      if (!mounted.current || controller.signal.aborted) return;
+      if (failure.status === 409 && failure.nodeStatus) { statusRef.current = { ...statusRef.current, ...normalizeNodeStatuses([failure.nodeStatus]) }; setStatuses(statusRef.current); }
+      setStatusWriteError(failure.status === 409 ? '这条用例的状态已被其他人修改，已显示最新状态，请核对后重试。' : failure.name === 'TimeoutError' ? '测试状态保存超时，正在核对服务器状态；请确认后重试。' : `测试状态未保存：${failure.message || '请求失败，请重试'}`);
+    } finally {
+      statusWrites.current.delete(id); statusMutation.current += 1;
+      if (mounted.current) { setPendingStatuses(new Set(statusWrites.current.keys())); if (!controller.signal.aborted) void onRefresh(); }
+    }
+  }
 
   useEffect(() => {
     if (!mind.current || !ready.current) return;
@@ -205,9 +369,9 @@ function MindMapEditor({ record, latest, canWrite, canLinkRequirements = true, p
   }, [canWrite, mapReady]);
 
   useEffect(() => {
-    function beforeUnload(event) { if (state.current.dirty || state.current.saving) { event.preventDefault(); event.returnValue = ''; } }
+    function beforeUnload(event) { if (state.current.dirty || state.current.saving || statusWrites.current.size) { event.preventDefault(); event.returnValue = ''; } }
     function beforeNavigate(event) {
-      if (state.current.saving || (state.current.dirty && !window.confirm('用例集尚未保存，确定放弃修改并离开吗？'))) event.preventDefault();
+      if (state.current.saving || statusWrites.current.size || (state.current.dirty && !window.confirm('用例集尚未保存，确定放弃修改并离开吗？'))) event.preventDefault();
     }
     window.addEventListener('beforeunload', beforeUnload);
     window.addEventListener('qzz-before-navigate', beforeNavigate);
@@ -215,14 +379,14 @@ function MindMapEditor({ record, latest, canWrite, canLinkRequirements = true, p
   }, []);
 
   useEffect(() => {
-    const changed = !latest || latest.revision !== base.current.revision;
+    const changed = !latest || latest.revision > base.current.revision;
     if (changed && latest && mapReady && !dirty && !saving) {
       loadSnapshot(latest);
     } else setRemoteChanged(changed);
   }, [latest, mapReady, dirty, saving]);
 
   function leave() {
-    if (!saving && (!dirty || window.confirm('用例集尚未保存，确定放弃修改并返回吗？'))) onBack();
+    if (!saving && !statusWrites.current.size && (!dirty || window.confirm('用例集尚未保存，确定放弃修改并返回吗？'))) onBack();
   }
   async function act(action) {
     if (!canWrite || !ready.current || saving) return;
@@ -248,7 +412,7 @@ function MindMapEditor({ record, latest, canWrite, canLinkRequirements = true, p
     } catch (failure) { if (mounted.current) setError(failure.message || '格式修改失败'); }
   }
   async function save(asCopy = false) {
-    if (!canWrite || !ready.current || state.current.saving || !title.trim()) return;
+    if (!canWrite || !ready.current || state.current.saving || !title.trim() || asCopy && statusWrites.current.size) return;
     container.current.querySelector('#input-box')?.blur();
     mind.current.disableEdit();
     await new Promise((resolve) => requestAnimationFrame(resolve));
@@ -283,7 +447,7 @@ function MindMapEditor({ record, latest, canWrite, canLinkRequirements = true, p
     base.current = snapshot; baseline.current = signature(snapshot.title, tree);
     setTitle(snapshot.title); currentTitle.current = snapshot.title;
     mind.current.refresh({ nodeData: toMindNode(tree) }); mind.current.clearHistory?.();
-    mind.current.toCenter(); setNodeCount(countNodes(tree)); setDirty(false); setError(''); setRemoteChanged(false);
+    fitMindMap(mind.current); setLiveTree(tree); setNodeCount(countNodes(tree)); setDirty(false); setError(''); setRemoteChanged(false);
   }
   function reloadLatest() {
     if (!latest || saving || (dirty && !window.confirm('载入最新版本会放弃当前未保存的修改，确定继续吗？'))) return;
@@ -291,25 +455,39 @@ function MindMapEditor({ record, latest, canWrite, canLinkRequirements = true, p
   }
   function changeZoom(delta) {
     if (!ready.current) return;
-    const value = Math.max(0.2, Math.min(2, mind.current.scaleVal + delta));
-    mind.current.scale(value); setZoom(Math.round(value * 100));
+    zoomMindMap(mind.current, delta); setZoom(Math.round(mind.current.scaleVal * 100));
   }
 
+  async function changeView(next) {
+    if (next === view || saving) return;
+    container.current.querySelector('#input-box')?.blur();
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    if (!mounted.current) return;
+    updateDirty(); setView(next);
+  }
+  const savedIds = new Set();
+  const collectSavedIds = (node) => { if (node) { savedIds.add(node.id); (node.children || []).forEach(collectSavedIds); } };
+  collectSavedIds(latest && latest.revision >= base.current.revision ? latest.tree : base.current.tree);
+
   return <section className="case-set-editor" onKeyDownCapture={(event) => { if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') { event.preventDefault(); event.stopPropagation(); save(); } }}>
-    <div className="case-editor-heading"><Tool icon={ArrowLeft} label="返回用例集列表" onClick={leave} disabled={saving} /><div className="case-editor-name"><label htmlFor="case-set-name">用例集名称</label><input id="case-set-name" value={title} maxLength={200} readOnly={!canWrite} disabled={saving} onChange={(event) => { const value = event.target.value; setTitle(value); currentTitle.current = value; updateDirty(); }} /></div><span className={`case-save-state ${dirty ? 'dirty' : ''}`}>{saving ? '保存中' : dirty ? '未保存' : <><Check size={14} />已保存</>}</span>{canWrite && <button type="button" className="button primary" onClick={() => save()} disabled={saving || !mapReady || !title.trim() || !dirty}><Save size={16} />保存</button>}</div>
-    {remoteChanged && <div className="case-editor-warning" role="status"><AlertCircle size={16} /><span>{latest ? '此用例集已有其他人的更新。' : '此用例集已不在当前列表中。'}当前编辑已保留。</span>{latest && <button type="button" className="text-button" onClick={reloadLatest} disabled={saving || !mapReady}>载入最新版本</button>}{canWrite && <button type="button" className="text-button" onClick={() => save(true)} disabled={saving || !mapReady || !title.trim()}>另存为新用例集</button>}</div>}
+    <div className="case-editor-heading"><Tool icon={ArrowLeft} label="返回用例集列表" onClick={leave} disabled={saving || pendingStatuses.size > 0} /><div className="case-editor-name"><label htmlFor="case-set-name">用例集名称</label><input id="case-set-name" value={title} maxLength={200} readOnly={!canWrite} disabled={saving} onChange={(event) => { const value = event.target.value; setTitle(value); currentTitle.current = value; updateDirty(); }} /></div><span className={`case-save-state ${dirty ? 'dirty' : ''}`}>{saving ? '保存中' : dirty ? '未保存' : <><Check size={14} />已保存</>}</span>{canWrite && <button type="button" className="button primary" onClick={() => save()} disabled={saving || !mapReady || !title.trim() || !dirty}><Save size={16} />保存</button>}</div>
+    {remoteChanged && <div className="case-editor-warning" role="status"><AlertCircle size={16} /><span>{latest ? '此用例集已有其他人的更新。' : '此用例集已不在当前列表中。'}当前编辑已保留。</span>{latest && <button type="button" className="text-button" onClick={reloadLatest} disabled={saving || !mapReady}>载入最新版本</button>}{canWrite && <button type="button" className="text-button" onClick={() => save(true)} disabled={saving || !mapReady || !title.trim() || pendingStatuses.size > 0}>另存为新用例集</button>}</div>}
     {error && <div className="inline-error" role="alert"><AlertCircle size={16} />{error}</div>}
-    <div className="case-map-toolbar" aria-label="思维导图工具栏"><div>{canWrite && <><Tool icon={GitBranch} label="添加子主题" disabled={!mapReady || saving || !selected} onClick={() => act((instance) => instance.addChild())} /><Tool icon={Plus} label="添加同级主题" disabled={!mapReady || saving || !selected || isRoot} onClick={() => act((instance) => instance.insertSibling('after'))} /><Tool icon={Pencil} label="编辑主题" disabled={!mapReady || saving || !selected} onClick={() => act((instance) => instance.beginEdit())} /><Tool icon={Trash2} label="删除选中主题" danger disabled={!mapReady || saving || !selected || isRoot} onClick={() => act((instance) => instance.removeNodes(instance.currentNodes))} /><span className="case-tool-divider" /><Tool icon={Undo2} label="撤销" disabled={!mapReady || saving || !history.undo} onClick={() => act((instance) => instance.undo())} /><Tool icon={Redo2} label="重做" disabled={!mapReady || saving || !history.redo} onClick={() => act((instance) => instance.redo())} /></>}</div><div><Tool icon={ZoomOut} label="缩小" disabled={!mapReady} onClick={() => changeZoom(-0.1)} /><span className="case-zoom-value">{zoom}%</span><Tool icon={ZoomIn} label="放大" disabled={!mapReady} onClick={() => changeZoom(0.1)} /><Tool icon={Maximize} label="适应画布" disabled={!mapReady} onClick={() => { mind.current.scaleFit(); setZoom(Math.round(mind.current.scaleVal * 100)); }} /></div></div>
+    <div className="case-view-tabs" role="tablist" aria-label="用例查看方式"><button type="button" role="tab" aria-selected={view === 'map'} aria-controls="case-map-panel" disabled={saving} onClick={() => changeView('map')}><GitBranch size={16} />脑图</button><button type="button" role="tab" aria-selected={view === 'list'} aria-controls="case-list-panel" disabled={saving} onClick={() => changeView('list')}><List size={16} />列表</button><span>测试状态即时保存</span></div>
+    <div id="case-map-panel" className="case-map-panel" role="tabpanel" hidden={view !== 'map'}>
+    <div className="case-map-toolbar" aria-label="思维导图工具栏"><div>{canWrite && <><Tool icon={GitBranch} label="添加子主题" disabled={!mapReady || saving || !selected} onClick={() => act((instance) => instance.addChild())} /><Tool icon={Plus} label="添加同级主题" disabled={!mapReady || saving || !selected || isRoot} onClick={() => act((instance) => instance.insertSibling('after'))} /><Tool icon={Pencil} label="编辑主题" disabled={!mapReady || saving || !selected} onClick={() => act((instance) => instance.beginEdit())} /><Tool icon={Trash2} label="删除选中主题" danger disabled={!mapReady || saving || !selected || isRoot} onClick={() => act((instance) => instance.removeNodes(instance.currentNodes))} /><span className="case-tool-divider" /><Tool icon={Undo2} label="撤销" disabled={!mapReady || saving || !history.undo} onClick={() => act((instance) => instance.undo())} /><Tool icon={Redo2} label="重做" disabled={!mapReady || saving || !history.redo} onClick={() => act((instance) => instance.redo())} /></>}</div><div><Tool icon={ZoomOut} label="缩小" disabled={!mapReady || zoom <= 20} onClick={() => changeZoom(-0.1)} /><span className="case-zoom-value">{zoom}%</span><Tool icon={ZoomIn} label="放大" disabled={!mapReady || zoom >= 200} onClick={() => changeZoom(0.1)} /><Tool icon={Maximize} label="适应画布" disabled={!mapReady} onClick={() => { fitMindMap(mind.current); setZoom(Math.round(mind.current.scaleVal * 100)); }} /></div></div>
     {canWrite && <div className="case-format-toolbar" role="toolbar" aria-label="主题格式工具栏">
       <div className="case-format-group"><select aria-label="字体大小" title="字体大小" value={format.fontSize || ''} disabled={!mapReady || saving || !selected} onChange={(event) => applyFormat({ fontSize: event.target.value })}><option value="" disabled>{selected ? '混合' : '字号'}</option>{[...new Set([...FONT_SIZES, ...(format.fontSize ? [format.fontSize] : [])])].sort((a, b) => parseInt(a) - parseInt(b)).map((value) => <option key={value} value={value}>{parseInt(value)} px</option>)}</select><Tool icon={Bold} label="加粗" pressed={format.bold} disabled={!mapReady || saving || !selected} onClick={() => applyFormat({ fontWeight: format.bold === true ? 'normal' : 'bold' })} /><Tool icon={Italic} label="斜体" pressed={format.italic} disabled={!mapReady || saving || !selected} onClick={() => applyFormat({ fontStyle: format.italic === true ? 'normal' : 'italic' })} /><Tool icon={Underline} label="下划线" pressed={format.underline} disabled={!mapReady || saving || !selected} onClick={() => applyFormat({ textDecoration: format.underline === true ? 'none' : 'underline' })} /></div>
       <span className="case-tool-divider" /><div className="case-format-group"><ColorTool icon={Type} label="文字颜色" value={format.color} disabled={!mapReady || saving || !selected} onChange={(value) => applyFormat({ color: value })} /><ColorTool icon={PaintBucket} label="背景颜色" value={format.background} disabled={!mapReady || saving || !selected} onChange={(value) => applyFormat({ background: value })} /><Tool icon={Eraser} label="清除格式" disabled={!mapReady || saving || !selected} onClick={() => applyFormat(null)} /></div>{selectedCount > 1 && <span className="case-format-selection">{selectedCount} 个主题</span>}
     </div>}
     <div className="case-map-canvas" ref={container} role="region" aria-label="用例思维导图" />
+    </div>
+    <div id="case-list-panel" className="case-list-panel" role="tabpanel" hidden={view !== 'list'}><CaseExecutionList tree={liveTree} statuses={statuses} statusLoading={statusLoading} statusError={statusError} writeError={statusWriteError} pending={pendingStatuses} canWrite={canWrite && (!remoteChanged || Boolean(latest))} savedIds={savedIds} saving={saving} onChange={changeStatus} onReload={reloadStatuses} onDismissError={() => setStatusWriteError('')} /></div>
     <div className="case-editor-footer"><span>{nodeCount} 个主题</span><span>{canWrite ? '可编辑' : '只读'} · 版本 {base.current.revision}</span></div>
   </section>;
 }
 
-export default function CaseSetsPage({ project, items, loading, canWrite, requirementId = null, canLinkRequirements = true, onRefresh, showError, onNotice }) {
+export default function CaseSetsPage({ project, items, loading, canWrite, requirementId = null, canLinkRequirements = true, refreshToken, onRefresh, showError, onNotice }) {
   const [query, setQuery] = useState('');
   const [sort, setSort] = useState('latest');
   const [selection, setSelection] = useState(new Map());
@@ -405,7 +583,7 @@ export default function CaseSetsPage({ project, items, loading, canWrite, requir
     finally { if (alive.current) setBusy(false); }
   }
 
-  if (editor) return <MindMapEditor key={editor.id} record={editor} latest={items.find((item) => item.id === editor.id)} canWrite={canWrite} canLinkRequirements={canLinkRequirements} projectId={projectId} onBack={() => setEditor(null)} onSaved={(record, asCopy) => { if (asCopy) setEditor(record); }} onRefresh={onRefresh} onNotice={onNotice} />;
+  if (editor) return <MindMapEditor key={editor.id} record={editor} latest={items.find((item) => item.id === editor.id)} canWrite={canWrite} canLinkRequirements={canLinkRequirements} projectId={projectId} refreshToken={refreshToken} onBack={() => setEditor(null)} onSaved={(record, asCopy) => { if (asCopy) setEditor(record); }} onRefresh={onRefresh} onNotice={onNotice} />;
 
   return <section className={`workspace-section case-sets-section ${dragging ? 'case-import-dragging' : ''}`} onDragOver={(event) => { if (canWrite && [...event.dataTransfer.types].includes('Files')) { event.preventDefault(); setDragging(true); } }} onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setDragging(false); }} onDrop={(event) => { event.preventDefault(); setDragging(false); if (canWrite) importFiles([...event.dataTransfer.files]); }}>
     <div className="section-heading"><div><span className="eyebrow">CASE COLLECTIONS</span><h1>测试用例库</h1><p>{project.name}</p></div><div className="heading-actions"><Tool icon={RefreshCw} label="刷新用例集" onClick={onRefresh} disabled={loading || busy} />{canWrite && <><button type="button" className="button secondary" disabled={busy} onClick={() => input.current?.click()}><Upload size={16} />导入</button><button type="button" className="button primary" disabled={busy} onClick={() => setDialog({})}><Plus size={16} />新建用例集</button></>}</div></div>

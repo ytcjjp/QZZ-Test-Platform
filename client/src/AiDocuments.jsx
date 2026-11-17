@@ -14,7 +14,7 @@ import {
   Upload,
   X,
 } from "lucide-react";
-import FeishuConnection from "./FeishuConnection";
+import FeishuConnection, { FeishuBrowserStatus, FeishuConnectionHelp } from "./FeishuConnection";
 import "./ai-documents.css";
 
 async function request(path, options = {}) {
@@ -321,7 +321,7 @@ export default function AiDocuments({
               ` · ${config.aiModel} · ${config.aiReasoningEffort || ""}`}
           </p>
         </div>
-        {isAdmin && (
+        {(
           <button
             type="button"
             className="button secondary"
@@ -329,7 +329,7 @@ export default function AiDocuments({
             disabled={Boolean(busy)}
           >
             <Settings2 size={16} />
-            飞书文档连接
+            飞书浏览器连接
           </button>
         )}
       </div>
@@ -352,6 +352,7 @@ export default function AiDocuments({
         <div className="inline-error ai-document-error" role="alert">
           <AlertCircle size={17} />
           <span>{error}</span>
+          {/飞书|浏览器|Chrome|连接|登录|权限/.test(error) && <button type="button" className="text-button" onClick={() => setSettingsOpen(true)}>查看浏览器连接</button>}
           <button
             type="button"
             className="icon-button"
@@ -446,6 +447,8 @@ export default function AiDocuments({
               导入链接
             </button>
           </form>
+          <FeishuBrowserStatus isAdmin={isAdmin} onConfigure={() => setSettingsOpen(true)} disabled={Boolean(busy)} />
+          <FeishuConnectionHelp isAdmin={isAdmin} onConfigure={() => setSettingsOpen(true)} />
           {documents.length > 0 && (
             <div className="ai-document-list">
               {documents.map((document) => (
@@ -461,7 +464,7 @@ export default function AiDocuments({
                     <FileText size={18} />
                     <span>
                       <strong>{document.name}</strong>
-                      <small>{document.chars.toLocaleString()} 字</small>
+                      <small>{document.chars.toLocaleString()} 字{document.warnings?.length ? ' · 有读取提醒' : ''}</small>
                     </span>
                     <ChevronRight size={15} />
                   </button>
@@ -481,6 +484,7 @@ export default function AiDocuments({
               ))}
             </div>
           )}
+          {preview?.warnings?.length > 0 && <div className="feishu-import-warnings" role="status"><strong><AlertCircle size={15} />{preview.name} · 导入内容提醒</strong><ul>{preview.warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul></div>}
           {preview && (
             <details className="ai-source-preview">
               <summary>文档内容 · {preview.name}</summary>
@@ -643,11 +647,12 @@ export default function AiDocuments({
           )}
         </div>
       </div>
-      {settingsOpen && isAdmin && (
+      {settingsOpen && (
         <FeishuConnection
+          isAdmin={isAdmin}
           onClose={() => setSettingsOpen(false)}
           onSaved={() =>
-            onNotice?.("飞书应用配置已保存，请确认飞书侧授权后再导入文档")
+            onNotice?.("飞书浏览器连接状态已更新")
           }
         />
       )}
