@@ -1,0 +1,132 @@
+.feishu-connection-backdrop {
+  z-index: 120;
+}
+.feishu-connection-modal {
+  width: min(720px, 100%);
+  max-height: calc(100dvh - 48px);
+  display: flex;
+  flex-direction: column;
+}
+.feishu-connection-modal .modal-head {
+  flex: none;
+}
+.feishu-connection-modal .modal-head h2 {
+  margin-top: 7px;
+}
+.feishu-connection-content {
+  padding: 22px 26px;
+  overflow: auto;
+  min-height: 0;
+}
+.feishu-configuration-state {
+  display: flex;
+  gap: 7px;
+  align-items: center;
+  color: var(--accent, #157f73);
+  font-size: 12px;
+  margin-bottom: 21px;
+}
+.feishu-configuration-form {
+  display: grid;
+  gap: 17px;
+}
+.feishu-credential-note {
+  color: var(--muted, #73868a);
+  font-size: 12px;
+  line-height: 1.8;
+  margin: 0;
+}
+.feishu-configuration-form .modal-actions {
+  margin-top: 1px;
+}
+.feishu-connection-help {
+  margin-top: 20px;
+  border-top: 1px solid var(--line, #dce5e5);
+  padding-top: 16px;
+}
+.feishu-connection-help > summary {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  cursor: pointer;
+  list-style: none;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent, #157f73);
+}
+.feishu-help-body {
+  color: var(--muted, #73868a);
+  font-size: 12px;
+  line-height: 1.85;
+}
+.feishu-help-body p {
+  margin: 12px 0;
+}
+.feishu-help-body ol {
+  padding-left: 21px;
+  margin: 0;
+}
+.feishu-help-body li {
+  padding: 5px 0;
+  overflow-wrap: anywhere;
+}
+.feishu-help-body strong {
+  color: var(--ink, #263d3f);
+}
+.feishu-help-body a {
+  color: var(--accent, #157f73);
+  text-decoration: none;
+  display: inline;
+}
+.feishu-help-body a svg {
+  display: inline-block;
+  vertical-align: -1px;
+  margin-left: 3px;
+}
+.feishu-help-body a:hover {
+  text-decoration: underline;
+}
+.feishu-help-body code {
+  font-size: 11px;
+  color: var(--ink, #263d3f);
+  padding: 2px 4px;
+  background: var(--surface-subtle, #f2f6f5);
+  border-radius: 3px;
+}
+.feishu-help-footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px 16px;
+  align-items: center;
+  margin-top: 15px;
+  padding-bottom: 2px;
+}
+.feishu-help-footer > span {
+  font-size: 11px;
+}
+.feishu-help-footer .text-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.feishu-source-help {
+  margin-top: -3px;
+}
+.feishu-source-help > .text-button {
+  display: inline-flex;
+  gap: 5px;
+  align-items: center;
+  font-size: 12px;
+}
+.feishu-source-help .feishu-connection-help {
+  margin-top: 13px;
+}
+@media (max-width: 520px) {
+  .feishu-connection-modal {
+    max-height: 100dvh;
+    height: 100dvh;
+  }
+  .feishu-connection-content {
+    padding: 20px 18px 30px;
+  }
+}

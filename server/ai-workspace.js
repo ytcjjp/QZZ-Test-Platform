@@ -197,7 +197,11 @@ export async function generateWorkspaceTask(input, evidence, knowledge, { provid
   const images = [...(evidence.images || []), ...(knowledge.images || [])];
   if (images.length > VISION_LIMITS.images) throw new WorkspaceAiError(`本次资料包含 ${images.length} 张可分析图片，超过单轮 64 张限制；请拆分需求或减少引用文档后生成`, 413, [...ingestionWarnings, '本轮未启动模型，未分析其中任何图片；不会仅取前 64 张后声称完整分析。']);
   if (!documents.some((document) => document.text.trim()) && !images.length) throw new WorkspaceAiError('需求未包含可读取文字或图片，请补充正文或重新导入；扫描版 PDF 请先 OCR 或补充页面图片', 400, ingestionWarnings);
-  const context = provider.mode === 'codex' ? await collectContext(provider.projectRoot, documents, { signal }) : { projectName: '点点消', files: [], warnings: ['API 模式本次未提供本机源码。'] };
+  const documentTask = input.type === 'analysis' || input.type === 'plan';
+  // Analysis and planning describe the supplied specification. Code evidence is collected when designing test coverage.
+  const context = provider.mode === 'codex' && !documentTask
+    ? await collectContext(provider.projectRoot, documents, { signal })
+    : { projectName: '点点消', files: [], warnings: [documentTask ? '本次分析依据需求文档、图片及所选知识库；未读取游戏源码。' : 'API 模式本次未提供本机源码。'] };
   signal?.throwIfAborted();
   const sources = [];
   const sourceDocuments = documents.map((document, index) => {

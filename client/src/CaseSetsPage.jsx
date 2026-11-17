@@ -103,7 +103,7 @@ function NameDialog({ initial = '', title, onClose, onSave }) {
   return <div className="modal-backdrop"><div className="modal case-set-name-dialog" role="dialog" aria-modal="true" aria-labelledby="case-set-dialog-title"><div className="modal-head"><h2 id="case-set-dialog-title">{title}</h2><Tool icon={X} label="关闭" disabled={busy} onClick={onClose} /></div><form className="modal-form" onSubmit={submit}><label className="field"><span>用例集名称</span><input autoFocus aria-label="用例集名称" value={name} maxLength={200} required disabled={busy} onChange={(event) => setName(event.target.value)} placeholder="输入用例集名称" /></label>{error && <div className="inline-error" role="alert"><AlertCircle size={16} />{error}</div>}<div className="modal-actions"><button type="button" className="button secondary" disabled={busy} onClick={onClose}>取消</button><button type="submit" className="button primary" disabled={busy || !name.trim()}>{busy ? '保存中…' : '保存'}</button></div></form></div></div>;
 }
 
-function MindMapEditor({ record, latest, canWrite, projectId, onBack, onSaved, onRefresh, onNotice }) {
+function MindMapEditor({ record, latest, canWrite, canLinkRequirements = true, projectId, onBack, onSaved, onRefresh, onNotice }) {
   const container = useRef(null);
   const mind = useRef(null);
   const ready = useRef(false);
@@ -262,7 +262,7 @@ function MindMapEditor({ record, latest, canWrite, projectId, onBack, onSaved, o
     try {
       const result = await request(`/api/cases${asCopy ? '' : `/${encodeURIComponent(original.id)}`}`, {
         method: asCopy ? 'POST' : 'PUT',
-        body: JSON.stringify({ title: savedTitle, tree, projectId, ...(asCopy ? {} : { revision: original.revision }) }),
+        body: JSON.stringify({ title: savedTitle, tree, projectId, ...(asCopy ? (canLinkRequirements && original.requirementId ? { requirementId: original.requirementId } : {}) : { revision: original.revision }) }),
       });
       if (!mounted.current) return;
       base.current = result.case; baseline.current = savedSignature;
@@ -309,7 +309,7 @@ function MindMapEditor({ record, latest, canWrite, projectId, onBack, onSaved, o
   </section>;
 }
 
-export default function CaseSetsPage({ project, items, loading, canWrite, onRefresh, showError, onNotice }) {
+export default function CaseSetsPage({ project, items, loading, canWrite, requirementId = null, canLinkRequirements = true, onRefresh, showError, onNotice }) {
   const [query, setQuery] = useState('');
   const [sort, setSort] = useState('latest');
   const [selection, setSelection] = useState(new Map());
@@ -335,7 +335,7 @@ export default function CaseSetsPage({ project, items, loading, canWrite, onRefr
     const editing = dialog?.record;
     const result = await request(`/api/cases${editing ? `/${encodeURIComponent(editing.id)}` : ''}`, {
       method: editing ? 'PUT' : 'POST',
-      body: JSON.stringify({ projectId, title: name, ...(editing ? { revision: editing.revision } : { tree: blankTree(name) }) }),
+      body: JSON.stringify({ projectId, title: name, ...(editing ? { revision: editing.revision } : { tree: blankTree(name), ...(canLinkRequirements && requirementId ? { requirementId } : {}) }) }),
     });
     if (!alive.current) return;
     setDialog(null); if (!editing) setEditor(result.case);
@@ -365,6 +365,7 @@ export default function CaseSetsPage({ project, items, loading, canWrite, onRefr
     try {
       for (const file of files) {
         const form = new FormData(); form.append('file', file); form.append('projectId', projectId);
+        if (canLinkRequirements && requirementId) form.append('requirementId', requirementId);
         const result = await request('/api/cases/import', { method: 'POST', body: form });
         imported += result.cases?.length || 0;
         if (!alive.current) return;
@@ -404,7 +405,7 @@ export default function CaseSetsPage({ project, items, loading, canWrite, onRefr
     finally { if (alive.current) setBusy(false); }
   }
 
-  if (editor) return <MindMapEditor key={editor.id} record={editor} latest={items.find((item) => item.id === editor.id)} canWrite={canWrite} projectId={projectId} onBack={() => setEditor(null)} onSaved={(record, asCopy) => { if (asCopy) setEditor(record); }} onRefresh={onRefresh} onNotice={onNotice} />;
+  if (editor) return <MindMapEditor key={editor.id} record={editor} latest={items.find((item) => item.id === editor.id)} canWrite={canWrite} canLinkRequirements={canLinkRequirements} projectId={projectId} onBack={() => setEditor(null)} onSaved={(record, asCopy) => { if (asCopy) setEditor(record); }} onRefresh={onRefresh} onNotice={onNotice} />;
 
   return <section className={`workspace-section case-sets-section ${dragging ? 'case-import-dragging' : ''}`} onDragOver={(event) => { if (canWrite && [...event.dataTransfer.types].includes('Files')) { event.preventDefault(); setDragging(true); } }} onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setDragging(false); }} onDrop={(event) => { event.preventDefault(); setDragging(false); if (canWrite) importFiles([...event.dataTransfer.files]); }}>
     <div className="section-heading"><div><span className="eyebrow">CASE COLLECTIONS</span><h1>测试用例库</h1><p>{project.name}</p></div><div className="heading-actions"><Tool icon={RefreshCw} label="刷新用例集" onClick={onRefresh} disabled={loading || busy} />{canWrite && <><button type="button" className="button secondary" disabled={busy} onClick={() => input.current?.click()}><Upload size={16} />导入</button><button type="button" className="button primary" disabled={busy} onClick={() => setDialog({})}><Plus size={16} />新建用例集</button></>}</div></div>

@@ -19,7 +19,7 @@ function docxWithImage(png, imageCount = 1) {
   });
 }
 
-async function fixture(run) {
+async function fixture(run, routeOptions = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'qzz-workspace-documents-'));
   const db = new Database(path.join(directory, 'platform.db'));
   db.pragma('foreign_keys=ON');
@@ -35,7 +35,7 @@ async function fixture(run) {
   };
   app.use((req, res, next) => { req.user = users[req.headers['x-user'] || 'writer']; next(); });
   const events = [];
-  const service = registerWorkspaceDocumentRoutes(app, { db, dataDir: directory, authenticate: (req) => users[req.headers['x-user'] || 'writer'], broadcast: (type, details) => events.push({ type, ...details }) });
+  const service = registerWorkspaceDocumentRoutes(app, { db, dataDir: directory, authenticate: (req) => users[req.headers['x-user'] || 'writer'], broadcast: (type, details) => events.push({ type, ...details }), ...routeOptions });
   app.use((error, req, res, next) => res.status(500).json({ message: error.message }));
   const server = http.createServer(app); await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -167,6 +167,15 @@ test('knowledge file documents preserve originals, expose real image evidence an
   assert.equal(preview.response.headers.get('content-type'), 'application/pdf');
   assert.equal(preview.response.headers.get('x-content-type-options'), 'nosniff');
   assert.equal(preview.response.headers.get('content-disposition'), null);
+  const tiff = await sharp(png).tiff().toBuffer();
+  const tiffForm = new FormData(); tiffForm.append('projectId', 'a'); tiffForm.append('title', 'TIFF图片'); tiffForm.append('file', new Blob([tiff]), 'source.tiff');
+  const tiffRequirement = (await call('/api/requirements', tiffForm)).body.requirement;
+  const tiffAttachment = tiffRequirement.attachments[0];
+  assert.equal(tiffAttachment.mimeType, 'image/tiff');
+  const tiffPreview = await call(tiffAttachment.previewUrl, undefined, 'GET');
+  assert.equal(tiffPreview.response.headers.get('content-type'), 'image/png');
+  assert.equal((await sharp(tiffPreview.body).metadata()).format, 'png');
+  assert.deepEqual((await call(tiffAttachment.downloadUrl, undefined, 'GET')).body, tiff);
 }));
 
 test('knowledge bases index actual chunks, retrieve Chinese keywords, persist config, and guard all project/revision operations', async () => fixture(async ({ service, call }) => {
@@ -211,4 +220,48 @@ test('chunk windows overlap predictably and heading mode respects sections witho
   assert.equal(headings.length, 2); assert.equal(headings[1].heading, 'B');
   assert.throws(() => splitKnowledgeText('x', { chunkSize: 100, chunkOverlap: 100 }), /重叠/);
   assert.throws(() => splitKnowledgeText('x'.repeat(20000), { chunkSize: 100, chunkOverlap: 99 }), /10000/);
+});
+
+test('Feishu imports use mocked official APIs, retain source text, and recheck permission/project after asynchronous reads', async () => {
+  let mode = 'ok'; let afterRead = () => {};
+  const calls = [];
+  const config = { appId: 'cli_mock', appSecret: 'mock-secret', request: async (url, options) => {
+    calls.push(url);
+    assert.ok(url.startsWith('https://open.feishu.cn/open-apis/'));
+    if (mode === 'network') throw new TypeError('private upstream network diagnostic');
+    if (mode === 'timeout') throw new DOMException('private timeout diagnostic', 'TimeoutError');
+    if (url.includes('/auth/')) return Response.json({ code: 0, tenant_access_token: 'mock-token' });
+    assert.equal(options.headers.authorization, 'Bearer mock-token');
+    if (mode === 'denied') return Response.json({ code: 99991663 }, { status: 403 });
+    if (url.includes('get_node')) return Response.json({ code: 0, data: { node: { obj_type: 'docx', obj_token: 'ResolvedDocument' } } });
+    afterRead();
+    return Response.json({ code: 0, data: { content: '# 飞书需求\n领取奖励后更新背包。' } });
+  } };
+  await fixture(async ({ call, db, users, service }) => {
+    const sourceUrl = 'https://team.feishu.cn/wiki/MockNode';
+    const created = await call('/api/requirements', { projectId: 'a', title: '飞书来源', sourceUrl });
+    assert.equal(created.status, 201);
+    assert.equal(created.body.requirement.sourceUrl, sourceUrl);
+    assert.match(created.body.requirement.body, /更新背包/);
+    assert.ok(service.getRequirementEvidence('a', created.body.requirement.id).warnings.some((warning) => /文字接口/.test(warning)));
+    assert.ok(calls.some((url) => url.includes('wiki/v2/spaces/get_node')));
+    const kb = (await call('/api/knowledge-bases', { projectId: 'a', name: '飞书知识' })).body.knowledgeBase;
+    assert.equal((await call(`/api/knowledge-bases/${kb.id}/documents`, { projectId: 'a', title: '飞书技术资料', sourceUrl: 'https://team.feishu.cn/docx/Source' })).status, 201);
+    assert.ok(service.getKnowledgeContext('a', [kb.id], '背包').chunks.length > 0);
+    const count = db.prepare('SELECT count(*) n FROM requirements').get().n;
+    mode = 'denied';
+    assert.equal((await call('/api/requirements', { projectId: 'a', title: '不可读取', sourceUrl })).status, 422);
+    mode = 'network';
+    const network = await call('/api/requirements', { projectId: 'a', title: '网络断开', sourceUrl });
+    assert.equal(network.status, 502); assert.ok(!network.body.message.includes('private'));
+    mode = 'timeout';
+    assert.equal((await call('/api/requirements', { projectId: 'a', title: '读取超时', sourceUrl })).status, 504);
+    mode = 'ok';
+    afterRead = () => { users.writer.permissions.requirements.write = false; };
+    assert.equal((await call('/api/requirements', { projectId: 'a', title: '权限已撤销', sourceUrl })).status, 403);
+    users.writer.permissions.requirements.write = true;
+    afterRead = () => { db.prepare('UPDATE projects SET deleted_at=? WHERE id=?').run('2026-11-17', 'a'); };
+    assert.equal((await call('/api/requirements', { projectId: 'a', title: '项目已删除', sourceUrl })).status, 400);
+    assert.equal(db.prepare('SELECT count(*) n FROM requirements').get().n, count);
+  }, { readFeishuConfig: () => config });
 });

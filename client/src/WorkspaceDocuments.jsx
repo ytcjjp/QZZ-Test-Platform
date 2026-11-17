@@ -30,6 +30,7 @@ import {
   X,
 } from "lucide-react";
 import "./workspace-documents.css";
+import FeishuConnection, { FeishuConnectionHelp } from "./FeishuConnection";
 const markdown = new MarkdownIt({ html: false, linkify: false, breaks: true });
 const REQUIREMENT_STATUSES = ["草稿", "已确认", "已归档"];
 const PRIORITIES = ["P0", "P1", "P2", "P3"];
@@ -339,6 +340,8 @@ function Attachment({ attachment }) {
 function SourceDialog({
   project,
   canWrite,
+  isAdmin = false,
+  onConfigureFeishu,
   record,
   knowledgeBase,
   onClose,
@@ -591,6 +594,23 @@ function SourceDialog({
             onChange={(event) => setSourceUrl(event.target.value)}
           />
         </label>
+        <div className="feishu-source-help">
+          {isAdmin && onConfigureFeishu && (
+            <button
+              type="button"
+              className="text-button"
+              disabled={busy}
+              onClick={onConfigureFeishu}
+            >
+              <Link2 size={14} />
+              飞书文档连接设置
+            </button>
+          )}
+          <FeishuConnectionHelp
+            isAdmin={isAdmin}
+            onConfigure={onConfigureFeishu}
+          />
+        </div>
         <div className="ws-form-row">
           {knowledgeBase ? (
             <label className="field">
@@ -642,6 +662,16 @@ function SourceDialog({
           </div>
         )}
         <ErrorMessage error={error}>
+          {isAdmin && onConfigureFeishu && /飞书|权限|应用/.test(error) && (
+            <button
+              type="button"
+              className="text-button"
+              disabled={busy}
+              onClick={onConfigureFeishu}
+            >
+              配置飞书连接
+            </button>
+          )}
           {conflict && (
             <button
               type="button"
@@ -1202,6 +1232,7 @@ function DraftDialog({
 function RequirementsPage({
   project,
   canWrite,
+  isAdmin = false,
   canAi = false,
   canCasesView = false,
   canGenerate = false,
@@ -1223,6 +1254,7 @@ function RequirementsPage({
   const [editor, setEditor] = useState(null);
   const [draft, setDraft] = useState(null);
   const [preview, setPreview] = useState(null);
+  const [feishuOpen, setFeishuOpen] = useState(false);
   const loadSequence = useRef(0);
   const report = useCallback(
     (failure) => {
@@ -1257,7 +1289,11 @@ function RequirementsPage({
     setQuery("");
     setStatus("");
     setPriority("");
+    setFeishuOpen(false);
   }, [project.id, canWrite]);
+  useEffect(() => {
+    if (!isAdmin) setFeishuOpen(false);
+  }, [isAdmin]);
   useEffect(() => {
     load();
   }, [load, canWrite, refreshToken]);
@@ -1371,6 +1407,16 @@ function RequirementsPage({
           <p>{project.name}</p>
         </div>
         <div className="heading-actions">
+          {isAdmin && (
+            <button
+              type="button"
+              className="button secondary"
+              onClick={() => setFeishuOpen(true)}
+            >
+              <Link2 size={16} />
+              飞书文档连接
+            </button>
+          )}
           <Icon
             icon={RefreshCw}
             label="刷新需求"
@@ -1518,6 +1564,8 @@ function RequirementsPage({
         <SourceDialog
           project={project}
           canWrite={canWrite}
+          isAdmin={isAdmin}
+          onConfigureFeishu={() => setFeishuOpen(true)}
           record={editor.record}
           onClose={() => setEditor(null)}
           onSaved={() => {
@@ -1565,6 +1613,14 @@ function RequirementsPage({
             onNotice?.(message);
             load();
           }}
+        />
+      )}
+      {feishuOpen && isAdmin && (
+        <FeishuConnection
+          onClose={() => setFeishuOpen(false)}
+          onSaved={() =>
+            onNotice?.("飞书应用配置已保存，请确认飞书侧授权后再导入文档")
+          }
         />
       )}
     </section>

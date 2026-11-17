@@ -9,6 +9,8 @@ import sharp from 'sharp';
 const BRANCHES = ['主流程', 'UI', '异常与边界', '受影响模块'];
 const MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
 const MAX_LOG_BYTES = 64 * 1024;
+const MAX_DIAGNOSTICS = 50;
+const diagnosticQueues = new Map();
 export const VISION_LIMITS = { images: 64, bytes: 64 * 1024 * 1024, pixels: 40000000 };
 
 export class CodexGenerationError extends Error {
@@ -108,11 +110,105 @@ function appendLog(previous, chunk) {
   return Buffer.concat([previous.subarray(-Math.min(previous.length, keep)), incoming]);
 }
 
-function exitError(logs) {
-  if (/unauthorized|authentication failed|invalid.api.key|\b401\b/i.test(logs)) return new CodexGenerationError('本机 Codex 网关认证失败，请联系管理员检查 API Key。', 'CODEX_AUTH');
-  if (/model_not_found|model[^\n]{0,80}(?:not found|unsupported)|unsupported[^\n]{0,80}model/i.test(logs)) return new CodexGenerationError('网关不支持当前 Codex 模型，请联系管理员检查模型配置。', 'CODEX_MODEL');
-  if (/\b404\b|endpoint[^\n]{0,80}not found/i.test(logs)) return new CodexGenerationError('本机 Codex 网关地址不可用，请检查 Responses 服务地址。', 'CODEX_ENDPOINT');
-  return new CodexGenerationError('本机 Codex 生成失败，请检查模型、网关配置或稍后重试。', 'CODEX_EXIT');
+function terminalFailure(stdout, stderr) {
+  const events = [];
+  for (const line of stdout.split(/\r?\n/)) {
+    try {
+      const event = JSON.parse(line);
+      if (event?.type === 'turn.failed' || event?.type === 'error') events.push(event);
+    } catch {}
+  }
+  const event = events.filter((entry) => entry.type === 'turn.failed').at(-1) || events.at(-1);
+  if (event) {
+    const detail = event.error && typeof event.error === 'object' ? event.error : event;
+    const message = typeof event.error === 'string' ? event.error : typeof detail.message === 'string' ? detail.message : '';
+    const code = typeof detail.code === 'string' ? detail.code.slice(0, 120) : '';
+    const status = detail.status ?? detail.status_code;
+    const requestId = detail.request_id ?? detail.requestId;
+    return [message, code, Number.isInteger(status) && status >= 400 && status <= 599 ? `HTTP ${status}` : '', typeof requestId === 'string' ? `request_id=${requestId}` : ''].filter(Boolean).join('\n');
+  }
+  // Bootstrap warnings can contain GitHub status codes unrelated to the model.
+  // They must not override a terminal model error or become gateway failures.
+  const lines = stderr.split(/\r?\n/).filter((line) => line.trim() && !/\b(?:WARN|INFO|DEBUG|TRACE)\b/.test(line));
+  const errors = lines.filter((line) => /\bERROR\b|^\s*error:|\b(?:model_not_found|invalid_json_schema|context_length_exceeded)\b/i.test(line));
+  return errors.at(-1) || lines.at(-1) || '';
+}
+
+function exitError(stdout, stderr) {
+  const logs = terminalFailure(stdout, stderr);
+  const statuses = [...logs.matchAll(/\b(?:HTTP(?:\/[\d.]+)?\s+|(?:unexpected\s+)?status(?:_code|\s+code)?["']?\s*[:=]?\s*)([45]\d{2})\b/gi)];
+  const bareStatus = logs.match(/\b(400|401|403|404|408|413|429|500|502|503|504)\s+(?:Bad Request|Unauthorized|Forbidden|Not Found|Request Timeout|Payload Too Large|Too Many Requests|Internal Server Error|Bad Gateway|Service Unavailable|Gateway Timeout)\b/i);
+  let httpStatus = statuses.length ? Number(statuses.at(-1)[1]) : bareStatus ? Number(bareStatus[1]) : null;
+  const requestId = [...logs.matchAll(/\b(?:x-request-id|request_id|requestId)["']?\s*[:=]\s*["']?([A-Za-z0-9_-]{8,100})/gi)].at(-1)?.[1];
+  let error;
+  if ([401, 403].includes(httpStatus) || /unauthorized|authentication failed|invalid.api.key|invalid_authentication/i.test(logs)) {
+    httpStatus ??= 401;
+    error = new CodexGenerationError('本机 Codex 网关认证失败，请联系管理员检查密钥和模型权限。', 'CODEX_AUTH');
+  } else if (/context_length_exceeded|context.window|maximum.context|too many tokens|token.limit|input[^\n]{0,60}(?:too long|exceeds)/i.test(logs)) {
+    error = new CodexGenerationError('本轮资料超过模型上下文容量，请拆分需求或减少引用资料后重试。', 'CODEX_CONTEXT', 413);
+  } else if (/invalid_json_schema|invalid.schema|schema[^\n]{0,100}(?:unsupported|not supported|invalid)|(?:invalid|unsupported)[^\n]{0,60}schema/i.test(logs)) {
+    httpStatus ??= 400;
+    error = new CodexGenerationError('AI 服务拒绝了结构化输出协议，请联系管理员检查接口兼容性。', 'CODEX_SCHEMA');
+  } else if (/model_not_found|model[^\n]{0,80}(?:not found|unsupported)|unsupported[^\n]{0,80}model/i.test(logs)) {
+    error = new CodexGenerationError('网关不支持当前 Codex 模型，请联系管理员检查模型配置。', 'CODEX_MODEL');
+  } else if (httpStatus === 404 || /endpoint[^\n]{0,80}not found/i.test(logs)) {
+    error = new CodexGenerationError('本机 Codex 网关地址不可用，请检查 Responses 服务地址。', 'CODEX_ENDPOINT');
+  } else if (/stream[^\n]{0,100}(?:disconnect|closed|ended|error)|error decoding response body/i.test(logs)) {
+    error = new CodexGenerationError('AI 返回流在完成前中断，已尝试重试，请稍后再试或拆分需求。', 'CODEX_STREAM');
+  } else if (httpStatus === 429 || /rate_limit|rate.limit|insufficient_quota|quota.exceeded|too many requests/i.test(logs)) {
+    httpStatus ??= 429;
+    error = new CodexGenerationError('AI 服务当前限流或额度不足，请稍后重试或联系管理员。', 'CODEX_RATE_LIMIT', 503);
+  } else if ([408, 504].includes(httpStatus) || /timed? out|\btimeout\b/i.test(logs)) {
+    error = new CodexGenerationError('本机 Codex 生成超时，请稍后重试或拆分需求。', 'CODEX_TIMEOUT', 504);
+  } else if (httpStatus >= 500 && httpStatus <= 599) {
+    error = new CodexGenerationError('AI 网关暂时不可用，已尝试重试，请稍后再试。', 'CODEX_UPSTREAM', 503);
+  } else if (/connection[^\n]{0,60}(?:closed|reset|refused|failed)|error sending request|error reading[^\n]{0,40}response|failed to[^\n]{0,40}(?:connect|resolve)|network.error|broken.pipe|\bECONN(?:RESET|REFUSED)\b|\bENOTFOUND\b|TLS|certificate|websocket/i.test(logs)) {
+    error = new CodexGenerationError('与 AI 服务的连接中断，已尝试重试，请稍后再试。', 'CODEX_CONNECTION');
+  } else if (httpStatus === 400) {
+    error = new CodexGenerationError('AI 服务拒绝了当前请求，请联系管理员检查接口参数。', 'CODEX_REQUEST');
+  } else if (/permission denied|access is denied|os error|config[^\n]{0,80}(?:invalid|error)|(?:failed|unable) to (?:load|read)[^\n]{0,60}(?:config|runtime)|could not find executable|no such file/i.test(logs)) {
+    error = new CodexGenerationError('本机 Codex 运行环境异常，请联系管理员检查程序和目录权限。', 'CODEX_RUNTIME', 503);
+  } else {
+    error = new CodexGenerationError('本机 Codex 生成失败，请检查模型、网关配置或稍后重试。', 'CODEX_EXIT');
+  }
+  error.httpStatus = httpStatus;
+  if (requestId) Object.defineProperty(error, 'requestId', { value: requestId });
+  return error;
+}
+
+function allowedRequestId(value, prompt, key) {
+  if (typeof value !== 'string' || !/^(?:req[-_][A-Za-z0-9]{16,64}|[a-f0-9]{32}|[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12})$/i.test(value)) return undefined;
+  if (prompt.includes(value) || key && value.includes(key) || /sk[-_]|Bearer/i.test(value)) return undefined;
+  return value;
+}
+
+async function recordFailure(config, { error, jobId, startedAt, prompt, images, exitCode }) {
+  const directory = path.resolve(config.dataDir, 'codex-diagnostics');
+  const previous = diagnosticQueues.get(directory) || Promise.resolve();
+  const pending = previous.catch(() => {}).then(async () => {
+    const requestId = allowedRequestId(error.requestId, prompt, config.apiKey);
+    const model = /^[A-Za-z0-9._:/-]{1,120}$/.test(config.model) && !config.model.includes(config.apiKey) ? config.model : 'unknown';
+    // Deliberately construct this allowlist; never serialize an Error, config,
+    // prompt, process environment, or any part of stdout/stderr.
+    const summary = {
+      time: new Date().toISOString(), model, errorCode: error.code,
+      httpStatus: Number.isInteger(error.httpStatus) && error.httpStatus >= 400 && error.httpStatus <= 599 ? error.httpStatus : null,
+      exitCode: Number.isInteger(exitCode) ? exitCode : null,
+      duration: Math.max(0, Date.now() - startedAt), promptChars: prompt.length, imageCount: images.length,
+      ...(requestId ? { requestId } : {}),
+    };
+    await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+    const filename = path.join(directory, `${jobId}.json`);
+    await fs.writeFile(filename, JSON.stringify(summary, null, 2), { mode: 0o600, flag: 'wx' });
+    const entries = (await fs.readdir(directory, { withFileTypes: true })).filter((entry) => entry.isFile() && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}\.json$/i.test(entry.name) && entry.name !== `${jobId}.json`);
+    const ordered = await Promise.all(entries.map(async (entry) => ({ name: entry.name, mtime: (await fs.stat(path.join(directory, entry.name))).mtimeMs })));
+    ordered.sort((a, b) => b.mtime - a.mtime || b.name.localeCompare(a.name));
+    await Promise.all(ordered.slice(MAX_DIAGNOSTICS - 1).map((entry) => fs.unlink(path.join(directory, entry.name))));
+    return jobId.slice(0, 8);
+  });
+  diagnosticQueues.set(directory, pending);
+  try { return await pending; }
+  finally { if (diagnosticQueues.get(directory) === pending) diagnosticQueues.delete(directory); }
 }
 
 export async function runCodexData({ prompt, schema, config, signal, projectContext, images = [] } = {}, dependencies = {}) {
@@ -133,7 +229,10 @@ export async function runCodexData({ prompt, schema, config, signal, projectCont
   const projectRoot = path.resolve(config.projectRoot);
   const codexHomeDir = path.resolve(config.dataDir, 'codex-runtime');
   const jobsDir = path.resolve(config.dataDir, 'codex-jobs');
-  const jobDir = path.join(jobsDir, crypto.randomUUID());
+  const jobId = crypto.randomUUID();
+  const jobDir = path.join(jobsDir, jobId);
+  const startedAt = Date.now();
+  let exitCode = null;
   let child;
   try {
     if (!(await fs.stat(projectRoot)).isDirectory()) throw new Error('project unavailable');
@@ -163,6 +262,8 @@ export async function runCodexData({ prompt, schema, config, signal, projectCont
       `model_reasoning_effort=${JSON.stringify(config.reasoningEffort || 'ultra')}`,
       'features.shell_tool=false',
       'features.unified_exec=false',
+      'features.plugins=false',
+      'features.apps=false',
       'web_search="disabled"',
       'shell_environment_policy.exclude=["QZZ_CODEX_API_KEY","OPENAI_API_KEY","AI_API_KEY","FEISHU_APP_SECRET"]',
       'model_providers.qzz_gateway.name="QZZ Responses Gateway"',
@@ -170,8 +271,8 @@ export async function runCodexData({ prompt, schema, config, signal, projectCont
       'model_providers.qzz_gateway.env_key="QZZ_CODEX_API_KEY"',
       'model_providers.qzz_gateway.wire_api="responses"',
       'model_providers.qzz_gateway.requires_openai_auth=false',
-      'model_providers.qzz_gateway.request_max_retries=0',
-      'model_providers.qzz_gateway.stream_max_retries=0',
+      'model_providers.qzz_gateway.request_max_retries=2',
+      'model_providers.qzz_gateway.stream_max_retries=1',
     ];
     for (const setting of settings) args.push('--config', setting);
     args.push('-');
@@ -199,8 +300,9 @@ export async function runCodexData({ prompt, schema, config, signal, projectCont
       child.stdin?.on('error', () => {});
       child.once('error', () => { void stop(new CodexGenerationError('无法启动本机 Codex，请检查程序路径和运行权限。', 'CODEX_START', 503)); });
       child.once('close', (code) => {
+        exitCode = Number.isInteger(code) ? code : null;
         if (finished) return;
-        const failure = code !== 0 ? exitError(stderr.toString('utf8') + '\n' + stdout.toString('utf8')) : null;
+        const failure = code !== 0 ? exitError(stdout.toString('utf8'), stderr.toString('utf8')) : null;
         finished = true; cleanup();
         if (failure) reject(failure);
         else resolve();
@@ -223,8 +325,16 @@ export async function runCodexData({ prompt, schema, config, signal, projectCont
     return result;
   } catch (error) {
     if (signal?.aborted) throw new CodexGenerationError('本次用例生成已取消。', 'CODEX_ABORTED', 499);
-    if (error instanceof CodexGenerationError) throw error;
-    throw new CodexGenerationError('本机 Codex 运行环境不可用，请检查项目目录和服务权限。', 'CODEX_RUNTIME', 503);
+    const failure = error instanceof CodexGenerationError ? error : new CodexGenerationError('本机 Codex 运行环境不可用，请检查项目目录和服务权限。', 'CODEX_RUNTIME', 503);
+    if (failure.code !== 'CODEX_ABORTED') {
+      try {
+        const diagnosticId = await recordFailure(config, { error: failure, jobId, startedAt, prompt, images, exitCode });
+        failure.diagnosticId = diagnosticId;
+        failure.message = `${failure.message}（诊断编号：${diagnosticId}）`;
+        failure.publicMessage = failure.message;
+      } catch { /* Diagnostic storage failure must not replace the controlled error. */ }
+    }
+    throw failure;
   } finally {
     await fs.rm(jobDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }).catch(() => {});
   }

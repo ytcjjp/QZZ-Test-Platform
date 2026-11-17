@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough, Writable } from 'node:stream';
 import { test } from 'node:test';
-import { generateWithCodex, CODEX_OUTPUT_SCHEMA } from '../codex-generator.js';
+import { generateWithCodex, runCodexData, CODEX_OUTPUT_SCHEMA } from '../codex-generator.js';
 
 const result = () => ({ title: '奖励领取测试用例', questions: [], branches: [
   { title: '主流程', cases: [{ title: '奖励领取', preconditions: '奖励可领取。', steps: '点击领取。', expected: '奖励到账。' }], modules: [] },
@@ -60,6 +61,10 @@ test('Codex worker uses isolated home, readonly Responses CLI, stdin sources and
     assert.ok(!args.includes('disable_response_storage=true'));
     assert.ok(args.includes('features.shell_tool=false'));
     assert.ok(args.includes('features.unified_exec=false'));
+    assert.ok(args.includes('features.plugins=false'));
+    assert.ok(args.includes('features.apps=false'));
+    assert.ok(args.includes('model_providers.qzz_gateway.request_max_retries=2'));
+    assert.ok(args.includes('model_providers.qzz_gateway.stream_max_retries=1'));
     assert.equal(args.at(-1), '-');
     assert.equal(spawnOptions.shell, false); assert.equal(spawnOptions.windowsHide, true);
     assert.equal(spawnOptions.env.QZZ_CODEX_API_KEY, config.apiKey);
@@ -103,6 +108,7 @@ test('Codex worker stops its own process tree on timeout or cancellation and ret
   const timeoutRunner = fakeRunner();
   await assert.rejects(generateWithCodex(documents, { ...options, config: { ...options.config, timeoutMs: 15 } }, { spawn: timeoutRunner.spawn, killTree }), (error) => error.code === 'CODEX_TIMEOUT' && error.status === 504 && error.publicMessage === error.message);
   assert.deepEqual(killed, [timeoutRunner.child.pid]); await assertNoJobs(dataDir);
+  assert.equal((await fs.readdir(path.join(dataDir, 'codex-diagnostics'))).length, 1);
   const controller = new AbortController();
   const abortRunner = fakeRunner(() => controller.abort());
   await assert.rejects(generateWithCodex(documents, { ...options, signal: controller.signal }, { spawn: abortRunner.spawn, killTree }), (error) => error.code === 'CODEX_ABORTED');
@@ -110,6 +116,105 @@ test('Codex worker stops its own process tree on timeout or cancellation and ret
   const before = killed.length;
   await assert.rejects(generateWithCodex(documents, { ...options, signal: controller.signal }, { spawn: () => { throw new Error('must not start'); }, killTree }), (error) => error.status === 499);
   assert.equal(killed.length, before);
+  assert.equal((await fs.readdir(path.join(dataDir, 'codex-diagnostics'))).length, 1, 'cancellation does not create failure diagnostics');
+}));
+
+test('Codex worker classifies terminal model errors and writes only bounded allowlisted diagnostics', async () => fixture(async ({ config, documents, options, dataDir }) => {
+  const allowedId = 'req_0123456789abcdef0123456789abcdef';
+  const entries = [
+    ['unexpected status 400 Bad Request: invalid_json_schema', 'CODEX_SCHEMA', 502, 400],
+    ['HTTP 400 Bad Request: invalid request parameter', 'CODEX_REQUEST', 502, 400],
+    ['HTTP 429 Too Many Requests: rate_limit_exceeded', 'CODEX_RATE_LIMIT', 503, 429],
+    ['unexpected status 500 Internal Server Error', 'CODEX_UPSTREAM', 503, 500],
+    ['HTTP 502 Bad Gateway', 'CODEX_UPSTREAM', 503, 502],
+    ['stream disconnected before completion: Transport error: network error: error decoding response body', 'CODEX_STREAM', 502, null],
+    ['error sending request: connection reset', 'CODEX_CONNECTION', 502, null],
+    ['HTTP 400 Bad Request: context_length_exceeded: maximum context window reached', 'CODEX_CONTEXT', 413, 400],
+    ['HTTP 401 Unauthorized: invalid_api_key', 'CODEX_AUTH', 502, 401],
+    ['HTTP 403 Forbidden', 'CODEX_AUTH', 502, 403],
+    ['HTTP 404 Not Found: model_not_found', 'CODEX_MODEL', 502, 404],
+    ['HTTP 404 Not Found: endpoint not found', 'CODEX_ENDPOINT', 502, 404],
+    ['HTTP 504 Gateway Timeout', 'CODEX_TIMEOUT', 504, 504],
+    ['runtime permission denied (os error 13)', 'CODEX_RUNTIME', 503, null],
+    ['unknown terminal failure', 'CODEX_EXIT', 502, null],
+  ];
+  for (const [message, code, status, httpStatus] of entries) {
+    const before = new Set(await fs.readdir(path.join(dataDir, 'codex-diagnostics')).catch(() => []));
+    const runner = fakeRunner((capture, prompt, child) => {
+      child.stderr.write(`2026-11-17 WARN plugin bootstrap GitHub unexpected status 429 Too Many Requests ${config.apiKey}\n${documents[0].text}\n`);
+      child.stdout.write(JSON.stringify({ type: 'error', message: 'earlier attempt HTTP 401 Unauthorized' }) + '\n');
+      child.stdout.write(JSON.stringify({ type: 'turn.failed', error: { message: `${message}\nprivate=${config.apiKey}\n${documents[0].text}`, request_id: allowedId, privateDocument: documents[0].text } }) + '\n');
+      child.emit('close', 7);
+    });
+    await assert.rejects(generateWithCodex(documents, options, { spawn: runner.spawn }), (error) => {
+      assert.equal(error.code, code); assert.equal(error.status, status);
+      assert.match(error.diagnosticId, /^[a-f0-9]{8}$/);
+      assert.ok(error.publicMessage.endsWith(`（诊断编号：${error.diagnosticId}）`));
+      assert.equal(error.message, error.publicMessage);
+      assert.equal(JSON.stringify(error).includes(config.apiKey), false);
+      assert.equal(JSON.stringify(error).includes(documents[0].text), false);
+      return true;
+    });
+    const added = (await fs.readdir(path.join(dataDir, 'codex-diagnostics'))).filter((name) => !before.has(name));
+    assert.equal(added.length, 1);
+    const content = await fs.readFile(path.join(dataDir, 'codex-diagnostics', added[0]), 'utf8');
+    const saved = JSON.parse(content);
+    assert.deepEqual(Object.keys(saved).sort(), ['time', 'model', 'errorCode', 'httpStatus', 'exitCode', 'duration', 'promptChars', 'imageCount', 'requestId'].sort());
+    assert.equal(saved.model, config.model); assert.equal(saved.errorCode, code); assert.equal(saved.httpStatus, httpStatus); assert.equal(saved.exitCode, 7);
+    assert.equal(saved.promptChars, runner.input.length); assert.equal(saved.imageCount, 0); assert.equal(saved.requestId, allowedId);
+    assert.ok(Number.isInteger(saved.duration) && saved.duration >= 0); assert.ok(!Number.isNaN(Date.parse(saved.time)));
+    for (const privateValue of [config.apiKey, documents[0].text, 'privateDocument', 'stdout', 'stderr', 'GitHub']) assert.equal(content.includes(privateValue), false);
+    await assertNoJobs(dataDir);
+  }
+}));
+
+test('diagnostics omit suspicious or prompt-derived request IDs and never expose raw startup errors', async () => fixture(async ({ config, documents, options, dataDir }) => {
+  const docId = 'req_abcdef0123456789abcdef0123456789';
+  const augmented = [{ ...documents[0], text: `${documents[0].text}\n${docId}` }];
+  for (const requestId of [docId, `req_${config.apiKey}`, 'sk-private-key-from-upstream']) {
+    const runner = fakeRunner((capture, prompt, child) => {
+      child.stdout.write(JSON.stringify({ type: 'turn.failed', error: { message: 'HTTP 400 invalid_json_schema', request_id: requestId } }) + '\n'); child.emit('close', 1);
+    });
+    await assert.rejects(generateWithCodex(augmented, options, { spawn: runner.spawn }), (error) => {
+      assert.equal(error.code, 'CODEX_SCHEMA'); assert.equal(JSON.stringify(error).includes(requestId), false); return true;
+    });
+  }
+  await assert.rejects(generateWithCodex(documents, options, { spawn: () => { throw new Error(`${config.apiKey} ${documents[0].text}`); } }), (error) => error.code === 'CODEX_START' && Boolean(error.diagnosticId));
+  const contents = await Promise.all((await fs.readdir(path.join(dataDir, 'codex-diagnostics'))).map((name) => fs.readFile(path.join(dataDir, 'codex-diagnostics', name), 'utf8')));
+  assert.equal(contents.length, 4);
+  for (const content of contents) {
+    const saved = JSON.parse(content); assert.equal(Object.hasOwn(saved, 'requestId'), false);
+    assert.equal(content.includes(config.apiKey), false); assert.equal(content.includes(documents[0].text), false);
+  }
+}));
+
+test('diagnostics retain at most 50 records under concurrent failures and tolerate unavailable storage', async () => fixture(async ({ config, documents, options, dataDir }) => {
+  const diagnosticDirectory = path.join(dataDir, 'codex-diagnostics');
+  await fs.mkdir(diagnosticDirectory, { recursive: true });
+  const oldNames = [];
+  for (let index = 0; index < 49; index++) {
+    const filename = `${crypto.randomUUID()}.json`; oldNames.push(filename);
+    const target = path.join(diagnosticDirectory, filename);
+    await fs.writeFile(target, '{}');
+    const timestamp = new Date(Date.now() - 100000 + index * 100); await fs.utimes(target, timestamp, timestamp);
+  }
+  await fs.writeFile(path.join(diagnosticDirectory, 'README.txt'), 'not a diagnostic record');
+  const identifiers = await Promise.all(Array.from({ length: 4 }, async () => {
+    const runner = fakeRunner((capture, prompt, child) => { child.stderr.write('HTTP 502 Bad Gateway'); child.emit('close', 1); });
+    let identifier;
+    await assert.rejects(generateWithCodex(documents, options, { spawn: runner.spawn }), (error) => { identifier = error.diagnosticId; return error.code === 'CODEX_UPSTREAM'; });
+    return identifier;
+  }));
+  const files = await fs.readdir(diagnosticDirectory);
+  assert.equal(files.filter((name) => name.endsWith('.json')).length, 50);
+  assert.ok(files.includes('README.txt'));
+  assert.equal(files.includes(oldNames[0]), false); assert.equal(files.includes(oldNames[1]), false); assert.equal(files.includes(oldNames[2]), false);
+  for (const identifier of identifiers) assert.ok(files.some((name) => name.startsWith(identifier)));
+  await fs.rm(diagnosticDirectory, { recursive: true });
+  await fs.writeFile(diagnosticDirectory, 'storage unavailable');
+  const runner = fakeRunner((capture, prompt, child) => { child.stderr.write('HTTP 400 invalid_json_schema'); child.emit('close', 1); });
+  await assert.rejects(generateWithCodex(documents, options, { spawn: runner.spawn }), (error) => error.code === 'CODEX_SCHEMA' && !error.diagnosticId && !error.message.includes(config.apiKey));
+  await assertNoJobs(dataDir);
 }));
 
 test('Codex worker rejects invalid output and startup failures without returning logs, documents or keys', async () => fixture(async ({ documents, options, config, dataDir }) => {

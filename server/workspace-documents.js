@@ -302,7 +302,16 @@ export function registerWorkspaceDocumentRoutes(app, options) {
   }
   async function sourceText(body, filesPresent) {
     let value = text(body.body, '正文'); const sourceUrl = sourceAddress(body.sourceUrl);
-    if (!value && !filesPresent && sourceUrl) { const config = readFeishuConfig ? await readFeishuConfig() : { appId: process.env.FEISHU_APP_ID, appSecret: process.env.FEISHU_APP_SECRET }; value = (await readFeishuDocument(sourceUrl, config)).text; }
+    if (!value && !filesPresent && sourceUrl) {
+      try {
+        const config = readFeishuConfig ? await readFeishuConfig() : { appId: process.env.FEISHU_APP_ID, appSecret: process.env.FEISHU_APP_SECRET };
+        value = (await readFeishuDocument(sourceUrl, config)).text;
+      } catch (error) {
+        if (Number.isInteger(error.status) && error.status >= 400 && error.status < 600) throw new WorkspaceError(error.message, error.status);
+        if (['TimeoutError', 'AbortError'].includes(error.name)) throw new WorkspaceError('飞书来源读取超时，请稍后重试或下载 Word/PDF 后导入。', 504);
+        throw new WorkspaceError('飞书来源暂时无法读取，请检查连接配置和网络，或下载 Word/PDF 后导入。', 502);
+      }
+    }
     return { body: value, sourceUrl };
   }
   function requirementValues(body, previous = {}) {
@@ -332,7 +341,9 @@ export function registerWorkspaceDocumentRoutes(app, options) {
     const row = need(db.prepare('SELECT * FROM workspace_attachments WHERE id=? AND owner_id=? AND owner_type=? AND project_id=? AND deleted_at IS NULL').get(req.params.aid, owner.id, type, projectId), '附件');
     if (row.parent_id && !db.prepare('SELECT 1 FROM workspace_attachments WHERE id=? AND deleted_at IS NULL').get(row.parent_id)) throw new WorkspaceError('附件不存在', 404);
     res.set('X-Content-Type-Options', 'nosniff');
-    if (req.query.inline === '1' && (parsedMeta(row).image || row.mime_type === 'application/pdf')) { res.type(row.mime_type); res.sendFile(path.join(service.fileDir, row.stored_name)); }
+    const metadata = parsedMeta(row);
+    if (req.query.inline === '1' && metadata.image && metadata.visionFile && !['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(row.mime_type)) { res.type('image/png'); res.sendFile(path.join(service.fileDir, metadata.visionFile)); }
+    else if (req.query.inline === '1' && (metadata.image || row.mime_type === 'application/pdf')) { res.type(row.mime_type); res.sendFile(path.join(service.fileDir, row.stored_name)); }
     else res.download(path.join(service.fileDir, row.stored_name), row.name);
   }
   route('get', '/api/requirements/:id/attachments/:aid/download', 'requirements', 'view', (req, res) => download(req, res, 'requirement'));

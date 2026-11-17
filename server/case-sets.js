@@ -80,7 +80,7 @@ export function registerCaseSetRoutes(app, { db, projects, sendError, inputError
     });
   }
 
-  const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024, files: 1, fields: 1, fieldSize: 100 } });
+  const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024, files: 1, fields: 2, fieldSize: 100 } });
   app.post('/api/cases/import', (req, res, next) => {
     upload.single('file')(req, res, (error) => {
       if (error instanceof multer.MulterError) return sendError(res, error.code === 'LIMIT_FILE_SIZE' ? 413 : 400, 'upload_error', error.code === 'LIMIT_FILE_SIZE' ? '用例集文件不能超过 10 MB' : '用例集上传格式不正确');
@@ -90,6 +90,12 @@ export function registerCaseSetRoutes(app, { db, projects, sendError, inputError
   }, (req, res) => {
     const projectId = projects.requireProject(req.body?.projectId);
     if (!req.file) throw inputError('请选择 Markdown 或 XMind 文件');
+    const requirementId = req.body?.requirementId || null;
+    const hasRequirementColumn = db.prepare('PRAGMA table_info(cases)').all().some((column) => column.name === 'requirement_id');
+    if (requirementId) {
+      if (req.user.role !== 'admin' && !req.user.permissions?.requirements?.view) return sendError(res, 403, 'forbidden', '没有关联需求的查看权限');
+      if (typeof requirementId !== 'string' || requirementId.length > 100 || !hasRequirementColumn || !db.prepare('SELECT 1 FROM requirements WHERE id=? AND project_id=? AND deleted_at IS NULL').get(requirementId, projectId)) throw inputError('关联需求不存在或不属于当前项目');
+    }
     const filename = uploadFilename(req.file.originalname, '导入用例集.md');
     const originalExtension = path.extname(filename);
     const extension = originalExtension.toLowerCase();
@@ -105,10 +111,10 @@ export function registerCaseSetRoutes(app, { db, projects, sendError, inputError
     }
     const now = new Date().toISOString();
     const insert = db.prepare(`INSERT INTO cases (id, title, module, priority, status, preconditions, steps, expected, notes, tags,
-      revision, created_by, created_at, updated_at, project_id, tree) VALUES (?, ?, '', 'P2', '未执行', '', '', '', '', '[]', 1, ?, ?, ?, ?, ?)`);
+      revision, created_by, created_at, updated_at, project_id, tree${hasRequirementColumn ? ', requirement_id' : ''}) VALUES (?, ?, '', 'P2', '未执行', '', '', '', '', '[]', 1, ?, ?, ?, ?, ?${hasRequirementColumn ? ', ?' : ''})`);
     const ids = db.transaction(() => sets.map((set) => {
       const id = crypto.randomUUID();
-      insert.run(id, set.title, req.user.id, now, now, projectId, JSON.stringify(set.tree));
+      insert.run(id, set.title, req.user.id, now, now, projectId, JSON.stringify(set.tree), ...(hasRequirementColumn ? [requirementId] : []));
       return id;
     }))();
     const cases = ids.map((id) => mapCase(getCase.get(id)));

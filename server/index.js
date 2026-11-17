@@ -13,6 +13,7 @@ import { initializeCaseSets, caseTree, registerCaseSetRoutes } from './case-sets
 import { registerAiRoutes, loadFeishuConfig } from './ai-documents.js';
 import { initializeWorkspaceDocuments, registerWorkspaceDocumentRoutes } from './workspace-documents.js';
 import { registerAiWorkspaceRoutes } from './ai-workspace.js';
+import { uploadFilename } from './upload-name.js';
 import { hashPassword, verifyPassword, loadPasswordKey,
   encryptPassword as encryptWithKey, decryptPassword as decryptWithKey } from './passwords.js';
 
@@ -661,7 +662,7 @@ app.get('/api/files', (req, res) => {
 
 app.post('/api/files', upload.single('file'), (req, res) => {
   if (!req.file) return sendError(res, 400, 'invalid_input', '请选择文件');
-  const name = path.basename(req.file.originalname).replace(/[\x00-\x1f\\/]/g, '').slice(0, 200);
+  const name = uploadFilename(req.file.originalname, '');
   if (!name) {
     fs.unlinkSync(req.file.path);
     return sendError(res, 400, 'invalid_input', '文件名不能为空');

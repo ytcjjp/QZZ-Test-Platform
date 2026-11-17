@@ -69,7 +69,7 @@ AI 生成草稿无需项目，保存进用例库时必须选择所属项目。
 - `/api/cases` 的一条记录现在代表一个用例集，保留原有字段，并新增 `tree`：`{id,title,children:[...]}`。`POST` 仅传 `{projectId,title}` 即创建只有中心主题的空白导图；`PUT /api/cases/:id` 传 `{projectId,revision,title?,tree?}` 保存，修订冲突返回 409。旧用例在迁移中转成包含模块、优先级、状态、前置条件、步骤、预期、标签和备注的导图，原字段、ID、修订和时间均保留。
 - 节点 ID 只接受 1-100 位字母、数字、下划线或连字符，单图不允许重复。导图上限为 5000 节点、64 层、50 万字符，单节点 3 万字符；JSON 请求上限 4 MB。
 - 节点可带 `style`，支持 `fontSize`（12-48 的整数加 `px`）、`color`/`background`（六位十六进制色）、`fontWeight`（`normal`/`bold`）、`fontStyle`（`normal`/`italic`）、`textDecoration`（`none`/`underline`）。保存、版本检查和现代 XMind 显式节点样式往返均保留这些字段；空对象或省略 `style` 恢复默认。拒绝其他 CSS 属性和值。Markdown 仍只保留主题文字与层级。
-- `POST /api/cases/import`：multipart 字段 `projectId`、`file`，支持 UTF-8 `.md/.markdown` 和 `.xmind`，返回 `{cases}`。多个一级标题或 XMind 多画布导入为多个用例集；导入一次最多 100 个用例集。XMind 支持现代 `content.json` 和旧版 `content.xml`，读取主题文本和层级，不导入原应用的主题样式、画布坐标、图片附件等。文件上限 10 MB；Markdown 文字上限 2 MB，归档目录和解压内容另有上限。
+- `POST /api/cases/import`：multipart 字段 `projectId`、`file`，可选 `requirementId`，支持 UTF-8 `.md/.markdown` 和 `.xmind`，返回 `{cases}`。传需求 ID 时校验需求查看权限、项目归属和未删除状态，并为本批导入记录建立关联；不传则不关联。多个一级标题或 XMind 多画布导入为多个用例集；导入一次最多 100 个用例集。XMind 支持现代 `content.json` 和旧版 `content.xml`，读取主题文本和层级，不导入原应用的主题样式、画布坐标、图片附件等。文件上限 10 MB；Markdown 文字上限 2 MB，归档目录和解压内容另有上限。
 - `POST /api/cases/export`：JSON `{projectId,items:[{id,revision}],format:"md"|"xmind"}`，有用例查看权限即可导出。单个 Markdown 返回 `.md`，多个返回包含独立 `.md` 的 ZIP；XMind 返回真实的多画布 `.xmind` ZIP。一次导出最多 1000 个用例集、8 MB UTF-8 导图内容；XMind 另限 100 个画布，含格式结构的 `content.json` 也不能超过 8 MB，以保证可重新导入。超限返回 413 并提示分批；单个 Markdown 转义后的文字也须符合 2 MB 限制。失效修订拒绝导出。
 - `POST /api/cases/batch`：`{projectId,items:[{id,revision}],action:"delete"}`。
 - `POST /api/defects/batch`：同上，支持 `action:"delete"` 或 `action:"status",status:"待处理"|"处理中"|"待验证"|"搁置"|"已解决"|"已关闭"`。单条列表状态修改同样使用此接口，`items` 只有一条。
@@ -121,6 +121,8 @@ DOCX 嵌图会提取并明确提示；扫描 PDF 当前无 OCR，需补截图或
 `reviewReport.method="ai-self-review"`，报告含问题、修改建议及加权分，不代表实际执行结果。
 AI 任务需 `ai.write` 和 `requirements.view`；引用知识库另需 `knowledge.view`，
 生成/修订用例另需 `cases.write`。写入分析、计划和正式用例仍分别走对应 CRUD 并需写权限。
+`analysis`、`plan` 及对应 `revise` 仅依据本次需求、实际图片及所选知识库，不采集游戏源码；
+测试点和用例任务才按需提供主机只读采集的相关源码片段。
 生成完成会再次检查会话、权限、项目和需求修订；期间需求修改返回 409，避免写入过期理解。
 网页取消或断开会释放任务锁，并取消请求或终止本次 Codex 子进程树。
 
@@ -132,8 +134,17 @@ AI 优先读取 `data/ai-provider.json` 中的固定本机配置，密钥以原�
 模型 `gpt-6.1-sol`、档位 `ultra`。当前 CLI 将该档位序列化为网关支持的 `xhigh`；
 已核对真实请求的 `store:false`。CLI 使用独立运行目录和临时输出 schema。
 平台只读采集点点消项目白名单中的相关源码片段，作为材料交给 Codex 分析；
-生成进程禁用系统命令，保持只读沙箱。临时提示及结果文件在完成或取消后清理。
+分析和计划任务除外，不采集源码。生成进程禁用系统命令及插件初始化，保持只读沙箱。
+网关请求配置 `request_max_retries=2`、流恢复配置 `stream_max_retries=1`，
+不做无限重试，仍受总超时和取消约束。临时提示及结果文件在完成或取消后清理。
 最长等待 15 分钟，网页取消或断开会终止本次子进程树并释放生成锁。
+
+Codex 非正常退出按终端模型错误提供受控分类：认证、模型、接口、结构化协议、上下文容量、
+限流、连接/流中断、超时、本机运行环境，未知错误保留通用退出提示。启动警告中的 HTTP
+状态不作为模型失败依据。诊断记录位于 `data/codex-diagnostics/`（随 `QZZ_DATA_DIR` 改变），
+最多保留 50 条；每条仅含时间、模型、错误分类、HTTP/退出状态、耗时、提示字符数、图片数
+及通过白名单验证的请求编号。不记录提示词、文档/图片内容、密钥、网关地址、环境变量或
+stdout/stderr 原文。页面错误可附诊断编号；记录写入失败不会掩盖原始受控错误。
 
 不存在本机配置时，保留 `AI_API_KEY`、`AI_MODEL`、`AI_BASE_URL` 环境变量兼容方式。
 `AI_WIRE_API=responses` 使用 Responses，`chat` 使用 Chat Completions；
@@ -153,14 +164,24 @@ AI 优先读取 `data/ai-provider.json` 中的固定本机配置，密钥以原�
 文档正文作为待分析资料发送，不作为系统指令；生成结果不会自动入库，需要选择项目组并保存。
 未配置 AI 时返回 503，不会伪装生成结果。
 
-飞书须由管理员在网页配置 `appId`、`appSecret`，或设置环境变量
+飞书须由管理员从需求管理页头、来源导入弹窗或 AI 来源入口的“飞书文档连接”配置
+`appId`、`appSecret`，或设置环境变量
 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`，并在飞书为应用开通相应文档读取权限、
-授权访问文档。网页 API 为 `GET/PUT /api/ai/feishu-config`，`appSecret` 不返回；
+发布应用及授权访问文档。QZZ 管理员身份不等于飞书企业审批或文档访问权限。
+参考飞书官方[纯文本接口说明](https://open.feishu.cn/document/server-docs/docs/docs/docx-v1/document/raw_content)
+及[云文档权限帮助](https://www.feishu.cn/hc/zh-CN/articles/360044508113-%E4%BA%91%E6%96%87%E6%A1%A3%E6%9D%83%E9%99%90%E5%B8%B8%E8%A7%81%E9%97%AE%E9%A2%98)。
+网页 API 为仅管理员可访问的 `GET/PUT /api/ai/feishu-config`，GET/PUT 仅返回应用 ID 和已配置标记，
+`appSecret` 不返回；同 App ID 留空保留原凭据，更换 App ID 需要新 Secret。
 本地配置 `data/feishu-config.json` 中的密钥使用原有 `password-key` 加密。
 服务仅请求固定的飞书 / Lark 官方 API 域名，不直接抓取任意传入地址。
-缺少授权会提示下载 Word/PDF 后导入。
+缺少授权会提示下载 Word/PDF 后导入；需求/知识来源读取网络失败返回受控 502，超时返回 504。
+本轮飞书测试使用请求替身，尚未配置真实租户，不能声明企业权限和文档共享已实测。
 
 工具云盘上传上限默认 100 MB，可用 `MAX_UPLOAD_MB` 调整；此设置不改变上述导入限制。
+新上传文件名统一修复 multipart UTF-8 被按 Latin-1 解码的问题，保留原生 Unicode 文件名，
+下载仍返回原始内容；不自动重写历史文件记录。
+
+本轮修复与验证边界见 [2026-11-17 复查记录](../docs/qa-review-20261117.md)。
 
 WebSocket 地址是同源 `/api/events`，会在项目组、用例、缺陷、文件、需求、计划和知识库变更时
 广播相应的 `project.*`、`case.*`、`defect.*`、`file.*`、`requirement.*`、`plan.*`、`knowledge.*` 事件。用例和缺陷事件包含

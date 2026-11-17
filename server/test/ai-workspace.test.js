@@ -50,10 +50,12 @@ test('workspace analysis, eight-section plan, staged points and traced cases pre
   assert.deepEqual(readPayload(captured.prompt).confirmedPoints, confirmedPoints);
   assert.deepEqual(result.confirmedPoints, confirmedPoints);
   assert.deepEqual(readPayload(captured.prompt).review, review);
-  const analyzed = await generateWorkspaceTask(input('analysis'), evidence(), { chunks: [], images: [], warnings: [] }, { ...options, runCodex: async () => analysis() });
+  const documentOnly = { ...options, collectContext: async () => { throw new Error('Document tasks must not load unrelated game source'); } };
+  const analyzed = await generateWorkspaceTask(input('analysis'), evidence(), { chunks: [], images: [], warnings: [] }, { ...documentOnly, runCodex: async () => analysis() });
   assert.match(analyzed.content, /功能清单/);
+  assert.equal(analyzed.retrieval.providedSourceFiles, 0);
   const rawPlan = { title: '奖励测试计划', content: PLAN_SECTIONS.map((section) => `## ${section}\n待确认，不虚构人员和日期。`).join('\n'), questions: ['请确认人员和排期。'], sourceIds: [sourceId] };
-  const planned = await generateWorkspaceTask(input('plan'), evidence(), knowledge(), { ...options, runCodex: async () => rawPlan });
+  const planned = await generateWorkspaceTask(input('plan'), evidence(), knowledge(), { ...documentOnly, runCodex: async () => rawPlan });
   assert.match(planned.content, /人力与人天/);
   assert.deepEqual(planned.questions, ['请确认人员和排期。']);
   const rawPoints = { ...points(), questions: ['失败是否可重试？'] };
