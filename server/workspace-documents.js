@@ -5,7 +5,7 @@ import path from 'node:path';
 import multer from 'multer';
 import sharp from 'sharp';
 import { unzipSync } from 'fflate';
-import { extractDocument, readFeishuDocument } from './ai-documents.js';
+import { extractDocument } from './ai-documents.js';
 import { uploadFilename } from './upload-name.js';
 
 const services = new WeakMap();
@@ -122,6 +122,13 @@ export function initializeWorkspaceDocuments(db, dataDir) {
     name TEXT NOT NULL, stored_name TEXT NOT NULL UNIQUE, mime_type TEXT NOT NULL, size INTEGER NOT NULL, extracted_text TEXT NOT NULL,
     metadata TEXT NOT NULL, created_at TEXT NOT NULL, deleted_at TEXT
   ); CREATE INDEX IF NOT EXISTS workspace_attachments_owner_idx ON workspace_attachments(owner_type,owner_id,deleted_at);`);
+  for (const table of ['requirements', 'knowledge_documents']) {
+    const columns = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((column) => column.name));
+    for (const [name, definition] of Object.entries({
+      source_warnings: "TEXT NOT NULL DEFAULT '[]'", source_completeness: "TEXT NOT NULL DEFAULT 'unknown'",
+      source_import_mode: "TEXT NOT NULL DEFAULT ''",
+    })) if (!columns.has(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
+  }
   let dependencies = {};
   function project(value) {
     if (dependencies.requireProject) return dependencies.requireProject(value);
@@ -144,9 +151,9 @@ export function initializeWorkspaceDocuments(db, dataDir) {
     const mapLeaf = (row) => { const metadata = parsedMeta(row); const url = attachmentUrl(type, ownerId, row.id, kbId) + `?projectId=${encodeURIComponent(projectId)}`; return { id: row.id, name: row.name, mimeType: row.mime_type, size: row.size, width: metadata.width, height: metadata.height, previewUrl: metadata.image ? url + '&inline=1' : null, downloadUrl: url, extractionError: metadata.extractionError || '', warnings: metadata.warnings || [] }; };
     return rows.filter((row) => !row.parent_id).map(map);
   }
-  function mapRequirement(row) { return { id: row.id, projectId: row.project_id, title: row.title, body: row.body, analysis: row.analysis, status: row.status, priority: row.priority, sourceUrl: row.source_url, revision: row.revision, createdBy: row.created_by, createdAt: row.created_at, updatedAt: row.updated_at, attachments: attachments('requirement', row.id, row.project_id) }; }
+  function mapRequirement(row) { return { id: row.id, projectId: row.project_id, title: row.title, body: row.body, analysis: row.analysis, status: row.status, priority: row.priority, sourceUrl: row.source_url, sourceWarnings: JSON.parse(row.source_warnings), sourceCompleteness: row.source_completeness, revision: row.revision, createdBy: row.created_by, createdAt: row.created_at, updatedAt: row.updated_at, attachments: attachments('requirement', row.id, row.project_id) }; }
   function mapKb(row) { return { id: row.id, projectId: row.project_id, name: row.name, description: row.description, category: row.category, chunkMode: row.chunk_mode, chunkSize: row.chunk_size, chunkOverlap: row.chunk_overlap, indexVersion: row.index_version, revision: row.revision, createdAt: row.created_at, updatedAt: row.updated_at, documentCount: db.prepare('SELECT count(*) n FROM knowledge_documents WHERE knowledge_base_id = ? AND deleted_at IS NULL').get(row.id).n, chunkCount: db.prepare('SELECT count(*) n FROM knowledge_chunks WHERE knowledge_base_id = ?').get(row.id).n, indexPending: db.prepare('SELECT count(*) n FROM knowledge_documents WHERE knowledge_base_id = ? AND deleted_at IS NULL AND index_version != ?').get(row.id, row.index_version).n }; }
-  function mapDocument(row) { const kb = kbRow(row.project_id, row.knowledge_base_id); return { id: row.id, projectId: row.project_id, knowledgeBaseId: row.knowledge_base_id, title: row.title, body: row.body, category: row.category, sourceUrl: row.source_url, revision: row.revision, indexOutdated: !kb || row.index_version !== kb.index_version, chunkCount: db.prepare('SELECT count(*) n FROM knowledge_chunks WHERE document_id = ?').get(row.id).n, createdAt: row.created_at, updatedAt: row.updated_at, attachments: attachments('knowledge', row.id, row.project_id, row.knowledge_base_id) }; }
+  function mapDocument(row) { const kb = kbRow(row.project_id, row.knowledge_base_id); return { id: row.id, projectId: row.project_id, knowledgeBaseId: row.knowledge_base_id, title: row.title, body: row.body, category: row.category, sourceUrl: row.source_url, sourceWarnings: JSON.parse(row.source_warnings), sourceCompleteness: row.source_completeness, revision: row.revision, indexOutdated: !kb || row.index_version !== kb.index_version, chunkCount: db.prepare('SELECT count(*) n FROM knowledge_chunks WHERE document_id = ?').get(row.id).n, createdAt: row.created_at, updatedAt: row.updated_at, attachments: attachments('knowledge', row.id, row.project_id, row.knowledge_base_id) }; }
   function imageEvidence(type, id, projectId) {
     const rows = db.prepare('SELECT * FROM workspace_attachments WHERE owner_type = ? AND owner_id = ? AND project_id = ? AND deleted_at IS NULL ORDER BY created_at,id').all(type, id, projectId);
     return rows.flatMap((row) => { const meta = parsedMeta(row); return meta.visionFile ? [{ id: row.id, name: row.name, path: path.join(fileDir, meta.visionFile), mimeType: 'image/png', sourceAttachmentId: row.parent_id || row.id }] : []; });
@@ -158,7 +165,9 @@ export function initializeWorkspaceDocuments(db, dataDir) {
     if (requirement.attachments.some((attachment) => attachment.imageCount > 64)) throw new WorkspaceError('需求原件包含超过 64 个嵌入媒体，本轮 AI 不会截取部分图片分析，请拆分文档后重试；原件已完整保留。', 413);
     const sections = requirement.body ? [requirement.body] : [];
     const warnings = [];
-    if (/\.?(?:feishu\.cn|larksuite\.com)\//i.test(requirement.sourceUrl)) warnings.push('飞书来源通过文字接口读取；如原文含图片或页面布局，请另行补充图片附件，不可假定已完整读取。');
+    const source = reqRow(projectId, id);
+    warnings.push(...requirement.sourceWarnings);
+    if (source.source_import_mode !== 'browser' && /\.?(?:feishu\.cn|larksuite\.com)\//i.test(requirement.sourceUrl)) warnings.push('历史飞书来源仅通过文字接口读取；如原文含图片或页面布局，请另行补充图片附件。');
     for (const attachment of requirement.attachments) {
       if (!requirement.body && attachment.extractedText) sections.push(`来源附件：${attachment.name}\n${attachment.extractedText}`);
       warnings.push(...attachment.warnings, ...(attachment.extractionError ? [`${attachment.name}：${attachment.extractionError}`] : []));
@@ -202,7 +211,7 @@ export function initializeWorkspaceDocuments(db, dataDir) {
       if (!content) break; chunks.push({ ...row, content }); count += content.length;
     }
     const images = [];
-    for (const kb of bases) for (const doc of db.prepare('SELECT id,title,source_url FROM knowledge_documents WHERE knowledge_base_id = ? AND deleted_at IS NULL ORDER BY created_at,id').all(kb.id)) {
+    for (const kb of bases) for (const doc of db.prepare('SELECT id,title,source_url,source_warnings,source_import_mode FROM knowledge_documents WHERE knowledge_base_id = ? AND deleted_at IS NULL ORDER BY created_at,id').all(kb.id)) {
       if (chunks.some((chunk) => chunk.documentId === doc.id) || !db.prepare('SELECT 1 FROM knowledge_chunks WHERE document_id = ?').get(doc.id)) {
         for (const attachment of attachments('knowledge', doc.id, projectId, kb.id)) {
           if (includeImages && attachment.imageCount > 64) throw new WorkspaceError('引用的知识文档包含超过 64 个嵌入媒体，AI 不会截取部分图片分析，请拆分原件或减少引用后重试。', 413);
@@ -211,7 +220,8 @@ export function initializeWorkspaceDocuments(db, dataDir) {
           for (const image of attachment.images) if (image.extractionError) warnings.push(`${doc.title}/${image.name}：${image.extractionError}`);
         }
         if (includeImages) images.push(...imageEvidence('knowledge', doc.id, projectId));
-        if (/\.?(?:feishu\.cn|larksuite\.com)\//i.test(doc.source_url)) warnings.push(`${doc.title} 仅同步飞书文字；如含图片请补充原图。`);
+        warnings.push(...JSON.parse(doc.source_warnings).map((warning) => `${doc.title}：${warning}`));
+        if (doc.source_import_mode !== 'browser' && /\.?(?:feishu\.cn|larksuite\.com)\//i.test(doc.source_url)) warnings.push(`${doc.title} 历史来源仅同步飞书文字；如含图片请补充原图。`);
       }
     }
     if (!chunks.length) warnings.push('本地关键词检索未找到匹配文本，不可据此假定知识库不存在相关规则。');
@@ -280,7 +290,7 @@ async function prepareFile(file, service, type, ownerId, projectId) {
 }
 
 export function registerWorkspaceDocumentRoutes(app, options) {
-  const { db, dataDir, broadcast = () => {}, authenticate, readFeishuConfig } = options;
+  const { db, dataDir, broadcast = () => {}, authenticate, browserService } = options;
   const service = initializeWorkspaceDocuments(db, dataDir); service.setDependencies(options);
   const { project, reqRow, kbRow, docRow, need, check, mapRequirement, mapKb, mapDocument, indexDocument } = service;
   const permission = (module, action) => options.requirePermission ? options.requirePermission(module, action) : (req, res, next) => req.user?.role === 'admin' || req.user?.permissions?.[module]?.[action] ? next() : res.status(403).json({ error: 'forbidden', message: '没有此模块的操作权限' });
@@ -300,19 +310,43 @@ export function registerWorkspaceDocumentRoutes(app, options) {
     try { fresh(req, module); project(projectId); const result = operation(groups); req.workspaceUploadsCommitted = true; return result; }
     catch (error) { await Promise.all(groups.flatMap((group) => group.files).map((filename) => fsp.unlink(filename).catch(() => {}))); throw error; }
   }
-  async function sourceText(body, filesPresent) {
+  async function sourceText(body, filesPresent, req, res) {
     let value = text(body.body, '正文'); const sourceUrl = sourceAddress(body.sourceUrl);
+    let imported = null;
     if (!value && !filesPresent && sourceUrl) {
+      const controller = new AbortController();
+      const disconnected = () => { if (!res.writableEnded) controller.abort(); };
+      res.on('close', disconnected);
       try {
-        const config = readFeishuConfig ? await readFeishuConfig() : { appId: process.env.FEISHU_APP_ID, appSecret: process.env.FEISHU_APP_SECRET };
-        value = (await readFeishuDocument(sourceUrl, config)).text;
+        if (!browserService) throw new WorkspaceError('请管理员先连接服务器 Chrome 浏览器扩展，再导入飞书文档。', 503);
+        imported = await browserService.read(sourceUrl, { requester: req.user, signal: controller.signal });
+        value = imported.text;
       } catch (error) {
         if (Number.isInteger(error.status) && error.status >= 400 && error.status < 600) throw new WorkspaceError(error.message, error.status);
-        if (['TimeoutError', 'AbortError'].includes(error.name)) throw new WorkspaceError('飞书来源读取超时，请稍后重试或下载 Word/PDF 后导入。', 504);
-        throw new WorkspaceError('飞书来源暂时无法读取，请检查连接配置和网络，或下载 Word/PDF 后导入。', 502);
-      }
+        if (error.name === 'AbortError') throw new WorkspaceError('飞书文档读取已取消。', 499);
+        if (error.name === 'TimeoutError') throw new WorkspaceError('飞书来源读取超时，请稍后重试或下载原件后导入。', 504);
+        throw new WorkspaceError('飞书来源暂时无法读取，请检查浏览器连接或下载原件后导入。', 502);
+      } finally { res.off('close', disconnected); }
     }
-    return { body: value, sourceUrl };
+    return { body: value, sourceUrl, imported };
+  }
+  async function attachImportedImages(req, imported) {
+    if (!imported?.images?.length) return;
+    const written = [];
+    try {
+      for (const image of imported.images) {
+        const extension = { 'image/png': '.png', 'image/jpeg': '.jpg', 'image/webp': '.webp' }[image.mimeType];
+        if (!extension) throw new WorkspaceError('浏览器返回的图片格式不支持。');
+        const name = uploadFilename(image.name, '飞书图片').replace(/\.[^.]+$/, '') + extension;
+        const filePath = path.join(service.fileDir, crypto.randomUUID() + '.bin');
+        await fsp.writeFile(filePath, image.buffer, { flag: 'wx' });
+        written.push({ path: filePath, originalname: name, size: image.buffer.length });
+      }
+      req.files = [...(req.files || []), ...written];
+    } catch (error) {
+      await Promise.all(written.map((file) => fsp.unlink(file.path).catch(() => {})));
+      throw error;
+    }
   }
   function requirementValues(body, previous = {}) {
     const value = { title: text(body.title, '需求名称', 200, previous.title || ''), body: text(body.body, '正文', 1000000, previous.body || ''), analysis: text(body.analysis, '需求分析', 1000000, previous.analysis || ''), status: body.status ?? previous.status ?? '草稿', priority: body.priority ?? previous.priority ?? 'P2', sourceUrl: sourceAddress(body.sourceUrl, previous.source_url || '') };
@@ -324,11 +358,13 @@ export function registerWorkspaceDocumentRoutes(app, options) {
   route('get', '/api/requirements', 'requirements', 'view', (req, res) => { const projectId = project(req.query.projectId); const q = text(req.query.q, '搜索', 200).toLowerCase(); const status = text(req.query.status, '状态', 20); const rows = db.prepare('SELECT * FROM requirements WHERE project_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC,id').all(projectId); res.json({ requirements: rows.map(mapRequirement).filter((row) => (!status || row.status === status) && (!q || [row.title, row.body, row.analysis, ...row.attachments.map((attachment) => attachment.extractedText)].join('\n').toLowerCase().includes(q))) }); });
   route('get', '/api/requirements/:id', 'requirements', 'view', (req, res) => res.json({ requirement: mapRequirement(need(reqRow(project(req.query.projectId), req.params.id), '需求')) }));
   route('post', '/api/requirements', 'requirements', 'write', async (req, res) => {
-    const projectId = project(req.body?.projectId); const id = crypto.randomUUID(); const source = await sourceText(req.body || {}, Boolean(req.files?.length)); const value = requirementValues({ ...req.body, ...source });
-    if (!value.body && !req.files?.length) throw new WorkspaceError('正文或附件至少填写一项');
+    const projectId = project(req.body?.projectId); const id = crypto.randomUUID(); const source = await sourceText(req.body || {}, Boolean(req.files?.length), req, res); const value = requirementValues({ ...req.body, body: source.body, sourceUrl: source.sourceUrl, title: req.body?.title || source.imported?.name });
+    if (!value.body && !req.files?.length && !source.imported?.images?.length) throw new WorkspaceError('正文或附件至少填写一项');
+    fresh(req, 'requirements'); project(projectId);
+    await attachImportedImages(req, source.imported);
     await writeFiles(req, 'requirement', id, projectId, 'requirements', (groups) => db.transaction(() => {
       const timestamp = now();
-      db.prepare('INSERT INTO requirements (id,project_id,title,body,analysis,status,priority,source_url,revision,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,1,?,?,?)').run(id, projectId, value.title, appendExtracted(value.body, groups), value.analysis, value.status, value.priority, value.sourceUrl, req.user.id, timestamp, timestamp); saveAttachments(groups);
+      db.prepare('INSERT INTO requirements (id,project_id,title,body,analysis,status,priority,source_url,source_warnings,source_completeness,source_import_mode,revision,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,?,?)').run(id, projectId, value.title, appendExtracted(value.body, groups), value.analysis, value.status, value.priority, value.sourceUrl, JSON.stringify(source.imported?.warnings || []), source.imported?.completeness || 'unknown', source.imported ? 'browser' : '', req.user.id, timestamp, timestamp); saveAttachments(groups);
     })());
     emit('requirement.created', projectId, id); res.status(201).json({ requirement: mapRequirement(reqRow(projectId, id)) });
   }, true);
@@ -365,15 +401,17 @@ export function registerWorkspaceDocumentRoutes(app, options) {
     const projectId = project(req.body?.projectId);
     const kb = need(kbRow(projectId, req.params.kbId), '知识库');
     const id = crypto.randomUUID();
-    const source = await sourceText(req.body || {}, Boolean(req.files?.length));
-    const title = text(req.body.title, '文档名称', 200, req.files?.[0] ? uploadFilename(req.files[0].originalname) : '');
+    const source = await sourceText(req.body || {}, Boolean(req.files?.length), req, res);
+    const title = text(req.body.title, '文档名称', 200, req.files?.[0] ? uploadFilename(req.files[0].originalname) : source.imported?.name || '');
     const category = text(req.body.category, '分类', 100);
     if (!title) throw new WorkspaceError('请输入文档名称');
-    if (!source.body && !req.files?.length) throw new WorkspaceError('正文或附件至少填写一项');
+    if (!source.body && !req.files?.length && !source.imported?.images?.length) throw new WorkspaceError('正文或附件至少填写一项');
+    fresh(req, 'knowledge'); project(projectId);
+    await attachImportedImages(req, source.imported);
     await writeFiles(req, 'knowledge', id, projectId, 'knowledge', (groups) => db.transaction(() => {
       const currentKb = need(kbRow(projectId, kb.id), '知识库');
       const timestamp = now();
-      db.prepare('INSERT INTO knowledge_documents (id,project_id,knowledge_base_id,title,body,category,source_url,revision,index_version,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,1,0,?,?,?)').run(id, projectId, kb.id, title, appendExtracted(source.body, groups), category, source.sourceUrl, req.user.id, timestamp, timestamp);
+      db.prepare('INSERT INTO knowledge_documents (id,project_id,knowledge_base_id,title,body,category,source_url,source_warnings,source_completeness,source_import_mode,revision,index_version,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,1,0,?,?,?)').run(id, projectId, kb.id, title, appendExtracted(source.body, groups), category, source.sourceUrl, JSON.stringify(source.imported?.warnings || []), source.imported?.completeness || 'unknown', source.imported ? 'browser' : '', req.user.id, timestamp, timestamp);
       saveAttachments(groups);
       indexDocument(docRow(projectId, kb.id, id), currentKb);
     })());
