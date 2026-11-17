@@ -8,6 +8,7 @@ import {
   Link2,
   LoaderCircle,
   Plus,
+  RefreshCw,
   Settings2,
   Sparkles,
   Trash2,
@@ -55,6 +56,9 @@ function MapBranch({ node, root = false }) {
 export default function AiDocuments({
   config = {},
   projects = [],
+  userId,
+  activeProjectId,
+  registerCloseGuard,
   canWrite,
   canSave,
   isAdmin = false,
@@ -63,6 +67,7 @@ export default function AiDocuments({
   onNotice,
 }) {
   const [documents, setDocuments] = useState([]);
+  const [selectedDocumentIds, setSelectedDocumentIds] = useState(new Set());
   const [previewId, setPreviewId] = useState("");
   const [url, setUrl] = useState("");
   const [dragging, setDragging] = useState(false);
@@ -73,15 +78,39 @@ export default function AiDocuments({
   const [projectId, setProjectId] = useState("");
   const [savedTargets, setSavedTargets] = useState(new Set());
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [cacheReady, setCacheReady] = useState(false);
+  const [cacheStatus, setCacheStatus] = useState("loading");
+  const [cacheRetry, setCacheRetry] = useState(0);
+  const [recovery, setRecovery] = useState(null);
   const input = useRef(null);
   const alive = useRef(true);
   const pending = useRef(new Set());
   const operation = useRef(0);
   const locked = useRef(false);
   const previousWrite = useRef(canWrite);
+  const draftSnapshot = useRef(null);
+  const draftVersion = useRef(null);
+  const saveQueue = useRef(Promise.resolve());
+  const saveRevision = useRef(0);
+  const skipFirstSave = useRef(false);
+  const localBackup = useRef(true);
+  const cloudBackup = useRef(true);
+  const recovering = useRef(false);
+  const localKey = `qzz-ai-documents:${userId || "anonymous"}:${activeProjectId}`;
   useEffect(() => {
     alive.current = true;
+    const unsafe = () => Boolean(draftSnapshot.current && !localBackup.current && !cloudBackup.current);
+    const beforeClose = () => !unsafe() || window.confirm("临时文档草稿未能保存，关闭会丢失当前修改。确定关闭？");
+    const navigation = (event) => { if (!beforeClose()) event.preventDefault(); };
+    const unload = (event) => { if (unsafe()) { event.preventDefault(); event.returnValue = ""; } };
+    registerCloseGuard?.(beforeClose);
+    window.addEventListener("qzz-before-navigate", navigation);
+    window.addEventListener("beforeunload", unload);
     return () => {
+      if (draftSnapshot.current && !cloudBackup.current) queueDraftSave(draftSnapshot.current);
+      registerCloseGuard?.(null);
+      window.removeEventListener("qzz-before-navigate", navigation);
+      window.removeEventListener("beforeunload", unload);
       alive.current = false;
       operation.current += 1;
       pending.current.forEach((controller) => controller.abort());
@@ -90,13 +119,34 @@ export default function AiDocuments({
   useEffect(() => {
     const token = ++operation.current;
     locked.current = true;
-    call("/api/ai/documents")
-      .then((data) => {
-        if (alive.current && operation.current === token)
-          setDocuments(data.documents || []);
+    Promise.all([call("/api/ai/documents"), call(`/api/ai/draft?projectId=${encodeURIComponent(activeProjectId)}`)])
+      .then(([data, cached]) => {
+        if (alive.current && operation.current === token) {
+          const rows = data.documents || [];
+          setDocuments(rows);
+          draftVersion.current = cached.saved?.updatedAt ?? null;
+          let local = null;
+          try { local = JSON.parse(localStorage.getItem(localKey) || "null"); } catch { /* Use cloud copy. */ }
+          const state = local && local.baseUpdatedAt === draftVersion.current ? local.state : cached.saved?.state;
+          if (local && local.baseUpdatedAt !== draftVersion.current) {
+            setRecovery(local);
+            try { localStorage.setItem(`${localKey}:recovery`, JSON.stringify(local)); } catch { /* Keep in memory. */ }
+            setCacheStatus("conflict");
+          } else {
+            try { setRecovery(JSON.parse(localStorage.getItem(`${localKey}:recovery`) || "null")); } catch { setRecovery(null); }
+            setCacheStatus("saved");
+          }
+          skipFirstSave.current = !local || local.baseUpdatedAt !== draftVersion.current;
+          restoreLegacyState(state, rows);
+          setCacheReady(true);
+        }
       })
       .catch((failure) => {
-        if (operation.current === token) report(failure);
+        if (operation.current === token) {
+          setCacheReady(false);
+          setCacheStatus("load-error");
+          report(failure);
+        }
       })
       .finally(() => {
         if (alive.current && operation.current === token) {
@@ -104,7 +154,53 @@ export default function AiDocuments({
           setBusy("");
         }
       });
-  }, []);
+  }, [activeProjectId, cacheRetry]);
+  function restoreLegacyState(state, rows) {
+    const originalIds = Array.isArray(state?.selectedDocumentIds) ? state.selectedDocumentIds : rows.slice(0, 5).map((row) => row.id);
+    const selectedIds = originalIds.filter((id) => rows.some((row) => row.id === id)).slice(0, 5);
+    setSelectedDocumentIds(new Set(selectedIds));
+    setResult(originalIds.length === selectedIds.length && state?.result && typeof state.result === "object" ? state.result : null);
+    setAnswers(typeof state?.answers === "string" ? state.answers : "");
+    setProjectId(typeof state?.projectId === "string" ? state.projectId : activeProjectId);
+    setPreviewId(typeof state?.previewId === "string" ? state.previewId : "");
+    setSavedTargets(new Set(Array.isArray(state?.savedTargets) ? state.savedTargets : []));
+    if (originalIds.length !== selectedIds.length) setError("部分策划文档已移除，旧生成结果不再适用，请重新生成");
+  }
+  function queueDraftSave(snapshot) {
+    const saving = saveQueue.current.then(async () => {
+      const result = await request("/api/ai/draft", { method: "PUT", body: JSON.stringify({ ...snapshot, baseUpdatedAt: draftVersion.current }) });
+      draftVersion.current = result.updatedAt;
+      return result;
+    });
+    saveQueue.current = saving.catch(() => {});
+    return saving;
+  }
+  draftSnapshot.current = cacheReady && canWrite ? {
+    projectId: activeProjectId,
+    state: { result, answers, projectId, previewId, selectedDocumentIds: [...selectedDocumentIds], savedTargets: [...savedTargets] },
+  } : null;
+  useEffect(() => {
+    const snapshot = draftSnapshot.current;
+    if (!snapshot) return;
+    if (skipFirstSave.current) { skipFirstSave.current = false; return; }
+    const revision = ++saveRevision.current;
+    cloudBackup.current = false;
+    try { localStorage.setItem(localKey, JSON.stringify({ ...snapshot, baseUpdatedAt: draftVersion.current })); localBackup.current = true; }
+    catch { localBackup.current = false; }
+    setCacheStatus(localBackup.current ? "saving" : "failed");
+    const timer = setTimeout(() => queueDraftSave(snapshot)
+      .then(() => { if (alive.current && revision === saveRevision.current) {
+        cloudBackup.current = true;
+        try { localStorage.removeItem(localKey); } catch { /* Cloud copy is durable. */ }
+        if (recovering.current) {
+          try { localStorage.removeItem(`${localKey}:recovery`); } catch { /* Cloud copy is durable. */ }
+          recovering.current = false;
+        }
+        setCacheStatus("saved");
+      } })
+      .catch(() => { if (alive.current && revision === saveRevision.current) setCacheStatus(localBackup.current ? "error" : "failed"); }), 450);
+    return () => clearTimeout(timer);
+  }, [cacheReady, activeProjectId, result, answers, projectId, previewId, selectedDocumentIds, savedTargets, canWrite]);
   useEffect(() => {
     if (projectId && !projects.some((project) => project.id === projectId))
       setProjectId("");
@@ -138,11 +234,11 @@ export default function AiDocuments({
     setSavedTargets(new Set());
   }
   async function importSources(files, link) {
-    if (!canWrite || locked.current) return;
+    if (!canWrite || !cacheReady || locked.current) return;
     const selected = files ? Array.from(files) : [];
     if (!selected.length && !link?.trim()) return;
-    if (selected.length + documents.length + (link ? 1 : 0) > 5) {
-      setError("每次最多使用 5 份策划文档");
+    if (selected.length + documents.length + (link ? 1 : 0) > 20) {
+      setError("当前账号最多保留 20 份策划文档，请先移除旧文档");
       return;
     }
     if (
@@ -169,6 +265,7 @@ export default function AiDocuments({
         const data = await call("/api/ai/documents", { method: "POST", body });
         if (!alive.current || operation.current !== token) return;
         setDocuments((current) => [...current, data.document]);
+        setSelectedDocumentIds((current) => current.size < 5 ? new Set([...current, data.document.id]) : current);
         setPreviewId(data.document.id);
         invalidateResult();
       }
@@ -184,7 +281,7 @@ export default function AiDocuments({
     }
   }
   async function removeDocument(document) {
-    if (!canWrite || locked.current) return;
+    if (!canWrite || !cacheReady || locked.current) return;
     locked.current = true;
     setBusy("remove");
     setError("");
@@ -196,6 +293,7 @@ export default function AiDocuments({
       setDocuments((current) =>
         current.filter((doc) => doc.id !== document.id),
       );
+      setSelectedDocumentIds((current) => { const next = new Set(current); next.delete(document.id); return next; });
       if (previewId === document.id) setPreviewId("");
       invalidateResult();
     } catch (failure) {
@@ -210,9 +308,10 @@ export default function AiDocuments({
   async function generate(confirmed = false) {
     if (
       !canWrite ||
+      !cacheReady ||
       locked.current ||
       !config.aiConfigured ||
-      !documents.length
+      !selectedDocumentIds.size
     )
       return;
     const token = ++operation.current;
@@ -223,13 +322,13 @@ export default function AiDocuments({
       const data = await call("/api/ai/generate", {
         method: "POST",
         body: JSON.stringify({
-          documentIds: documents.map((doc) => doc.id),
+          documentIds: [...selectedDocumentIds],
           clarifications: answers.trim(),
           confirmed,
         }),
       });
       if (!alive.current || operation.current !== token) return;
-      setResult(data);
+        setResult(data);
       setSavedTargets(new Set());
     } catch (failure) {
       if (operation.current === token) report(failure);
@@ -250,6 +349,7 @@ export default function AiDocuments({
   async function save() {
     if (
       !canSave ||
+      !cacheReady ||
       locked.current ||
       !projectId ||
       !result?.tree ||
@@ -308,7 +408,7 @@ export default function AiDocuments({
   }
   const preview = documents.find((doc) => doc.id === previewId) || documents[0];
   const noGenerate =
-    !canWrite || !config.aiConfigured || !documents.length || Boolean(busy);
+    !canWrite || !cacheReady || !config.aiConfigured || !selectedDocumentIds.size || Boolean(busy);
   return (
     <section className="workspace-section ai-documents-section">
       <div className="section-heading">
@@ -348,6 +448,16 @@ export default function AiDocuments({
           <span>当前账号没有生成权限，请联系管理员。</span>
         </div>
       )}
+      {(cacheReady || cacheStatus === "load-error") && <div className={`ai-cache-status ${recovery || ["error", "failed", "load-error"].includes(cacheStatus) ? "error" : ""}`} role="status">
+        <span>{recovery ? "本机有未同步草稿，云端也已更新" : cacheStatus === "saving" ? "草稿保存中" : cacheStatus === "failed" ? "草稿保存失败，请检查网络和本机空间" : cacheStatus === "error" ? "草稿云端保存失败，本机副本已保留" : cacheStatus === "load-error" ? "草稿读取失败，暂不可编辑" : "草稿已自动保存"}</span>
+        {recovery && <button type="button" className="text-button" onClick={() => {
+          restoreLegacyState(recovery.state, documents);
+          setRecovery(null);
+          recovering.current = true;
+          skipFirstSave.current = false;
+        }}>恢复本机副本</button>}
+        {cacheStatus === "load-error" && <button type="button" className="icon-button" aria-label="重试读取草稿" title="重试读取草稿" onClick={() => setCacheRetry((value) => value + 1)}><RefreshCw size={15} /></button>}
+      </div>}
       {error && (
         <div className="inline-error ai-document-error" role="alert">
           <AlertCircle size={17} />
@@ -368,7 +478,7 @@ export default function AiDocuments({
         <div className="ai-source-column">
           <div className="ai-source-heading">
             <h2>策划文档</h2>
-            <span>{documents.length} / 5</span>
+            <span>本轮 {selectedDocumentIds.size} / 5 · 已存 {documents.length}</span>
           </div>
           <input
             ref={input}
@@ -382,7 +492,7 @@ export default function AiDocuments({
             className={`ai-document-drop ${dragging ? "dragging" : ""}`}
             onDragOver={(event) => {
               event.preventDefault();
-              if (canWrite && !busy) setDragging(true);
+              if (canWrite && cacheReady && !busy) setDragging(true);
             }}
             onDragLeave={(event) => {
               if (!event.currentTarget.contains(event.relatedTarget))
@@ -404,7 +514,7 @@ export default function AiDocuments({
             <button
               type="button"
               className="button secondary"
-              disabled={!canWrite || Boolean(busy) || documents.length >= 5}
+              disabled={!canWrite || !cacheReady || Boolean(busy) || documents.length >= 20}
               onClick={() => input.current?.click()}
             >
               <Plus size={16} />
@@ -427,7 +537,7 @@ export default function AiDocuments({
                   placeholder="https://…feishu.cn/docx/…"
                   value={url}
                   onChange={(event) => setUrl(event.target.value)}
-                  disabled={!canWrite || Boolean(busy)}
+                  disabled={!canWrite || !cacheReady || Boolean(busy)}
                   aria-label="飞书云文档地址"
                   required
                   maxLength={2000}
@@ -439,9 +549,10 @@ export default function AiDocuments({
               className="button secondary"
               disabled={
                 !canWrite ||
+                !cacheReady ||
                 Boolean(busy) ||
                 !url.trim() ||
-                documents.length >= 5
+                documents.length >= 20
               }
             >
               导入链接
@@ -453,11 +564,22 @@ export default function AiDocuments({
             <div className="ai-document-list">
               {documents.map((document) => (
                 <div
-                  className={`ai-source-item ${preview?.id === document.id ? "selected" : ""}`}
+                  className={`ai-source-item ${selectedDocumentIds.has(document.id) ? "selected" : ""}`}
                   key={document.id}
                 >
+                  <input type="checkbox" aria-label={`引用 ${document.name}`} checked={selectedDocumentIds.has(document.id)} disabled={!canWrite || !cacheReady || Boolean(busy) || !selectedDocumentIds.has(document.id) && selectedDocumentIds.size >= 5}
+                    onChange={(event) => {
+                      setSelectedDocumentIds((current) => {
+                        const next = new Set(current);
+                        if (event.target.checked && next.size < 5) next.add(document.id);
+                        else if (!event.target.checked) next.delete(document.id);
+                        return next;
+                      });
+                      invalidateResult();
+                    }} />
                   <button
                     type="button"
+                    className="ai-source-preview-button"
                     onClick={() => setPreviewId(document.id)}
                     title={document.name}
                   >
@@ -474,7 +596,7 @@ export default function AiDocuments({
                       className="icon-button danger"
                       title={`移除 ${document.name}`}
                       aria-label={`移除 ${document.name}`}
-                      disabled={Boolean(busy)}
+                      disabled={Boolean(busy) || !cacheReady}
                       onClick={() => removeDocument(document)}
                     >
                       <Trash2 size={16} />
@@ -550,7 +672,7 @@ export default function AiDocuments({
                   value={answers}
                   onChange={(event) => setAnswers(event.target.value)}
                   maxLength={12000}
-                  disabled={Boolean(busy) || !canWrite}
+                  disabled={Boolean(busy) || !cacheReady || !canWrite}
                   placeholder="按问题编号补充已确认的规则"
                 />
               </label>
@@ -598,7 +720,7 @@ export default function AiDocuments({
                     aria-label="保存到项目组"
                     value={projectId}
                     onChange={(event) => setProjectId(event.target.value)}
-                    disabled={Boolean(busy) || !canSave}
+                    disabled={Boolean(busy) || !cacheReady || !canSave}
                   >
                     <option value="">请选择项目组</option>
                     {projects.map((project) => (
@@ -614,6 +736,7 @@ export default function AiDocuments({
                   onClick={save}
                   disabled={
                     !canSave ||
+                    !cacheReady ||
                     !projectId ||
                     Boolean(busy) ||
                     !result.title.trim() ||

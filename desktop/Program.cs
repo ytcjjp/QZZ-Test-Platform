@@ -66,7 +66,6 @@ internal sealed class Settings
 {
     public int Port { get; set; } = 3210;
     public bool AutoStart { get; set; }
-    public int MaxUploadMb { get; set; } = 100;
     public string AiBaseUrl { get; set; } = "https://api.openai.com/v1/";
     public string AiModel { get; set; } = "";
     public string EncryptedAiKey { get; set; } = "";
@@ -82,7 +81,6 @@ internal sealed class ControlWindow : Form
     private readonly NotifyIcon tray;
     private readonly HttpClient http = new() { Timeout = TimeSpan.FromSeconds(1) };
     private readonly NumericUpDown portInput = new() { Minimum = 1024, Maximum = 65535, Width = 110 };
-    private readonly NumericUpDown uploadInput = new() { Minimum = 1, Maximum = 1024, Width = 110 };
     private readonly CheckBox autoStartInput = new() { Text = "登录 Windows 后自动开启服务", AutoSize = true };
     private readonly TextBox aiUrlInput = new() { Width = 350 };
     private readonly TextBox aiModelInput = new() { Width = 240 };
@@ -134,7 +132,6 @@ internal sealed class ControlWindow : Form
 
         BuildLayout();
         portInput.Value = Math.Clamp(settings.Port, 1024, 65535);
-        uploadInput.Value = Math.Clamp(settings.MaxUploadMb, 1, 1024);
         autoStartInput.Checked = settings.AutoStart;
         aiUrlInput.Text = settings.AiBaseUrl;
         aiModelInput.Text = settings.AiModel;
@@ -233,8 +230,6 @@ internal sealed class ControlWindow : Form
         configTab.Controls.Add(config);
         config.Controls.Add(new Label { Text = "服务端口", AutoSize = true });
         config.Controls.Add(portInput);
-        config.Controls.Add(new Label { Text = "单个文件上传上限 (MB)", AutoSize = true });
-        config.Controls.Add(uploadInput);
         config.Controls.Add(autoStartInput);
         config.Controls.Add(new Label { Text = " ", Height = 12 });
         config.Controls.Add(new Label { Text = "AI 接口地址", AutoSize = true });
@@ -289,7 +284,6 @@ internal sealed class ControlWindow : Form
             var updated = new Settings
             {
                 Port = (int)portInput.Value,
-                MaxUploadMb = (int)uploadInput.Value,
                 AutoStart = autoStartInput.Checked,
                 AiBaseUrl = aiUrl.ToString(),
                 AiModel = aiModelInput.Text.Trim(),
@@ -389,7 +383,6 @@ internal sealed class ControlWindow : Form
             };
             process.StartInfo.ArgumentList.Add(Path.Combine(root, "server", "index.js"));
             process.StartInfo.Environment["PORT"] = port.ToString();
-            process.StartInfo.Environment["MAX_UPLOAD_MB"] = settings.MaxUploadMb.ToString();
             process.StartInfo.Environment["AI_BASE_URL"] = settings.AiBaseUrl;
             process.StartInfo.Environment["AI_MODEL"] = settings.AiModel;
             if (!string.IsNullOrWhiteSpace(settings.EncryptedAiKey))

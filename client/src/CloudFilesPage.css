@@ -1,0 +1,81 @@
+.cloud-breadcrumbs {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+  min-height: 38px;
+  margin: -8px 0 18px;
+  color: #82928e;
+}
+
+.cloud-breadcrumbs button {
+  border: 0;
+  padding: 4px 2px;
+  background: none;
+  color: #537a73;
+  font: inherit;
+  cursor: pointer;
+  max-width: min(260px, 65vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cloud-breadcrumbs button[aria-current="page"] {
+  color: #273e3f;
+  font-weight: 700;
+  cursor: default;
+}
+
+.cloud-folder-name {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 100%;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: #314849;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.cloud-folder-name > span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cloud-folder-name:hover,
+.cloud-breadcrumbs button:not([aria-current="page"]):hover {
+  color: #087a68;
+}
+
+.cloud-folder-icon {
+  background: #edf3f9;
+  color: #44789b;
+}
+
+.cloud-folder-dialog {
+  width: min(460px, calc(100vw - 32px));
+}
+
+.cloud-folder-dialog .modal-form {
+  padding-top: 22px;
+}
+
+.cloud-folder-dialog select {
+  width: 100%;
+}
+
+@media (max-width: 680px) {
+  .cloud-files-section .heading-actions {
+    flex-wrap: wrap;
+  }
+
+  .cloud-files-section .heading-actions .button {
+    flex: 1 1 auto;
+    justify-content: center;
+  }
+}

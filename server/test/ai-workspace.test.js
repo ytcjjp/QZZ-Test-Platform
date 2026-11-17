@@ -7,6 +7,7 @@ import path from 'node:path';
 import { PassThrough, Writable } from 'node:stream';
 import { test } from 'node:test';
 import express from 'express';
+import Database from 'better-sqlite3';
 import sharp from 'sharp';
 import { generateWorkspaceTask, normalizeWorkspaceOutput, PLAN_SECTIONS, registerAiWorkspaceRoutes, WORKSPACE_SCHEMAS } from '../ai-workspace.js';
 import { runCodexData, prepareVisionImages } from '../codex-generator.js';
@@ -245,4 +246,56 @@ test('workspace API checks project and module dependencies, rejects stale requir
     behavior = async (values) => { assert.deepEqual(values.points, points().points); return { type: 'cases' }; };
     assert.equal((await post({ task: 'revise', draft: published, points: [] })).status, 200);
   } finally { server.closeAllConnections(); await new Promise((resolve) => server.close(resolve)); await fs.rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }); }
+});
+
+test('AI draft cache is durable per user, project and requirement with permission checks', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'qzz-ai-drafts-'));
+  const db = new Database(path.join(directory, 'drafts.db'));
+  const app = express(); app.use(express.json({ limit: '4mb' }));
+  const full = { ai: { write: true }, requirements: { view: true }, knowledge: { view: true }, cases: { write: true } };
+  const users = {
+    alice: { id: 'alice', role: 'member', permissions: structuredClone(full) },
+    bob: { id: 'bob', role: 'member', permissions: structuredClone(full) },
+    restricted: { id: 'restricted', role: 'member', permissions: structuredClone(full) },
+  };
+  users.restricted.permissions.ai.write = false;
+  app.use((req, res, next) => { req.user = users[req.headers['x-user'] || 'alice']; next(); });
+  const deleted = new Set();
+  const workspace = { getRequirement: (projectId, id) => projectId === 'project-1' && ['requirement-1', 'requirement-2'].includes(id) && !deleted.has(id) ? { id } : null };
+  registerAiWorkspaceRoutes(app, { db, dataDir: directory, workspace, requireProject: (id) => { if (!['project-1', 'project-2'].includes(id)) throw Object.assign(new Error('项目不存在'), { status: 400 }); }, authenticate: () => users.alice, sendError: (res, status, code, message) => res.status(status).json({ error: code, message }) });
+  const server = http.createServer(app); await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const state = { mode: 'staged', history: [{ role: 'assistant', content: '测试点已生成' }], knowledgeBaseIds: [], draft: { type: 'points', requirementId: 'requirement-1', points: [{ id: 'point-1', title: '登录' }] }, answers: { question: '已确认' }, written: [] };
+  async function call(method, projectId, requirementId, user = 'alice', payload = state, baseUpdatedAt) {
+    const query = new URLSearchParams({ projectId, ...(requirementId ? { requirementId } : {}) });
+    const response = await fetch(`${base}/api/workspace/ai-draft${method === 'GET' ? `?${query}` : ''}`, { method, headers: { 'content-type': 'application/json', 'x-user': user }, ...(method === 'PUT' ? { body: JSON.stringify({ projectId, requirementId, state: payload, ...(baseUpdatedAt !== undefined ? { baseUpdatedAt } : {}) }) } : {}) });
+    return { status: response.status, body: await response.json() };
+  }
+  try {
+    assert.equal((await call('PUT', 'project-1', 'requirement-1', 'alice', state, null)).status, 200);
+    const original = (await call('GET', 'project-1', 'requirement-1')).body.saved;
+    assert.deepEqual(original.state, state);
+    assert.equal((await call('PUT', 'project-1', 'requirement-1', 'alice', { ...state, instructions: '旧窗口覆盖' }, original.updatedAt - 1)).status, 409);
+    assert.deepEqual((await call('GET', 'project-1', 'requirement-1')).body.saved.state, state);
+    assert.equal((await call('PUT', 'project-1', 'requirement-1', 'alice', state, original.updatedAt)).status, 200);
+    assert.equal((await call('GET', 'project-1', 'requirement-1', 'bob')).body.saved, null);
+    assert.equal((await call('GET', 'project-2')).body.saved, null);
+    assert.equal((await call('GET', 'project-1', 'requirement-1', 'restricted')).status, 403);
+    assert.equal((await call('PUT', 'project-1', 'missing')).status, 404);
+    assert.equal((await call('PUT', 'project-1', 'requirement-1', 'restricted')).status, 403);
+    assert.equal((await call('PUT', 'project-1', 'requirement-1', 'alice', { ...state, draft: { ...state.draft, requirementId: 'requirement-2' } })).status, 400);
+    assert.equal((await call('PUT', 'project-1', 'requirement-2', 'alice', { ...state, draft: null })).status, 200);
+    assert.equal((await call('GET', 'project-1')).body.saved.requirementId, 'requirement-2');
+    deleted.add('requirement-2');
+    assert.equal((await call('GET', 'project-1')).body.saved.requirementId, 'requirement-1');
+    users.alice.permissions.knowledge.view = false;
+    assert.equal((await call('PUT', 'project-1', 'requirement-1', 'alice', { ...state, knowledgeBaseIds: ['kb-1'] })).status, 403);
+    users.alice.permissions.knowledge.view = true;
+    users.alice.permissions.cases.write = false;
+    assert.equal((await call('PUT', 'project-1', 'requirement-1', 'alice', { ...state, draft: { type: 'cases', requirementId: 'requirement-1' } })).status, 403);
+    assert.equal(db.prepare('SELECT count(*) count FROM ai_workspace_drafts').get().count, 2);
+  } finally {
+    server.closeAllConnections(); await new Promise((resolve) => server.close(resolve));
+    db.close(); await fs.rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  }
 });

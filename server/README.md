@@ -175,7 +175,13 @@ AI 临时来源仅保存正文，图片应导入项目需求或知识库后参�
 超过 180 秒自动取消。安装及边界见 [浏览器导入说明](../docs/browser-import.md)。
 本轮仅用模拟扩展与 DOM 测试，尚未验证真实飞书页面及企业账号权限。
 
-工具云盘上传上限默认 100 MB，可用 `MAX_UPLOAD_MB` 调整；此设置不改变上述导入限制。
+工具云盘支持多级文件夹、文件移动、空文件夹删除。`GET /api/files?folderId=...` 返回当前目录的
+`files`、`folders`、`path` 和 `allFolders`；旧文件仍在根目录。`POST /api/files/folders` 传
+`{name,parentId?}`，`PUT /api/files/folders/:id` 传 `{name}`，`DELETE` 只允许空文件夹；
+`PATCH /api/files/:id` 传 `{folderId:null|id}` 移动文件。上传至指定目录用
+`POST /api/files?folderId=...`，不传时上传到根目录。应用不再设置单文件大小上限，
+`MAX_UPLOAD_MB` 已停用；上传允许持续超过 Node 默认的五分钟整请求时间，但连接空闲
+两分钟会断开。实际可上传大小仍取决于剩余磁盘空间、浏览器和网络代理限制。
 新上传文件名统一修复 multipart UTF-8 被按 Latin-1 解码的问题，保留原生 Unicode 文件名，
 下载仍返回原始内容；不自动重写历史文件记录。
 

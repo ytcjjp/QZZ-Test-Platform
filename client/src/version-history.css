@@ -1,0 +1,113 @@
+.version-trigger {
+  width: 100%;
+  min-height: 32px;
+  border: 0;
+  background: transparent;
+  color: #a9c9be;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 0 13px;
+  font-size: 11px;
+  text-align: left;
+  white-space: nowrap;
+  border-radius: 6px;
+}
+.version-trigger:hover {
+  color: white;
+  background: #304647;
+}
+.sidebar-collapsed .version-trigger {
+  justify-content: center;
+  padding: 0;
+}
+.sidebar-collapsed .version-trigger span {
+  display: none;
+}
+.version-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: #102d2ab3;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+}
+.version-dialog {
+  background: #fff;
+  color: #263d38;
+  border-radius: 8px;
+  width: min(560px, 100%);
+  max-height: min(680px, calc(100dvh - 40px));
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 24px 60px #102d2a38;
+}
+.version-dialog-head {
+  padding: 22px 24px 16px;
+  border-bottom: 1px solid #e2eae7;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 14px;
+}
+.version-dialog h2 {
+  font-size: 18px;
+  margin: 5px 0 0;
+}
+.version-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 24px;
+  overflow-y: auto;
+}
+.version-list li {
+  padding: 16px 0;
+  border-bottom: 1px solid #e8efeb;
+}
+.version-list li:last-child {
+  border-bottom: 0;
+}
+.version-list li > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: baseline;
+}
+.version-list strong {
+  color: #157f73;
+  font-size: 13px;
+}
+.version-list time,
+.version-note {
+  color: #73877e;
+  font-size: 11px;
+}
+.version-list p {
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.version-note {
+  margin: 0;
+  padding: 14px 24px 20px;
+  border-top: 1px solid #e2eae7;
+}
+@media (max-width: 720px) {
+  .sidebar-collapsed .version-trigger {
+    justify-content: flex-start;
+    padding: 0 13px;
+  }
+  .sidebar-collapsed .version-trigger span {
+    display: initial;
+  }
+  .version-dialog-head,
+  .version-note {
+    padding-left: 18px;
+    padding-right: 18px;
+  }
+  .version-list {
+    padding: 0 18px;
+  }
+}

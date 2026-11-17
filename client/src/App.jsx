@@ -4,14 +4,17 @@ import ProjectsPage, { ProjectContext, ProjectIcon } from './Projects';
 import CaseSetsPage from './CaseSetsPage';
 import DefectsPage from './DefectsPage';
 import AiWorkspace from './AiWorkspace';
+import CloudFilesPage from './CloudFilesPage';
+import BrandMark from './BrandMark';
+import VersionHistory from './VersionHistory';
 import { RequirementsPage, KnowledgePage } from './WorkspaceDocuments';
 import { DEFECT_STATUSES, defectStatusClass } from './defect-status';
 import {
-  AlertCircle, ArrowDownToLine, ArrowUpRight, Bot, Bug, Check, Copy,
-  ChevronDown, ChevronRight, CircleHelp, CloudUpload, Database,
+  AlertCircle, ArrowUpRight, Bot, Bug, Check, Copy,
+  ChevronDown, ChevronRight, CircleHelp, Database,
   Eye, EyeOff, FileText, Filter, FolderOpen, LayoutDashboard, LogOut, Menu,
   PanelLeftClose, PanelLeftOpen, Pencil, Plus,
-  RefreshCw, Search, ShieldCheck, Sparkles, Trash2, Upload,
+  RefreshCw, Search, ShieldCheck, Sparkles, Trash2,
   Users, Wifi, WifiOff, X, KeyRound,
 } from 'lucide-react';
 
@@ -81,13 +84,6 @@ function displayDate(value) {
   }).format(date);
 }
 
-function fileSize(bytes) {
-  if (typeof bytes !== 'number') return '—';
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-}
-
 function prepareGenerated(record, module) {
   const priority = { critical: 'P0', high: 'P1', medium: 'P2', low: 'P3' }[record.priority] || record.priority || 'P2';
   return { ...record, module: record.module || module, priority, status: '未执行' };
@@ -127,7 +123,7 @@ function Login({ onLogin, busy, error }) {
     await onLogin(username.trim(), password, remember, register);
   }
   return <div className="login-page">
-    <div className="login-top"><div className="brand-mark">Q</div><span>QZZ <strong>公共测试平台</strong></span></div>
+    <div className="login-top"><BrandMark /><span>QZZ <strong>公共测试平台</strong></span></div>
     <main className="login-main">
       <div className="login-intro"><span className="eyebrow">INTERNAL WORKSPACE</span><h1>游戏测试协作平台</h1><p>用例、缺陷与工具集中管理，团队进度实时同步。</p></div>
       <form className="login-panel" onSubmit={submit}>
@@ -141,7 +137,7 @@ function Login({ onLogin, busy, error }) {
         <button className="button primary login-submit" type="submit" disabled={busy || !username.trim() || !password}>{busy ? '正在处理…' : <>{register ? '注册并进入' : '进入平台'} <ArrowUpRight size={17} /></>}</button>
       </form>
     </main>
-    <div className="login-bottom">QZZ · 仅供内部测试协作使用</div>
+    <div className="login-bottom"><VersionHistory /><span>QZZ · 仅供内部测试协作使用</span></div>
   </div>;
 }
 
@@ -186,26 +182,6 @@ function RecordDetail({ kind, record, onClose, onEdit, onDelete, canWrite }) {
       {canWrite && <div className="drawer-actions"><button className="button secondary" type="button" onClick={onDelete}><Trash2 size={16} /> 删除</button><button className="button primary" type="button" onClick={onEdit}><Pencil size={16} /> 编辑</button></div>}
     </aside>
   </div>;
-}
-
-
-function FilesPage({ files, loading, maxUploadMb, onUpload, onDelete, onRefresh, showError, canWrite }) {
-  const inputRef = useRef(null);
-  const [uploading, setUploading] = useState(false);
-  const [dragging, setDragging] = useState(false);
-  async function upload(file) {
-    if (!file) return;
-    if (maxUploadMb && file.size > maxUploadMb * 1024 * 1024) { showError(`文件不能超过 ${maxUploadMb} MB`); return; }
-    setUploading(true);
-    try { await onUpload(file); }
-    catch (error) { showError(error.message); }
-    finally { setUploading(false); if (inputRef.current) inputRef.current.value = ''; }
-  }
-  return <section className="workspace-section files-section"><div className="section-heading"><div><span className="eyebrow">TEAM FILES</span><h1>测试工具云盘</h1><p>共享安装包、测试工具与团队资料</p></div><div className="heading-actions"><IconButton icon={RefreshCw} label="刷新" onClick={onRefresh} disabled={loading} /><button className="button primary" type="button" onClick={() => inputRef.current?.click()} disabled={!canWrite || uploading}><Upload size={17} /> 上传文件</button></div></div>
-    <input ref={inputRef} type="file" hidden onChange={(event) => upload(event.target.files?.[0])} />
-    {canWrite && <div className={`upload-zone ${dragging ? 'dragging' : ''}`} onDragOver={(event) => { event.preventDefault(); setDragging(true); }} onDragLeave={(event) => { event.preventDefault(); setDragging(false); }} onDrop={(event) => { event.preventDefault(); setDragging(false); upload(event.dataTransfer.files?.[0]); }}><div className="upload-icon"><CloudUpload size={24} /></div><div><strong>{uploading ? '正在上传…' : '拖放文件到这里'}</strong><span>或 <button type="button" className="text-button" onClick={() => inputRef.current?.click()} disabled={!canWrite || uploading}>选择文件</button> 上传{maxUploadMb ? `，单个文件最大 ${maxUploadMb} MB` : ''}</span></div></div>}
-    <div className="table-surface files-table"><div className="files-table-title"><h2>团队文件</h2><span>{files.length} 个文件</span></div>{loading && files.length === 0 ? <div className="loading-state"><RefreshCw size={18} className="spin" /> 加载中…</div> : files.length === 0 ? <Empty icon={FolderOpen} title="还没有共享文件" detail="上传工具或资料后，团队成员即可下载。" /> : <div className="table-scroll"><table><thead><tr><th>文件名</th><th>大小</th><th>上传人</th><th>上传时间</th><th className="actions-col">操作</th></tr></thead><tbody>{files.map((file) => <tr key={file.id}><td><div className="file-name"><span className="file-icon"><FileText size={19} /></span><span title={file.name}>{file.name}</span></div></td><td>{fileSize(file.size)}</td><td>{file.uploadedBy || file.createdBy || '—'}</td><td className="date-cell">{displayDate(file.createdAt || file.uploadedAt)}</td><td className="actions-col"><div className="row-actions"><a className="icon-button" href={`/api/files/${encodeURIComponent(file.id)}/download`} title={`下载 ${file.name}`} aria-label={`下载 ${file.name}`}><ArrowDownToLine size={17} /></a>{canWrite && <IconButton icon={Trash2} label={`删除 ${file.name}`} danger onClick={() => onDelete(file)} />}</div></td></tr>)}</tbody></table></div>}</div>
-  </section>;
 }
 
 
@@ -284,7 +260,7 @@ function UsersDialog({ onClose, onChanged }) {
 
 export default function App() {
   const [user, setUser] = useState(undefined);
-  const [config, setConfig] = useState({ aiConfigured: false, maxUploadMb: null });
+  const [config, setConfig] = useState({ aiConfigured: false });
   const [loginBusy, setLoginBusy] = useState(false);
   const [loginError, setLoginError] = useState('');
   const [active, setActive] = useState('cases');
@@ -295,7 +271,6 @@ export default function App() {
   const [selectedProjectId, setSelectedProjectId] = useState(null);
   const [cases, setCases] = useState([]);
   const [defects, setDefects] = useState([]);
-  const [files, setFiles] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [toast, setToast] = useState('');
@@ -326,7 +301,7 @@ export default function App() {
     const previous = contextRef.current.user;
     if (previous?.id !== next?.id || !next) {
       authEpoch.current += 1;
-      changeProject(null); setProjects([]); setFiles([]);
+      changeProject(null); setProjects([]);
       setUsersOpen(false); setPasswordOpen(false);
     } else if (!permitted(next, contextRef.current.active) && contextRef.current.projectId) changeProject(null);
     contextRef.current.user = next;
@@ -367,10 +342,9 @@ export default function App() {
       if (!current()) return [];
       const canLoadProjects = currentUser.role === 'admin' || ['cases', 'defects', 'requirements', 'knowledge', 'ai'].some((module) => permitted(currentUser, module));
       const scoped = ['cases', 'defects'].includes(snapshot.active) && snapshot.projectId && permitted(currentUser, snapshot.active);
-      const [projectData, recordData, fileData] = await Promise.all([
+      const [projectData, recordData] = await Promise.all([
         canLoadProjects ? api('/api/projects') : Promise.resolve({ projects: [] }),
         scoped ? api(`/api/${snapshot.active}?projectId=${encodeURIComponent(snapshot.projectId)}`) : Promise.resolve({}),
-        snapshot.active === 'files' && permitted(currentUser, 'files') ? api('/api/files') : Promise.resolve({}),
       ]);
       if (!current()) return [];
       const latestProjects = projectData.projects || [];
@@ -378,7 +352,6 @@ export default function App() {
       if (snapshot.projectId && !latestProjects.some((project) => project.id === snapshot.projectId)) { changeProject(null); return latestProjects; }
       setCases(snapshot.active === 'cases' ? recordData.cases || [] : []);
       setDefects(snapshot.active === 'defects' ? recordData.defects || [] : []);
-      setFiles(fileData.files || []);
       setDataVersion((value) => value + 1);
       setError('');
       return latestProjects;
@@ -428,7 +401,7 @@ export default function App() {
     try { await api('/api/session', { method: 'DELETE' }); applyUser(null); }
     catch (failure) { setError(failure.message); }
   }
-  function navigate(next) { if (!window.dispatchEvent(new Event('qzz-before-navigate', { cancelable: true }))) return; contextRef.current.active = next; changeProject(null); setActive(next); setMobileOpen(false); }
+  function navigate(next) { if (!window.dispatchEvent(new Event('qzz-before-navigate', { cancelable: true }))) return; contextRef.current.active = next; if (next === 'ai') setAiRequirement(null); changeProject(null); setActive(next); setMobileOpen(false); }
   function selectProject(projectId) { if (window.dispatchEvent(new Event('qzz-before-navigate', { cancelable: true }))) changeProject(projectId); }
   function openRequirementAi(requirement) {
     if (!permitted(user, 'ai') || !window.dispatchEvent(new Event('qzz-before-navigate', { cancelable: true }))) return;
@@ -513,17 +486,7 @@ export default function App() {
     if (authEpoch.current === auth) { await loadData(); setToast('项目组已恢复'); }
   }
   async function listArchivedProjects() { return (await api('/api/projects?archived=1')).projects; }
-  async function upload(file) {
-    const body = new FormData(); body.append('file', file);
-    await api('/api/files', { method: 'POST', body }); setToast('文件已上传'); await loadData();
-  }
-  async function deleteFile(file) {
-    if (!window.confirm(`确定删除“${file.name}”吗？此操作无法撤销。`)) return;
-    try { await api(`/api/files/${encodeURIComponent(file.id)}`, { method: 'DELETE' }); setToast('文件已删除'); await loadData(); }
-    catch (failure) { setError(failure.message); }
-  }
-
-  if (user === undefined) return <div className="boot-screen"><div className="brand-mark">Q</div><RefreshCw className="spin" size={20} /><span>正在连接平台…</span></div>;
+  if (user === undefined) return <div className="boot-screen"><BrandMark /><RefreshCw className="spin" size={20} /><span>正在连接平台…</span></div>;
   if (!user) return <Login onLogin={login} busy={loginBusy} error={loginError} />;
   const currentNav = NAV.find((item) => item.id === active);
   const canView = permitted(user, active);
@@ -533,17 +496,17 @@ export default function App() {
   const selectedRecord = detail && (detail.kind === 'cases' ? cases : defects).find((item) => item.id === detail.id);
   return <div className={`app-shell ${collapsed ? 'sidebar-collapsed' : ''} ${mobileOpen ? 'mobile-open' : ''}`}>
     {mobileOpen && <button type="button" className="mobile-shade" aria-label="关闭导航" onClick={() => setMobileOpen(false)} />}
-    <aside className="sidebar"><div className="sidebar-brand"><div className="brand-mark">Q</div><div className="brand-words"><strong>QZZ</strong><span>公共测试平台</span></div><IconButton icon={X} label="关闭导航" onClick={() => setMobileOpen(false)} className="mobile-close" /></div>
+    <aside className="sidebar"><div className="sidebar-brand"><BrandMark /><div className="brand-words"><strong>QZZ</strong><span>公共测试平台</span></div><IconButton icon={X} label="关闭导航" onClick={() => setMobileOpen(false)} className="mobile-close" /></div>
       <div className="sidebar-label">工作空间</div><nav aria-label="主导航">{NAV.filter(({ id }) => permitted(user, id)).map(({ id, label, icon: Icon }) => <button className={`nav-item ${active === id ? 'active' : ''}`} type="button" key={id} onClick={() => navigate(id)} title={collapsed ? label : undefined} aria-current={active === id ? 'page' : undefined}><Icon size={19} strokeWidth={1.8} /><span>{label}</span>{active === id && <span className="nav-active-dot" />}</button>)}</nav>
-      <div className="sidebar-bottom"><div className="sidebar-hint"><ShieldCheck size={17} /><span>公司内网工作区</span></div><button type="button" className="collapse-control" title={collapsed ? '展开侧边栏' : '收起侧边栏'} aria-label={collapsed ? '展开侧边栏' : '收起侧边栏'} onClick={() => setCollapsed(!collapsed)}>{collapsed ? <PanelLeftOpen size={19} /> : <PanelLeftClose size={19} />}<span>收起侧边栏</span></button></div>
+      <div className="sidebar-bottom"><VersionHistory /><div className="sidebar-hint"><ShieldCheck size={17} /><span>公司内网工作区</span></div><button type="button" className="collapse-control" title={collapsed ? '展开侧边栏' : '收起侧边栏'} aria-label={collapsed ? '展开侧边栏' : '收起侧边栏'} onClick={() => setCollapsed(!collapsed)}>{collapsed ? <PanelLeftOpen size={19} /> : <PanelLeftClose size={19} />}<span>收起侧边栏</span></button></div>
     </aside>
       <div className="main-column"><header className="topbar"><div className="topbar-left"><IconButton icon={Menu} label="打开导航" className="mobile-menu" onClick={() => setMobileOpen(true)} /><span className="breadcrumb-parent">工作空间</span><ChevronRight size={15} className="breadcrumb-chevron" /><strong>{currentNav.label}</strong>{selectedProject && <><ChevronRight size={15} className="breadcrumb-chevron" /><span className="breadcrumb-project"><ProjectIcon project={selectedProject} small /><strong title={selectedProject.name}>{selectedProject.name}</strong></span></>}</div><div className="topbar-right"><div className={`connection ${connection}`} title={connection === 'online' ? '实时连接已建立' : '实时连接未建立，正在重试'}>{connection === 'online' ? <Wifi size={15} /> : <WifiOff size={15} />}<span>{connection === 'online' ? '实时在线' : connection === 'connecting' ? '连接中' : '重连中'}</span></div><span className="topbar-divider" /><div className="user-menu"><span className="avatar">{String(user.username || '用').slice(0, 1).toUpperCase()}</span><span className="user-name">{user.username}</span></div>{user.role === 'admin' && <IconButton icon={Users} label="账号管理" onClick={() => setUsersOpen(true)} />}<IconButton icon={KeyRound} label="修改我的密码" onClick={() => setPasswordOpen(true)} /><IconButton icon={LogOut} label="退出登录" onClick={logout} /></div></header>
       {error && <div className="global-error"><AlertCircle size={17} /><span>{error}</span><IconButton icon={X} label="关闭错误提示" onClick={() => setError('')} /></div>}
       <main className={`content ${canWrite ? '' : 'read-only-module'}`}>
         {!canView ? <Empty icon={ShieldCheck} title="暂未开放模块权限" detail="请联系管理员分配工作区权限。" action={<button className="button secondary" type="button" onClick={() => setPasswordOpen(true)}><KeyRound size={16} />修改我的密码</button>} />
-          : ['cases', 'defects', 'requirements', 'knowledge', 'ai'].includes(active) ? selectedProject ? <><ProjectContext project={selectedProject} onBack={() => selectProject(null)} />{active === 'cases' ? <>{caseRequirementFilter && <div className="project-context"><FileText size={16} /><span>仅查看此需求关联的用例集</span><button type="button" className="text-button" onClick={() => setCaseRequirementFilter(null)}>显示全部</button></div>}<CaseSetsPage requirementId={permitted(user, 'requirements') ? caseRequirementFilter : null} canLinkRequirements={permitted(user, 'requirements')} key={`cases-${selectedProject.id}-${caseRequirementFilter || 'all'}`} project={selectedProject} items={caseRequirementFilter ? cases.filter((item) => item.requirementId === caseRequirementFilter) : cases} loading={loading} canWrite={canWrite} refreshToken={dataVersion} onRefresh={loadData} showError={setError} onNotice={setToast} /></> : active === 'defects' ? <DefectsPage key={`defects-${selectedProject.id}`} project={selectedProject} items={defects} loading={loading} canWrite={canWrite} onNew={() => canWrite && openForm('defects')} onSelect={(record) => setDetail({ kind: 'defects', id: record.id })} onRefresh={loadData} showError={setError} onNotice={setToast} /> : active === 'requirements' ? <RequirementsPage isAdmin={user.role === 'admin'} key={`requirements-${selectedProject.id}`} project={selectedProject} canWrite={canWrite} canAi={permitted(user, 'ai', 'write')} canCasesView={permitted(user, 'cases')} canGenerate={permitted(user, 'ai')} config={config} onGenerate={openRequirementAi} onOpenCases={openRequirementCases} refreshToken={dataVersion} onNotice={setToast} showError={setError} /> : active === 'knowledge' ? <KnowledgePage isAdmin={user.role === 'admin'} key={`knowledge-${selectedProject.id}`} project={selectedProject} canWrite={canWrite} config={config} refreshToken={dataVersion} onNotice={setToast} showError={setError} /> : <AiWorkspace key={`ai-${user.id}-${selectedProject.id}-${aiRequirement?.id || 'default'}`} project={selectedProject} projects={projects} isAdmin={user.role === 'admin'} canWrite={canWrite} canSave={permitted(user, 'cases', 'write')} canRequirements={permitted(user, 'requirements')} canKnowledge={permitted(user, 'knowledge')} config={config} initialRequirement={aiRequirement} refreshToken={dataVersion} onCreateRequirement={openRequirements} onRefresh={loadData} showError={setError} onNotice={setToast} />}</>
+          : ['cases', 'defects', 'requirements', 'knowledge', 'ai'].includes(active) ? selectedProject ? <><ProjectContext project={selectedProject} onBack={() => selectProject(null)} />{active === 'cases' ? <>{caseRequirementFilter && <div className="project-context"><FileText size={16} /><span>仅查看此需求关联的用例集</span><button type="button" className="text-button" onClick={() => setCaseRequirementFilter(null)}>显示全部</button></div>}<CaseSetsPage requirementId={permitted(user, 'requirements') ? caseRequirementFilter : null} canLinkRequirements={permitted(user, 'requirements')} key={`cases-${selectedProject.id}-${caseRequirementFilter || 'all'}`} project={selectedProject} items={caseRequirementFilter ? cases.filter((item) => item.requirementId === caseRequirementFilter) : cases} loading={loading} canWrite={canWrite} refreshToken={dataVersion} onRefresh={loadData} showError={setError} onNotice={setToast} /></> : active === 'defects' ? <DefectsPage key={`defects-${selectedProject.id}`} project={selectedProject} items={defects} loading={loading} canWrite={canWrite} onNew={() => canWrite && openForm('defects')} onSelect={(record) => setDetail({ kind: 'defects', id: record.id })} onRefresh={loadData} showError={setError} onNotice={setToast} /> : active === 'requirements' ? <RequirementsPage isAdmin={user.role === 'admin'} userId={user.id} key={`requirements-${selectedProject.id}`} project={selectedProject} canWrite={canWrite} canAi={permitted(user, 'ai', 'write')} canCasesView={permitted(user, 'cases')} canGenerate={permitted(user, 'ai')} config={config} onGenerate={openRequirementAi} onOpenCases={openRequirementCases} refreshToken={dataVersion} onNotice={setToast} showError={setError} /> : active === 'knowledge' ? <KnowledgePage isAdmin={user.role === 'admin'} key={`knowledge-${selectedProject.id}`} project={selectedProject} canWrite={canWrite} config={config} refreshToken={dataVersion} onNotice={setToast} showError={setError} /> : <AiWorkspace userId={user.id} key={`ai-${user.id}-${selectedProject.id}-${aiRequirement?.id || 'default'}`} project={selectedProject} projects={projects} isAdmin={user.role === 'admin'} canWrite={canWrite} canSave={permitted(user, 'cases', 'write')} canRequirements={permitted(user, 'requirements')} canKnowledge={permitted(user, 'knowledge')} config={config} initialRequirement={aiRequirement} refreshToken={dataVersion} onCreateRequirement={openRequirements} onRefresh={loadData} showError={setError} onNotice={setToast} />}</>
             : <ProjectsPage key={active} kind={active} projects={projects} loading={loading} canManage={user.role === 'admin'} onSelect={(project) => selectProject(project.id)} onRefresh={loadData} onCreate={createProject} onRename={renameProject} onUpload={uploadProjectIcon} onDelete={deleteProject} onRestore={restoreProject} onListArchived={listArchivedProjects} />
-          : <FilesPage canWrite={canWrite} files={files} loading={loading} maxUploadMb={config.maxUploadMb} onUpload={upload} onDelete={deleteFile} onRefresh={loadData} showError={setError} />}
+          : <CloudFilesPage canWrite={canWrite} refreshToken={dataVersion} showError={setError} onNotice={setToast} />}
       </main>
       {toast && <div className="toast" role="status"><Check size={17} />{toast}</div>}
     </div>

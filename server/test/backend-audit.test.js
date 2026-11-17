@@ -5,11 +5,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
+import Database from 'better-sqlite3';
 import { importXmind } from '../mindmap-formats.js';
+import { hashPassword } from '../passwords.js';
 
 const serverDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-async function fixture(run) {
+async function fixture(run, prepare) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'qzz-backend-audit-'));
+  if (prepare) await prepare(directory);
   const child = spawn(process.execPath, [path.join(serverDir, 'index.js')], { cwd: os.tmpdir(), env: { ...process.env, PORT: '0', QZZ_DATA_DIR: directory, ADMIN_PASSWORD: 'AuditAdminPassword123', MAX_UPLOAD_MB: '2' }, stdio: ['ignore', 'pipe', 'pipe'] });
   let output = '';
   try {
@@ -50,7 +53,34 @@ test('cloud disk preserves UTF-8 multipart names and original content', async ()
   assert.ok(downloaded.response.headers.get('content-disposition').includes(encodeURIComponent(file.name)));
 }));
 
-test('cloud disk enforces file permissions and cleans oversized uploads and deleted originals', async () => fixture(async ({ directory, call, login, admin, reader }) => {
+test('legacy flat cloud files migrate into the root folder without changing bytes', async () => fixture(async ({ call, admin }) => {
+  const listing = await call('/api/files', undefined, 'GET', admin);
+  assert.equal(listing.status, 200);
+  assert.equal(listing.body.files.length, 1);
+  assert.equal(listing.body.files[0].name, '旧工具.bin');
+  assert.equal(listing.body.files[0].folderId, null);
+  assert.deepEqual((await call(listing.body.files[0].downloadUrl, undefined, 'GET', admin)).body, Buffer.from([0, 255, 55]));
+}, async (directory) => {
+  const db = new Database(path.join(directory, 'platform.db'));
+  db.exec(`CREATE TABLE users (
+    id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
+    role TEXT NOT NULL, created_at TEXT NOT NULL
+  );
+  CREATE TABLE files (
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, stored_name TEXT NOT NULL UNIQUE,
+    mime_type TEXT NOT NULL, size INTEGER NOT NULL,
+    uploaded_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL
+  );`);
+  db.prepare('INSERT INTO users VALUES (?, ?, ?, ?, ?)')
+    .run('legacy-admin', 'admin', hashPassword('AuditAdminPassword123'), 'admin', new Date().toISOString());
+  db.prepare('INSERT INTO files VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run('legacy-file', '旧工具.bin', 'legacy.bin', 'application/octet-stream', 3, 'legacy-admin', new Date().toISOString());
+  db.close();
+  await fs.mkdir(path.join(directory, 'uploads'));
+  await fs.writeFile(path.join(directory, 'uploads', 'legacy.bin'), Buffer.from([0, 255, 55]));
+}));
+
+test('cloud disk enforces permissions and cleans deleted originals without a configured size cap', async () => fixture(async ({ directory, call, login, admin, reader }) => {
   const content = Buffer.from([0, 1, 255, 24, 128]);
   const form = new FormData(); form.append('file', new Blob([content]), 'audit-tool.bin');
   const uploaded = await call('/api/files', form, 'POST', admin);
@@ -62,16 +92,80 @@ test('cloud disk enforces file permissions and cleans oversized uploads and dele
   assert.equal((await call('/api/files', deniedForm, 'POST', readOnly.cookie)).status, 403);
   assert.equal((await call('/api/files/' + file.id, undefined, 'DELETE', readOnly.cookie)).status, 403);
   assert.equal((await call(file.downloadUrl, undefined, 'GET')).status, 401);
-  const before = await fs.readdir(path.join(directory, 'uploads'));
-  const oversized = new FormData(); oversized.append('file', new Blob([Buffer.alloc(3 * 1024 * 1024)]), 'oversized.bin');
-  assert.equal((await call('/api/files', oversized, 'POST', admin)).status, 413);
-  assert.deepEqual(await fs.readdir(path.join(directory, 'uploads')), before);
+  const large = new FormData(); large.append('file', new Blob([Buffer.alloc(3 * 1024 * 1024)]), 'larger-than-old-config.bin');
+  const largeUpload = await call('/api/files', large, 'POST', admin);
+  assert.equal(largeUpload.status, 201); assert.equal(largeUpload.body.file.size, 3 * 1024 * 1024);
   assert.equal((await call('/api/users/' + readOnly.id, { permissions: { files: { view: false } } }, 'PUT', admin)).status, 200);
   const denied = await login('audit-reader', 'AuditReaderPassword123');
   assert.equal((await call(file.downloadUrl, undefined, 'GET', denied)).status, 403);
   assert.equal((await call('/api/files/' + file.id, undefined, 'DELETE', admin)).status, 200);
+  assert.equal((await call('/api/files/' + largeUpload.body.file.id, undefined, 'DELETE', admin)).status, 200);
   assert.equal((await call(file.downloadUrl, undefined, 'GET', admin)).status, 404);
   assert.deepEqual(await fs.readdir(path.join(directory, 'uploads')), []);
+}));
+
+test('cloud folders list, rename and move files without losing existing root files', async () => fixture(async ({ call, admin, reader }) => {
+  const originalForm = new FormData(); originalForm.append('file', new Blob(['root']), 'existing-root.txt');
+  const original = (await call('/api/files', originalForm, 'POST', admin)).body.file;
+  const parent = await call('/api/files/folders', { name: '测试工具' }, 'POST', admin);
+  assert.equal(parent.status, 201);
+  const parentId = parent.body.folder.id;
+  assert.equal((await call('/api/files/folders', { name: '测试工具' }, 'POST', admin)).status, 409);
+  const nested = await call('/api/files/folders', { name: '安装包', parentId }, 'POST', admin);
+  assert.equal(nested.status, 201);
+  const nestedId = nested.body.folder.id;
+  const root = (await call('/api/files', undefined, 'GET', admin)).body;
+  assert.deepEqual(root.files.map((file) => file.id), [original.id]);
+  assert.equal(root.folders[0].id, parentId);
+  const form = new FormData(); form.append('file', new Blob(['nested bytes']), '工具.exe');
+  const upload = await call('/api/files?folderId=' + nestedId, form, 'POST', admin);
+  assert.equal(upload.status, 201); assert.equal(upload.body.file.folderId, nestedId);
+  const childList = (await call('/api/files?folderId=' + nestedId, undefined, 'GET', admin)).body;
+  assert.deepEqual(childList.path.map((folder) => folder.name), ['测试工具', '安装包']);
+  assert.deepEqual(childList.files.map((file) => file.name), ['工具.exe']);
+  assert.equal((await call('/api/files/folders/' + parentId, undefined, 'DELETE', admin)).status, 409);
+  assert.equal((await call('/api/files/folders/' + nestedId, undefined, 'DELETE', admin)).status, 409);
+  assert.equal((await call('/api/files/folders/' + nestedId, { name: '安装包-新版' }, 'PUT', admin)).status, 200);
+  const moved = await call('/api/files/' + original.id, { folderId: nestedId }, 'PATCH', admin);
+  assert.equal(moved.status, 200); assert.equal(moved.body.file.folderId, nestedId);
+  assert.equal((await call('/api/files', undefined, 'GET', admin)).body.files.length, 0);
+  assert.equal((await call('/api/files?folderId=' + nestedId, undefined, 'GET', admin)).body.files.length, 2);
+  assert.equal((await call('/api/files/' + original.id, { folderId: null }, 'PATCH', admin)).status, 200);
+  assert.equal((await call('/api/files/' + upload.body.file.id, undefined, 'DELETE', admin)).status, 200);
+  assert.equal((await call('/api/files/folders/' + nestedId, undefined, 'DELETE', admin)).status, 200);
+  assert.equal((await call('/api/files/folders/' + parentId, undefined, 'DELETE', admin)).status, 200);
+  assert.equal((await call('/api/files?folderId=' + nestedId, undefined, 'GET', admin)).status, 404);
+  assert.equal((await call('/api/files', undefined, 'GET', admin)).body.files[0].id, original.id);
+  const readOnly = await reader();
+  assert.equal((await call('/api/files/folders', { name: 'denied' }, 'POST', readOnly.cookie)).status, 403);
+  assert.equal((await call('/api/files/' + original.id, { folderId: null }, 'PATCH', readOnly.cookie)).status, 403);
+  assert.equal((await call('/api/files/folders', { name: '../bad' }, 'POST', admin)).status, 400);
+  assert.equal((await call('/api/files?folderId=missing', undefined, 'GET', admin)).status, 404);
+  assert.equal((await call('/api/files?folderId=missing', form, 'POST', admin)).status, 404);
+}));
+
+test('cloud disk accepts a streamed upload larger than the former 100 MB limit', async () => fixture(async ({ base, call, admin }) => {
+  const boundary = 'qzz-upload-limit-check';
+  const header = Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="large-tool.bin"\r\nContent-Type: application/octet-stream\r\n\r\n`);
+  const footer = Buffer.from(`\r\n--${boundary}--\r\n`);
+  const chunk = Buffer.alloc(1024 * 1024, 0x51);
+  let part = 0;
+  const stream = new ReadableStream({
+    pull(controller) {
+      if (part === 0) controller.enqueue(header);
+      else if (part <= 101) controller.enqueue(chunk);
+      else { controller.enqueue(footer); controller.close(); }
+      part += 1;
+    },
+  });
+  const response = await fetch(base + '/api/files', {
+    method: 'POST', headers: { cookie: admin, 'content-type': `multipart/form-data; boundary=${boundary}` },
+    body: stream, duplex: 'half',
+  });
+  const result = await response.json();
+  assert.equal(response.status, 201, result.message);
+  assert.equal(result.file.size, 101 * 1024 * 1024);
+  assert.equal((await call('/api/files/' + result.file.id, undefined, 'DELETE', admin)).status, 200);
 }));
 
 test('all six defect states persist atomically, while stale, invalid, cross-project and readonly batches leave records unchanged', async () => fixture(async ({ call, admin, project, reader }) => {

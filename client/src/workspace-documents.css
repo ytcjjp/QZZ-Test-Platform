@@ -150,7 +150,7 @@
   border-top: 1px solid #e9efea;
   gap: 8px;
 }
-.ws-modal {
+.modal.ws-modal {
   display: flex;
   flex-direction: column;
   width: min(760px, 100%);
@@ -165,12 +165,34 @@
   overflow-wrap: anywhere;
   margin: 3px 0;
 }
+.ws-modal-tools {
+  display: flex;
+  align-items: center;
+  flex: none;
+  gap: 6px;
+}
 .ws-modal .modal-form {
   min-height: 0;
   overflow: auto;
 }
-.ws-wide-modal {
-  width: min(1280px, 100%);
+.modal.ws-wide-modal {
+  width: min(1440px, 100%);
+}
+@media (min-width: 761px) {
+  .ws-resizable-modal {
+    resize: both;
+    min-width: min(760px, calc(100vw - 40px));
+    min-height: min(480px, calc(100dvh - 40px));
+    max-width: calc(100vw - 40px);
+    max-height: calc(100dvh - 40px);
+  }
+}
+.ws-resizable-modal.ws-maximized-modal {
+  width: calc(100vw - 40px);
+  height: calc(100dvh - 40px);
+  max-width: calc(100vw - 40px);
+  max-height: calc(100dvh - 40px);
+  resize: none;
 }
 .ws-source-form {
   display: grid;
@@ -443,7 +465,7 @@
   background: #e4efe4;
 }
 .ws-draft-modal {
-  height: min(880px, calc(100dvh - 44px));
+  height: min(920px, calc(100dvh - 44px));
 }
 .ws-draft-workspace {
   display: grid;
@@ -1105,5 +1127,11 @@
   }
   .ws-draft-modal {
     width: 100%;
+  }
+  .ws-resizable-modal.ws-maximized-modal {
+    width: 100%;
+    height: calc(100dvh - 40px);
+    max-width: 100%;
+    max-height: calc(100dvh - 40px);
   }
 }

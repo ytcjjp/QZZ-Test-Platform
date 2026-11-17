@@ -13,7 +13,6 @@ import { loadAiProvider, publicAiProvider } from './ai-provider.js';
 import { generateWithCodex } from './codex-generator.js';
 
 const MAX_CHARS = 100000;
-const DOCUMENT_TTL = 24 * 60 * 60 * 1000;
 const BRANCHES = ['主流程', 'UI', '异常与边界', '受影响模块'];
 const SKILL = fs.readFileSync(fileURLToPath(new URL('./skills/game-prd-testcases.md', import.meta.url)), 'utf8');
 
@@ -212,20 +211,59 @@ export async function generateDocumentCases(documents, {
   return result;
 }
 
-export function registerAiRoutes(app, { db, dataDir, sendError, authenticate, browserService, loadProvider = loadAiProvider, generateCases = generateDocumentCases }) {
+export function registerAiRoutes(app, { db, dataDir, sendError, authenticate, browserService, requireProject, loadProvider = loadAiProvider, generateCases = generateDocumentCases }) {
   db.exec(`CREATE TABLE IF NOT EXISTS ai_documents (
     id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, name TEXT NOT NULL, text TEXT NOT NULL, created_at INTEGER NOT NULL
   ); CREATE INDEX IF NOT EXISTS ai_documents_owner_idx ON ai_documents(owner_id, created_at)`);
+  db.exec(`CREATE TABLE IF NOT EXISTS ai_document_drafts (
+    user_id TEXT NOT NULL, project_id TEXT NOT NULL, state TEXT NOT NULL, updated_at INTEGER NOT NULL,
+    PRIMARY KEY (user_id, project_id)
+  )`);
+  const findDraft = db.prepare('SELECT state, updated_at FROM ai_document_drafts WHERE user_id = ? AND project_id = ?');
+  const putDraft = db.prepare(`INSERT INTO ai_document_drafts (user_id, project_id, state, updated_at)
+    VALUES (?, ?, ?, ?) ON CONFLICT(user_id, project_id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at`);
   function freshWriter(req) {
     const user = authenticate(req);
     if (!user || user.id !== req.user.id) throw new DocumentError('登录已失效，请重新登录', 401);
     if (user.role !== 'admin' && !user.permissions?.ai?.write) throw new DocumentError('没有 AI 模块的操作权限', 403);
     return user;
   }
-  function cleanDocuments() { db.prepare('DELETE FROM ai_documents WHERE created_at < ?').run(Date.now() - DOCUMENT_TTL); }
+  function draftProject(req) {
+    const id = req.method === 'GET' ? req.query.projectId : req.body?.projectId;
+    if (typeof id !== 'string' || !id || id.length > 100) throw new DocumentError('请先选择项目组');
+    requireProject(id);
+    return id;
+  }
+  function draftError(res, error) {
+    if (!(error instanceof DocumentError) && !(error.status >= 400 && error.status < 500)) console.error('Document draft failed:', error.name);
+    sendError(res, error.status >= 400 && error.status < 500 ? error.status : 500, 'document_draft_error', error.publicMessage || error.status >= 400 && error.status < 500 && error.message || '草稿保存失败');
+  }
+  app.get('/api/ai/draft', (req, res) => {
+    try {
+      freshWriter(req);
+      const projectId = draftProject(req);
+      const row = findDraft.get(req.user.id, projectId);
+      res.json({ saved: row ? { state: JSON.parse(row.state), updatedAt: row.updated_at } : null });
+    } catch (error) { draftError(res, error); }
+  });
+  app.put('/api/ai/draft', (req, res) => {
+    try {
+      freshWriter(req);
+      const projectId = draftProject(req);
+      const state = req.body?.state;
+      if (!state || typeof state !== 'object' || Array.isArray(state) || typeof state.answers !== 'string' || state.answers.length > 12000 || state.result !== null && (typeof state.result !== 'object' || Array.isArray(state.result)) || !Array.isArray(state.savedTargets) || state.savedTargets.length > 100 || state.savedTargets.some((value) => typeof value !== 'string' || value.length > 100)) throw new DocumentError('草稿格式不正确');
+      const serialized = JSON.stringify(state);
+      if (serialized.length > 1000000) throw new DocumentError('生成结果过大，无法保存为草稿', 413);
+      const previous = findDraft.get(req.user.id, projectId);
+      const baseUpdatedAt = req.body?.baseUpdatedAt;
+      if (baseUpdatedAt !== undefined && (baseUpdatedAt !== null && (!Number.isSafeInteger(baseUpdatedAt) || baseUpdatedAt < 0) || baseUpdatedAt !== (previous?.updated_at ?? null))) throw new DocumentError('草稿已在其他窗口更新，请重新打开后确认', 409);
+      const updatedAt = Math.max(Date.now(), (previous?.updated_at || 0) + 1);
+      putDraft.run(req.user.id, projectId, serialized, updatedAt);
+      res.json({ saved: true, updatedAt });
+    } catch (error) { draftError(res, error); }
+  });
   app.get('/api/ai/documents', (req, res) => {
-    cleanDocuments();
-    const documents = db.prepare('SELECT id,name,text FROM ai_documents WHERE owner_id = ? ORDER BY created_at DESC,id DESC LIMIT 5').all(req.user.id)
+    const documents = db.prepare('SELECT id,name,text FROM ai_documents WHERE owner_id = ? ORDER BY created_at DESC,id DESC LIMIT 20').all(req.user.id)
       .map((document) => ({ ...document, name: documentName(document.name), chars: document.text.length }));
     res.json({ documents });
   });
@@ -242,7 +280,6 @@ export function registerAiRoutes(app, { db, dataDir, sendError, authenticate, br
     parsing += 1;
     try {
       freshWriter(req);
-      cleanDocuments();
       if (db.prepare('SELECT count(*) AS count FROM ai_documents WHERE owner_id = ?').get(req.user.id).count >= 20) throw new DocumentError('已导入较多策划文档，请移除不用的文档后重试', 429);
       if (db.prepare('SELECT count(*) AS count FROM ai_documents').get().count >= 500) throw new DocumentError('暂存文档数量已达上限，请稍后重试', 429);
       const extracted = req.file
@@ -282,7 +319,6 @@ export function registerAiRoutes(app, { db, dataDir, sendError, authenticate, br
       if (req.body?.title !== undefined && (typeof req.body.title !== 'string' || req.body.title.length > 200)) throw new DocumentError('用例集名称不能超过 200 字');
       if (req.body?.clarifications !== undefined && (typeof req.body.clarifications !== 'string' || req.body.clarifications.length > 12000)) throw new DocumentError('补充回答不能超过 12000 字');
       if (req.body?.confirmed !== undefined && typeof req.body.confirmed !== 'boolean') throw new DocumentError('生成选项不正确');
-      cleanDocuments();
       const documents = ids.map((id) => {
         const document = db.prepare('SELECT name,text FROM ai_documents WHERE id = ? AND owner_id = ?').get(id, req.user.id);
         return document && { ...document, name: documentName(document.name) };

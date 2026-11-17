@@ -8,8 +8,11 @@ import {
   LayoutGrid,
   List,
   LoaderCircle,
+  Maximize2,
   MessageSquare,
+  Minimize2,
   Plus,
+  RefreshCw,
   Send,
   Sparkles,
   Square,
@@ -29,6 +32,24 @@ const DIMENSIONS = [
   "前置/数据完整性",
   "需求追溯",
 ];
+const cacheKey = (userId, projectId) =>
+  `qzz-ai-workspace:${userId}:${projectId}`;
+function localDraft(key, requirementId = "") {
+  try {
+    const selected = requirementId || localStorage.getItem(`${key}:last`);
+    if (!selected) return null;
+    const value = JSON.parse(localStorage.getItem(`${key}:${selected}`) || "null");
+    return value && (!requirementId || value.requirementId === requirementId)
+      ? value
+      : null;
+  } catch {
+    return null;
+  }
+}
+function recoveryDraft(key, requirementId) {
+  try { return JSON.parse(localStorage.getItem(`${key}:${requirementId}:recovery`) || "null"); }
+  catch { return null; }
+}
 const newId = () => {
   if (globalThis.crypto?.randomUUID) return crypto.randomUUID();
   if (globalThis.crypto?.getRandomValues)
@@ -183,6 +204,7 @@ function Sources({ sources = [] }) {
 }
 function AiWorkspace({
   project,
+  userId,
   projects,
   config,
   canWrite,
@@ -225,38 +247,40 @@ function AiWorkspace({
   const [written, setWritten] = useState(/* @__PURE__ */ new Map());
   const [reviewStale, setReviewStale] = useState(false);
   const [legacy, setLegacy] = useState(false);
+  const [cacheReady, setCacheReady] = useState(false);
+  const [cacheStatus, setCacheStatus] = useState("loading");
+  const [cacheRetry, setCacheRetry] = useState(0);
+  const [recovery, setRecovery] = useState(null);
+  const [expanded, setExpanded] = useState(false);
+  const [assistantWidth, setAssistantWidth] = useState(370);
   const pending = useRef(null);
+  const resizeStart = useRef(null);
+  const legacyCloseGuard = useRef(null);
   const requirementIdRef = useRef(requirementId);
   requirementIdRef.current = requirementId;
   const operation = useRef(0);
   const alive = useRef(true);
-  const dirty = useRef(false);
   const locked = useRef(false);
   const canWriteRef = useRef(canWrite);
   canWriteRef.current = canWrite;
-  dirty.current = Boolean(
-    instructions.trim() ||
-    Object.values(answers).some((answer) => answer.trim()) ||
-    (draft &&
-      (draft.type !== "cases" ||
-        !draft.cases?.length ||
-        draft.cases.some(
-          (item) => written.get(item.id) !== caseSnapshot(item, draft.title),
-        ))),
-  );
+  const cacheSnapshot = useRef(null);
+  const saveQueue = useRef(Promise.resolve());
+  const cacheLoad = useRef(0);
+  const cacheRevision = useRef(0);
+  const localSaved = useRef(true);
+  const serverSaved = useRef(true);
+  const serverVersions = useRef(new Map());
+  const skipAutosave = useRef(false);
+  const recovering = useRef(null);
+  const storageKey = cacheKey(userId || "anonymous", project.id);
   useEffect(() => {
     alive.current = true;
     const guard = (event) => {
-      if (
-        (dirty.current || locked.current) &&
-        !window.confirm(
-          "当前 AI 草稿尚未写入，离开会丢失草稿并取消正在进行的生成。确定离开？",
-        )
-      )
+      if ((locked.current || cacheSnapshot.current && !localSaved.current && !serverSaved.current) && !window.confirm("生成仍在进行，或本次草稿尚未成功保存。确定离开？"))
         event.preventDefault();
     };
     const unload = (event) => {
-      if (dirty.current || locked.current) {
+      if (locked.current || cacheSnapshot.current && !localSaved.current && !serverSaved.current) {
         event.preventDefault();
         event.returnValue = "";
       }
@@ -264,6 +288,7 @@ function AiWorkspace({
     window.addEventListener("qzz-before-navigate", guard);
     window.addEventListener("beforeunload", unload);
     return () => {
+      if (cacheSnapshot.current && !serverSaved.current) queueSave(cacheSnapshot.current);
       alive.current = false;
       operation.current += 1;
       pending.current?.abort();
@@ -315,6 +340,7 @@ function AiWorkspace({
     pending.current?.abort();
     locked.current = false;
     setBusy("");
+    setCacheReady(false);
     resetDraft();
     setRequirements([]);
     setLibraries([]);
@@ -327,6 +353,98 @@ function AiWorkspace({
         : initialRequirement?.id || "",
     );
   }, [project.id]);
+  function queueSave(snapshot) {
+    const saving = saveQueue.current.then(async () => {
+      const result = await request("/api/workspace/ai-draft", {
+        method: "PUT",
+        body: JSON.stringify({ ...snapshot, baseUpdatedAt: serverVersions.current.get(snapshot.requirementId) ?? null }),
+      });
+      serverVersions.current.set(snapshot.requirementId, result.updatedAt);
+      return result;
+    });
+    saveQueue.current = saving.catch(() => {});
+    return saving;
+  }
+  function restoreCache(saved, fallbackId = "", saveNow = false) {
+    skipAutosave.current = !saveNow;
+    const state = saved?.state || {};
+    const id = saved?.requirementId || fallbackId;
+    setRequirementId(id);
+    setMode(["staged", "quick"].includes(state.mode) ? state.mode : "staged");
+    setKnowledgeBaseIds(Array.isArray(state.knowledgeBaseIds) && canKnowledge ? state.knowledgeBaseIds : []);
+    setReviewEnabled(state.reviewEnabled !== false);
+    if (Array.isArray(state.review) && state.review.length === DIMENSIONS.length && state.review.every((item) => DIMENSIONS.includes(item.dimension))) setReview(state.review);
+    setInstructions(typeof state.instructions === "string" ? state.instructions : "");
+    setHistory(Array.isArray(state.history) ? state.history.filter((item) => ["user", "assistant"].includes(item?.role) && typeof item.content === "string").slice(-20) : []);
+    setAnswers(state.answers && typeof state.answers === "object" ? state.answers : {});
+    setClarifications(typeof state.clarifications === "string" ? state.clarifications : "");
+    setConfirmedAnswers(state.confirmedAnswers && typeof state.confirmedAnswers === "object" ? state.confirmedAnswers : {});
+    setConfirmedRulesOnly(state.confirmedRulesOnly === true);
+    setDraft(state.draft && state.draft.requirementId === id && (state.draft.type !== "cases" || canSave) ? normalizeDraft(state.draft) : null);
+    setAnalysis(state.analysis && state.analysis.requirementId === id ? normalizeDraft(state.analysis) : null);
+    setWritten(new Map(Array.isArray(state.written) ? state.written.filter((entry) => Array.isArray(entry) && entry.length === 2) : []));
+    setReviewStale(state.reviewStale === true);
+    setView(state.view === "grid" ? "grid" : "table");
+    setResultTab(["draft", "analysis", "review"].includes(state.resultTab) ? state.resultTab : "draft");
+    setSelected(new Set());
+    setRequestWarnings([]);
+    setCacheReady(true);
+    setCacheStatus(saved ? "saved" : "empty");
+    locked.current = false;
+    setBusy("");
+  }
+  function chooseCachedDraft(saved, local, fallbackId = "") {
+    const id = local?.requirementId || saved?.requirementId || fallbackId;
+    serverVersions.current.set(id, saved?.updatedAt ?? null);
+    const eligibleLocal = local && (!local.state?.knowledgeBaseIds?.length || canKnowledge) && (local.state?.draft?.type !== "cases" || canSave);
+    const candidateRecovery = recoveryDraft(storageKey, id);
+    const storedRecovery = candidateRecovery && (!candidateRecovery.state?.knowledgeBaseIds?.length || canKnowledge) && (candidateRecovery.state?.draft?.type !== "cases" || canSave) ? candidateRecovery : null;
+    if (eligibleLocal && local.baseUpdatedAt === (saved?.updatedAt ?? null)) {
+      setRecovery(storedRecovery);
+      restoreCache(local, id, true);
+    } else {
+      if (eligibleLocal) {
+        try { localStorage.setItem(`${storageKey}:${id}:recovery`, JSON.stringify(local)); } catch { /* The current session still holds it. */ }
+      }
+      setRecovery(eligibleLocal || storedRecovery);
+      restoreCache(saved, id);
+    }
+  }
+  useEffect(() => {
+    if (!canWrite || !canRequirements) {
+      setCacheReady(false);
+      return;
+    }
+    const initialId = initialRequirement?.projectId && initialRequirement.projectId !== project.id ? "" : initialRequirement?.id || "";
+    const token = ++cacheLoad.current;
+    const controller = new AbortController();
+    // With no selected requirement, the selector must remain usable while the last draft is checked.
+    setCacheReady(!initialId);
+    request(`/api/workspace/ai-draft?projectId=${encodeURIComponent(project.id)}${initialId ? `&requirementId=${encodeURIComponent(initialId)}` : ""}`, { signal: controller.signal })
+      .then(async ({ saved }) => {
+        if (!alive.current || controller.signal.aborted || cacheLoad.current !== token) return;
+        const local = localDraft(storageKey, initialId);
+        const remote = local && saved?.requirementId !== local.requirementId
+          ? (await request(`/api/workspace/ai-draft?projectId=${encodeURIComponent(project.id)}&requirementId=${encodeURIComponent(local.requirementId)}`, { signal: controller.signal })).saved
+          : saved;
+        if (!alive.current || controller.signal.aborted || cacheLoad.current !== token) return;
+        chooseCachedDraft(remote, local, initialId);
+      })
+      .catch((failure) => {
+        if (controller.signal.aborted || cacheLoad.current !== token) return;
+        const local = localDraft(storageKey, initialId);
+        if (local && (!local.state?.knowledgeBaseIds?.length || canKnowledge) && (local.state?.draft?.type !== "cases" || canSave)) {
+          serverVersions.current.set(local.requirementId, local.baseUpdatedAt ?? null);
+          restoreCache(local, initialId, true);
+          setCacheStatus("error");
+        } else {
+          setCacheReady(false);
+          setCacheStatus("load-error");
+        }
+        setError(`草稿读取失败：${failure.message}`);
+      });
+    return () => controller.abort();
+  }, [project.id, initialRequirement?.id, canWrite, canRequirements, canKnowledge, canSave, storageKey, cacheRetry]);
   useEffect(() => {
     const controller = new AbortController();
     Promise.all([
@@ -381,8 +499,8 @@ function AiWorkspace({
   const confirmedPoints =
     draft?.type === "points" ? pointItems : draft?.confirmedPoints || [];
   const blocked =
-    !canWrite || !config.aiConfigured || busy !== "" || !requirementId;
-  const saveBlocked = !canWrite || !canSave || busy !== "" || !requirementId;
+    !canWrite || !cacheReady || !config.aiConfigured || busy !== "" || !requirementId;
+  const saveBlocked = !canWrite || !canSave || !cacheReady || busy !== "" || !requirementId;
   const invalidCases =
     caseItems.length > 200 || caseItems.some((item) => !validCase(item));
   const validPoints =
@@ -424,6 +542,47 @@ function AiWorkspace({
   const stage =
     draft?.type === "cases" ? 3 : draft?.type === "points" ? 2 : draft ? 1 : 0;
   const conversation = useMemo(() => history.slice(-20), [history]);
+  cacheSnapshot.current = cacheReady && canWrite && canRequirements && requirementId ? {
+    projectId: project.id,
+    requirementId,
+    state: {
+      mode, knowledgeBaseIds, reviewEnabled, review, instructions, history, answers,
+      clarifications, confirmedAnswers, confirmedRulesOnly, draft, analysis,
+      written: [...written], reviewStale, view, resultTab,
+    },
+  } : null;
+  useEffect(() => {
+    const snapshot = cacheSnapshot.current;
+    if (!snapshot) return;
+    if (skipAutosave.current) {
+      skipAutosave.current = false;
+      localSaved.current = true;
+      serverSaved.current = true;
+      return;
+    }
+    const revision = ++cacheRevision.current;
+    serverSaved.current = false;
+    try {
+      localStorage.setItem(`${storageKey}:${snapshot.requirementId}`, JSON.stringify({ ...snapshot, baseUpdatedAt: serverVersions.current.get(snapshot.requirementId) ?? null }));
+      localStorage.setItem(`${storageKey}:last`, snapshot.requirementId);
+      localSaved.current = true;
+    } catch { localSaved.current = false; }
+    setCacheStatus("saving");
+    const timer = setTimeout(() => {
+      queueSave(snapshot)
+        .then(() => { if (alive.current && cacheRevision.current === revision) {
+          serverSaved.current = true;
+          try { localStorage.removeItem(`${storageKey}:${snapshot.requirementId}`); } catch { /* Cloud copy is durable. */ }
+          if (recovering.current === snapshot.requirementId) {
+            try { localStorage.removeItem(`${storageKey}:${snapshot.requirementId}:recovery`); } catch { /* Cloud copy is durable. */ }
+            recovering.current = null;
+          }
+          setCacheStatus("saved");
+        } })
+        .catch(() => { if (alive.current && cacheRevision.current === revision) setCacheStatus(localSaved.current ? "error" : "failed"); });
+    }, 450);
+    return () => clearTimeout(timer);
+  }, [project.id, requirementId, cacheReady, mode, knowledgeBaseIds, reviewEnabled, review, instructions, history, answers, clarifications, confirmedAnswers, confirmedRulesOnly, draft, analysis, written, reviewStale, view, resultTab]);
   function report(failure) {
     if (failure.name !== "AbortError" && alive.current) {
       setError(failure.message);
@@ -444,18 +603,58 @@ function AiWorkspace({
     setReviewStale(false);
     setRequestWarnings([]);
   }
-  function changeRequirement(id) {
-    if (
-      (dirty.current || busy) &&
-      !window.confirm("切换需求将清空当前草稿，确定继续？")
-    )
-      return;
-    operation.current += 1;
-    pending.current?.abort();
-    locked.current = false;
-    setBusy("");
-    setRequirementId(id);
-    resetDraft();
+  async function changeRequirement(id) {
+    if (locked.current || busy || !cacheReady) return;
+    const token = ++cacheLoad.current;
+    const previous = cacheSnapshot.current;
+    locked.current = true;
+    setBusy("cache");
+    if (previous && !serverSaved.current) {
+      try {
+        await queueSave(previous); serverSaved.current = true;
+        if (recovering.current === previous.requirementId) {
+          try { localStorage.removeItem(`${storageKey}:${previous.requirementId}:recovery`); } catch { /* Cloud copy is durable. */ }
+          recovering.current = null;
+        }
+      }
+      catch (failure) {
+        if (!localSaved.current) {
+          locked.current = false; setBusy("");
+          setError(`原需求草稿保存失败，未切换：${failure.message}`);
+          return;
+        }
+        setCacheStatus("error");
+      }
+    }
+    if (!alive.current || token !== cacheLoad.current) return;
+    try {
+      let saved = null;
+      if (id) ({ saved } = await request(`/api/workspace/ai-draft?projectId=${encodeURIComponent(project.id)}&requirementId=${encodeURIComponent(id)}`));
+      if (!alive.current || token !== cacheLoad.current) return;
+      const local = id ? localDraft(storageKey, id) : null;
+      setCacheReady(false);
+      setRequirementId(id);
+      resetDraft();
+      chooseCachedDraft(saved, local, id);
+      if (previous && serverSaved.current) {
+        try { localStorage.removeItem(`${storageKey}:${previous.requirementId}`); } catch { /* Cloud copy is durable. */ }
+      }
+    } catch (failure) {
+      if (!alive.current || token !== cacheLoad.current) return;
+      const local = id ? localDraft(storageKey, id) : null;
+      if (local && (!local.state?.knowledgeBaseIds?.length || canKnowledge) && (local.state?.draft?.type !== "cases" || canSave)) {
+        serverVersions.current.set(id, local.baseUpdatedAt ?? null);
+        setCacheReady(false); setRequirementId(id); resetDraft(); restoreCache(local, id, true);
+        setCacheStatus("error");
+      } else { locked.current = false; setBusy(""); }
+      setError(`草稿读取失败：${failure.message}`);
+    }
+  }
+  function resizeAssistant(event) {
+    if (!resizeStart.current) return;
+    const available = event.currentTarget.parentElement.clientWidth;
+    const maximum = Math.max(300, available - 520);
+    setAssistantWidth(Math.min(maximum, Math.max(300, resizeStart.current.width + resizeStart.current.x - event.clientX)));
   }
   async function generate(task, asRevision = false) {
     if (blocked || locked.current) return;
@@ -699,7 +898,7 @@ ${result.questions.map((question, index) => `${index + 1}. ${question}`).join("\
       }
     }
   }
-  const disabledEdit = !canWrite || Boolean(busy);
+  const disabledEdit = !canWrite || !cacheReady || Boolean(busy);
   return (
     <section className="workspace-section aw-page">
       <div className="section-heading">
@@ -714,6 +913,16 @@ ${result.questions.map((question, index) => `${index + 1}. ${question}`).join("\
           {config.aiReasoningEffort || "默认"}
         </span>
       </div>
+      {(requirementId || cacheStatus === "load-error") && <div className={`aw-cache-status ${["error", "failed", "load-error"].includes(cacheStatus) || recovery ? "error" : ""}`} role="status">
+        <span>{recovery ? "云端草稿有更新，本机未同步副本已保留" : cacheStatus === "loading" ? "正在恢复草稿" : cacheStatus === "saving" ? "草稿保存中" : cacheStatus === "failed" ? "草稿保存失败，请检查存储和网络" : cacheStatus === "load-error" ? "草稿读取失败，暂不可编辑" : cacheStatus === "error" ? "草稿云端保存失败，本机副本已保留" : cacheStatus === "empty" ? "尚无草稿" : "草稿已自动保存"}</span>
+        {recovery && <button type="button" className="text-button" onClick={() => {
+          const copy = recovery;
+          setRecovery(null);
+          recovering.current = copy.requirementId;
+          restoreCache(copy, copy.requirementId, true);
+        }}>恢复本机副本</button>}
+        {cacheStatus === "load-error" && <button type="button" className="icon-button" aria-label="重试读取草稿" title="重试读取草稿" onClick={() => setCacheRetry((value) => value + 1)}><RefreshCw size={15} /></button>}
+      </div>}
       <ol className="aw-stages">
         {stages.map((label, index) => (
           <li className={index <= stage ? "active" : ""} key={label}>
@@ -757,7 +966,7 @@ ${result.questions.map((question, index) => `${index + 1}. ${question}`).join("\
               : warning.message || JSON.stringify(warning)}
           </p>
         ))}
-      <div className="aw-layout">
+      <div className={`aw-layout ${expanded ? "aw-layout-expanded" : ""}`} style={{ "--aw-assistant-width": `${assistantWidth}px` }}>
         <div className="aw-result">
           <div className="aw-result-head">
             <div>
@@ -765,6 +974,9 @@ ${result.questions.map((question, index) => `${index + 1}. ${question}`).join("\
               <p>所有内容均为草稿，确认写入后才会进入用例库</p>
             </div>
             <div className="heading-actions">
+              <button type="button" className="icon-button" title={expanded ? "还原分栏" : "展开结果区"} aria-label={expanded ? "还原分栏" : "展开结果区"} onClick={() => setExpanded((value) => !value)}>
+                {expanded ? <Minimize2 size={17} /> : <Maximize2 size={17} />}
+              </button>
               {draft?.type === "cases" && (
                 <>
                   <button
@@ -1257,6 +1469,13 @@ ${result.questions.map((question, index) => `${index + 1}. ${question}`).join("\
             </>
           )}
         </div>
+        <div className="aw-splitter" role="separator" aria-label="调整助手宽度" aria-orientation="vertical" aria-valuemin={300} aria-valuemax={720} aria-valuenow={assistantWidth} tabIndex={0} title="拖动以调整助手宽度"
+          onPointerDown={(event) => { if (event.button !== 0) return; resizeStart.current = { x: event.clientX, width: assistantWidth }; event.currentTarget.setPointerCapture(event.pointerId); }}
+          onPointerMove={resizeAssistant}
+          onPointerUp={() => { resizeStart.current = null; }}
+          onPointerCancel={() => { resizeStart.current = null; }}
+          onKeyDown={(event) => { if (["ArrowLeft", "ArrowRight"].includes(event.key)) { event.preventDefault(); setAssistantWidth((width) => Math.min(720, Math.max(300, width + (event.key === "ArrowLeft" ? 24 : -24)))); } }}
+        />
         <aside className="aw-assistant">
           <div className="aw-assistant-title">
             <MessageSquare size={17} />
@@ -1517,7 +1736,13 @@ ${result.questions.map((question, index) => `${index + 1}. ${question}`).join("\
       <details
         className="aw-legacy"
         open={legacy}
-        onToggle={(event) => setLegacy(event.currentTarget.open)}
+        onToggle={(event) => {
+          if (!event.currentTarget.open && legacyCloseGuard.current && !legacyCloseGuard.current()) {
+            event.currentTarget.open = true;
+            return;
+          }
+          setLegacy(event.currentTarget.open);
+        }}
       >
         <summary>
           <FileText size={16} />
@@ -1527,6 +1752,9 @@ ${result.questions.map((question, index) => `${index + 1}. ${question}`).join("\
           <AiDocuments
             config={config}
             projects={projects}
+            userId={userId}
+            activeProjectId={project.id}
+            registerCloseGuard={(guard) => { legacyCloseGuard.current = guard; }}
             canWrite={canWrite}
             canSave={canSave}
             isAdmin={isAdmin}

@@ -19,8 +19,12 @@
 .ai-document-list { display: grid; gap: 6px; margin-top: 20px; }
 .ai-source-item { display: flex; min-width: 0; border: 1px solid #e2e9e5; border-radius: 5px; padding: 4px 6px; background: white; }
 .ai-source-item.selected { border-color: #88b7a6; background: #f0f7f4; }
-.ai-source-item > button:first-child { flex: 1; display: flex; align-items: center; gap: 10px; min-width: 0; text-align: left; background: transparent; border: 0; padding: 9px 4px; color: #689681; }
-.ai-source-item > button:first-child > span { min-width: 0; flex: 1; }
+.ai-source-item > input[type="checkbox"] { flex: none; align-self: center; margin: 0 7px 0 3px; }
+.ai-source-preview-button { flex: 1; display: flex; align-items: center; gap: 10px; min-width: 0; text-align: left; background: transparent; border: 0; padding: 9px 4px; color: #689681; }
+.ai-source-preview-button > span { min-width: 0; flex: 1; }
+.ai-cache-status { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: -4px 0 14px; font-size: 11px; color: #648475; }
+.ai-cache-status.error { color: #a76047; }
+.ai-cache-status .text-button { font-size: 11px; }
 .ai-source-item strong { display: block; font-size: 12px; font-weight: 600; color: #345343; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ai-source-item small { display: block; font-size: 10px; color: #8b9f94; margin-top: 4px; }
 .ai-source-item .icon-button { align-self: center; }

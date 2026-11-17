@@ -26,13 +26,9 @@ const uploadDir = path.join(dataDir, 'uploads');
 const credentialFile = path.join(dataDir, 'initial-admin.txt');
 const distDir = path.resolve(projectDir, process.env.QZZ_CLIENT_DIST || path.join('client', 'dist'));
 const port = Number(process.env.PORT || 3210);
-const maxUploadMb = Number(process.env.MAX_UPLOAD_MB || 100);
 const trustProxy = process.env.TRUST_PROXY === '1';
 
 if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('Invalid PORT');
-if (!Number.isFinite(maxUploadMb) || maxUploadMb < 1 || maxUploadMb > 1024) {
-  throw new Error('MAX_UPLOAD_MB must be between 1 and 1024');
-}
 fs.mkdirSync(uploadDir, { recursive: true });
 
 const db = new Database(path.join(dataDir, 'platform.db'));
@@ -72,6 +68,19 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS files_created_idx ON files(created_at DESC);
 `);
+db.exec(`
+  CREATE TABLE IF NOT EXISTS file_folders (
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, parent_id TEXT REFERENCES file_folders(id),
+    created_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS file_folders_name_idx
+    ON file_folders(COALESCE(parent_id, ''), name COLLATE NOCASE);
+  CREATE INDEX IF NOT EXISTS file_folders_parent_idx ON file_folders(parent_id);
+`);
+if (!db.prepare('PRAGMA table_info(files)').all().some((column) => column.name === 'folder_id')) {
+  db.exec('ALTER TABLE files ADD COLUMN folder_id TEXT REFERENCES file_folders(id)');
+}
+db.exec('CREATE INDEX IF NOT EXISTS files_folder_idx ON files(folder_id, created_at DESC)');
 const projectIconDir = initializeProjects(db, dataDir);
 initializeCaseSets(db);
 const workspaceDocuments = initializeWorkspaceDocuments(db, dataDir);
@@ -316,8 +325,8 @@ app.delete('/api/session', requireAuth, (req, res) => {
 app.use('/api', requireAuth);
 
 app.get('/api/config', (req, res) => {
-  try { res.json({ ...publicAiProvider(loadAiProvider(dataDir)), maxUploadMb }); }
-  catch { res.json({ aiConfigured: false, aiConfigError: '本机 AI 配置无法读取，请联系管理员检查配置', maxUploadMb }); }
+  try { res.json(publicAiProvider(loadAiProvider(dataDir))); }
+  catch { res.json({ aiConfigured: false, aiConfigError: '本机 AI 配置无法读取，请联系管理员检查配置' }); }
 });
 
 app.get('/api/users', requireAdmin, (req, res) => {
@@ -646,26 +655,118 @@ const upload = multer({
     destination: uploadDir,
     filename: (req, file, callback) => callback(null, `${crypto.randomUUID()}.bin`),
   }),
-  limits: { fileSize: maxUploadMb * 1024 * 1024, files: 1 },
+  limits: { files: 1, fields: 1, fieldSize: 100 },
 });
 
 const fileSelect = `SELECT files.*, users.username AS uploader_name FROM files
   JOIN users ON users.id = files.uploaded_by`;
 const getFile = db.prepare(`${fileSelect} WHERE files.id = ?`);
+const folderSelect = `SELECT file_folders.*, users.username AS creator_name FROM file_folders
+  JOIN users ON users.id = file_folders.created_by`;
+const getFolder = db.prepare(`${folderSelect} WHERE file_folders.id = ?`);
+
+function folderId(value) {
+  if (value === undefined || value === null || value === '') return null;
+  if (typeof value !== 'string' || value.length > 100) throw new InputError('文件夹格式不正确');
+  return value;
+}
+
+function folderName(value) {
+  const name = readString(value, '文件夹名称', 100);
+  if (!name || name === '.' || name === '..' || /[\\/\x00-\x1f]/.test(name)) {
+    throw new InputError('文件夹名称不能为空，且不能包含斜杠或控制字符');
+  }
+  return name;
+}
+
+function mapFolder(row) {
+  return { id: row.id, name: row.name, parentId: row.parent_id,
+    createdBy: row.creator_name, createdAt: row.created_at };
+}
+
+function folderPath(folder) {
+  const pathItems = [];
+  for (let current = folder; current; current = current.parent_id ? getFolder.get(current.parent_id) : null) {
+    pathItems.unshift(mapFolder(current));
+  }
+  return pathItems;
+}
+
+function duplicateFolder(error) {
+  if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') return true;
+  throw error;
+}
 
 function mapFile(row) {
   return {
-    id: row.id, name: row.name, size: row.size, mimeType: row.mime_type,
+    id: row.id, name: row.name, size: row.size, mimeType: row.mime_type, folderId: row.folder_id,
     uploadedBy: row.uploader_name, createdAt: row.created_at,
     downloadUrl: `/api/files/${row.id}/download`,
   };
 }
 
 app.get('/api/files', (req, res) => {
-  res.json({ files: db.prepare(`${fileSelect} ORDER BY files.created_at DESC, files.id DESC`).all().map(mapFile) });
+  const currentId = folderId(req.query.folderId);
+  const current = currentId ? getFolder.get(currentId) : null;
+  if (currentId && !current) return sendError(res, 404, 'not_found', '文件夹不存在');
+  res.json({
+    files: db.prepare(`${fileSelect} WHERE files.folder_id IS ? ORDER BY files.created_at DESC, files.id DESC`)
+      .all(currentId).map(mapFile),
+    folders: db.prepare(`${folderSelect} WHERE file_folders.parent_id IS ? ORDER BY file_folders.name COLLATE NOCASE`)
+      .all(currentId).map(mapFolder),
+    path: folderPath(current),
+    allFolders: db.prepare(`${folderSelect} ORDER BY file_folders.name COLLATE NOCASE`).all().map(mapFolder),
+  });
 });
 
-app.post('/api/files', upload.single('file'), (req, res) => {
+app.post('/api/files/folders', (req, res) => {
+  const parentId = folderId(req.body?.parentId);
+  if (parentId && !getFolder.get(parentId)) return sendError(res, 404, 'not_found', '上级文件夹不存在');
+  const name = folderName(req.body?.name);
+  const id = crypto.randomUUID();
+  try {
+    db.prepare('INSERT INTO file_folders (id, name, parent_id, created_by, created_at) VALUES (?, ?, ?, ?, ?)')
+      .run(id, name, parentId, req.user.id, new Date().toISOString());
+  } catch (error) {
+    if (duplicateFolder(error)) return sendError(res, 409, 'duplicate', '同一目录下已有同名文件夹');
+  }
+  const folder = mapFolder(getFolder.get(id));
+  broadcast('file.folder.created', { folder });
+  res.status(201).json({ folder });
+});
+
+app.put('/api/files/folders/:id', (req, res) => {
+  const current = getFolder.get(req.params.id);
+  if (!current) return sendError(res, 404, 'not_found', '文件夹不存在');
+  const name = folderName(req.body?.name);
+  try {
+    db.prepare('UPDATE file_folders SET name = ? WHERE id = ?').run(name, current.id);
+  } catch (error) {
+    if (duplicateFolder(error)) return sendError(res, 409, 'duplicate', '同一目录下已有同名文件夹');
+  }
+  const folder = mapFolder(getFolder.get(current.id));
+  broadcast('file.folder.updated', { folder });
+  res.json({ folder });
+});
+
+app.delete('/api/files/folders/:id', (req, res) => {
+  const current = getFolder.get(req.params.id);
+  if (!current) return sendError(res, 404, 'not_found', '文件夹不存在');
+  if (db.prepare('SELECT 1 FROM file_folders WHERE parent_id = ?').get(current.id) ||
+      db.prepare('SELECT 1 FROM files WHERE folder_id = ?').get(current.id)) {
+    return sendError(res, 409, 'folder_not_empty', '请先移走或删除文件夹内的内容');
+  }
+  db.prepare('DELETE FROM file_folders WHERE id = ?').run(current.id);
+  broadcast('file.folder.deleted', { id: current.id, parentId: current.parent_id });
+  res.json({ ok: true });
+});
+
+app.post('/api/files', (req, res, next) => {
+  const targetId = folderId(req.query.folderId);
+  if (targetId && !getFolder.get(targetId)) return sendError(res, 404, 'not_found', '文件夹不存在');
+  req.targetFolderId = targetId;
+  next();
+}, upload.single('file'), (req, res) => {
   if (!req.file) return sendError(res, 400, 'invalid_input', '请选择文件');
   const name = uploadFilename(req.file.originalname, '');
   if (!name) {
@@ -674,9 +775,10 @@ app.post('/api/files', upload.single('file'), (req, res) => {
   }
   const id = crypto.randomUUID();
   try {
-    db.prepare('INSERT INTO files VALUES (?, ?, ?, ?, ?, ?, ?)')
+    db.prepare(`INSERT INTO files (id, name, stored_name, mime_type, size, uploaded_by, created_at, folder_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(id, name, req.file.filename, req.file.mimetype || 'application/octet-stream',
-        req.file.size, req.user.id, new Date().toISOString());
+        req.file.size, req.user.id, new Date().toISOString(), req.targetFolderId);
   } catch (error) {
     fs.unlinkSync(req.file.path);
     throw error;
@@ -684,6 +786,17 @@ app.post('/api/files', upload.single('file'), (req, res) => {
   const record = mapFile(getFile.get(id));
   broadcast('file.created', { file: record });
   res.status(201).json({ file: record });
+});
+
+app.patch('/api/files/:id', (req, res) => {
+  const current = getFile.get(req.params.id);
+  if (!current) return sendError(res, 404, 'not_found', '文件不存在');
+  const targetId = folderId(req.body?.folderId);
+  if (targetId && !getFolder.get(targetId)) return sendError(res, 404, 'not_found', '目标文件夹不存在');
+  db.prepare('UPDATE files SET folder_id = ? WHERE id = ?').run(targetId, current.id);
+  const file = mapFile(getFile.get(current.id));
+  broadcast('file.updated', { file });
+  res.json({ file });
 });
 
 app.get('/api/files/:id/download', (req, res, next) => {
@@ -714,7 +827,7 @@ app.get('/api/feishu-browser/extension.zip', requireAdmin, (req, res) => {
 });
 registerAiRoutes(app, { db, dataDir, sendError, authenticate: userFromRequest, browserService: feishuBrowser, requireProject: projects.requireProject });
 registerWorkspaceDocumentRoutes(app, { db, dataDir, requirePermission, requireProject: projects.requireProject, broadcast, authenticate: userFromRequest, browserService: feishuBrowser });
-registerAiWorkspaceRoutes(app, { dataDir, workspace: workspaceDocuments, requireProject: projects.requireProject, authenticate: userFromRequest, sendError });
+registerAiWorkspaceRoutes(app, { db, dataDir, workspace: workspaceDocuments, requireProject: projects.requireProject, authenticate: userFromRequest, sendError });
 
 app.use('/api', (req, res) => sendError(res, 404, 'not_found', '接口不存在'));
 
@@ -730,8 +843,7 @@ app.use((error, req, res, next) => {
   if (res.headersSent) return next(error);
   if (error instanceof InputError) return sendError(res, 400, 'invalid_input', error.message);
   if (error instanceof multer.MulterError) {
-    return sendError(res, error.code === 'LIMIT_FILE_SIZE' ? 413 : 400,
-      'upload_error', error.code === 'LIMIT_FILE_SIZE' ? `文件不能超过 ${maxUploadMb} MB` : '文件上传失败');
+    return sendError(res, 400, 'upload_error', '文件上传失败');
   }
   if (error instanceof SyntaxError && 'body' in error) return sendError(res, 400, 'invalid_json', '请求内容不是有效的 JSON');
   if (error.type === 'entity.too.large') return sendError(res, 413, 'too_large', '请求内容超过 4 MB，请缩小思维导图后重试');
@@ -740,6 +852,8 @@ app.use((error, req, res, next) => {
 });
 
 const server = http.createServer(app);
+server.requestTimeout = 0;
+server.setTimeout(120000);
 const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
   if (feishuBrowser.handleUpgrade(req, socket, head)) return;

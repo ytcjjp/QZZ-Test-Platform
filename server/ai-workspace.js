@@ -258,8 +258,65 @@ export async function generateWorkspaceTask(input, evidence, knowledge, { provid
   return result;
 }
 
-export function registerAiWorkspaceRoutes(app, { dataDir, workspace, requireProject, authenticate, sendError, loadProvider = loadAiProvider, generateTask = generateWorkspaceTask }) {
+export function registerAiWorkspaceRoutes(app, { db, dataDir, workspace, requireProject, authenticate, sendError, loadProvider = loadAiProvider, generateTask = generateWorkspaceTask }) {
   const active = new Set();
+  if (db) {
+    db.exec(`CREATE TABLE IF NOT EXISTS ai_workspace_drafts (
+      user_id TEXT NOT NULL, project_id TEXT NOT NULL, requirement_id TEXT NOT NULL,
+      state TEXT NOT NULL, updated_at INTEGER NOT NULL,
+      PRIMARY KEY (user_id, project_id, requirement_id)
+    ); CREATE INDEX IF NOT EXISTS ai_workspace_drafts_recent_idx
+      ON ai_workspace_drafts(user_id, project_id, updated_at DESC);`);
+    const findDraft = db.prepare('SELECT requirement_id, state, updated_at FROM ai_workspace_drafts WHERE user_id = ? AND project_id = ? AND requirement_id = ?');
+    const recentDrafts = db.prepare('SELECT requirement_id, state, updated_at FROM ai_workspace_drafts WHERE user_id = ? AND project_id = ? ORDER BY updated_at DESC LIMIT 30');
+    const putDraft = db.prepare(`INSERT INTO ai_workspace_drafts (user_id, project_id, requirement_id, state, updated_at)
+      VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id, project_id, requirement_id)
+      DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at`);
+    const draftError = (res, error) => {
+      if (!(error instanceof WorkspaceAiError) && !(error.status >= 400 && error.status < 500)) console.error('Workspace draft failed:', error.name);
+      return sendError(res, error.status && error.status >= 400 && error.status < 500 ? error.status : 500, 'workspace_ai_draft_error', error.publicMessage || error.status >= 400 && error.status < 500 && error.message || '草稿保存失败');
+    };
+    function draftScope(req, requireRequirement = false) {
+      const projectId = text(req.method === 'GET' ? req.query.projectId : req.body?.projectId, '项目组', 100);
+      const requirementId = text(req.method === 'GET' ? req.query.requirementId : req.body?.requirementId, '需求 ID', 100);
+      if (!projectId || requireRequirement && !requirementId) throw new WorkspaceAiError('请先选择项目组和需求文档');
+      if (!permission(req.user, 'ai', 'write') || !permission(req.user, 'requirements', 'view')) throw new WorkspaceAiError('没有本次 AI 草稿所需的模块权限', 403);
+      requireProject(projectId);
+      if (requirementId && !workspace.getRequirement(projectId, requirementId)) throw new WorkspaceAiError('当前项目中不存在该需求，或需求已删除', 404);
+      return { projectId, requirementId };
+    }
+    function readableDraft(req, row) {
+      if (!row) return null;
+      const state = JSON.parse(row.state);
+      if (state.knowledgeBaseIds?.length && !permission(req.user, 'knowledge', 'view')) return null;
+      if (state.draft?.type === 'cases' && !permission(req.user, 'cases', 'write')) return null;
+      return { requirementId: row.requirement_id, state, updatedAt: row.updated_at };
+    }
+    app.get('/api/workspace/ai-draft', (req, res) => {
+      try {
+        const { projectId, requirementId } = draftScope(req);
+        const rows = requirementId ? [findDraft.get(req.user.id, projectId, requirementId)] : recentDrafts.all(req.user.id, projectId);
+        const saved = rows.find((row) => row && workspace.getRequirement(projectId, row.requirement_id) && readableDraft(req, row));
+        res.json({ saved: readableDraft(req, saved) });
+      } catch (error) { draftError(res, error); }
+    });
+    app.put('/api/workspace/ai-draft', (req, res) => {
+      try {
+        const { projectId, requirementId } = draftScope(req, true);
+        const state = req.body?.state;
+        if (!state || typeof state !== 'object' || Array.isArray(state) || !['staged', 'quick'].includes(state.mode) || state.draft?.requirementId && state.draft.requirementId !== requirementId || !Array.isArray(state.history) || state.history.length > 40 || state.history.some((entry) => !entry || !['user', 'assistant'].includes(entry.role) || typeof entry.content !== 'string' || entry.content.length > 12000)) throw new WorkspaceAiError('AI 草稿格式不正确');
+        if (state.knowledgeBaseIds?.length && !permission(req.user, 'knowledge', 'view') || state.draft?.type === 'cases' && !permission(req.user, 'cases', 'write')) throw new WorkspaceAiError('没有本次 AI 草稿所需的模块权限', 403);
+        const serialized = JSON.stringify(state);
+        if (serialized.length > 1000000 || state.draft && JSON.stringify(state.draft).length > DRAFT_MAX_CHARS) throw new WorkspaceAiError('AI 草稿超过保存容量，请拆分需求后重试', 413);
+        const previous = findDraft.get(req.user.id, projectId, requirementId);
+        const baseUpdatedAt = req.body?.baseUpdatedAt;
+        if (baseUpdatedAt !== undefined && (baseUpdatedAt !== null && (!Number.isSafeInteger(baseUpdatedAt) || baseUpdatedAt < 0) || baseUpdatedAt !== (previous?.updated_at ?? null))) throw new WorkspaceAiError('草稿已在其他窗口更新，本机副本已保留，请重新打开后确认', 409);
+        const updatedAt = Math.max(Date.now(), (previous?.updated_at || 0) + 1);
+        putDraft.run(req.user.id, projectId, requirementId, serialized, updatedAt);
+        res.json({ saved: true, updatedAt });
+      } catch (error) { draftError(res, error); }
+    });
+  }
   app.post('/api/workspace/ai', async (req, res) => {
     const controller = new AbortController();
     const disconnected = () => { if (!res.writableEnded) controller.abort(); };

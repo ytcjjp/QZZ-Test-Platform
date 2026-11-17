@@ -186,6 +186,7 @@ test('document routes isolate users, deny raw requirements, and import browser t
   let generateStub; const browserCalls = [];
   registerAiRoutes(app, {
     db, dataDir: directory, authenticate: (req) => users[req.headers['x-user'] || 'one'],
+    requireProject: (id) => { if (!['project-1', 'project-2'].includes(id)) throw Object.assign(new Error('项目不存在'), { status: 400 }); },
     inputError: (message) => new Error(message), sendError: (res, status, error, message) => res.status(status).json({ error, message }),
     browserService: { read: async (url, { requester }) => { browserCalls.push({ url, requester: requester.id }); return { name: '飞书需求', text: '领取奖励后进入背包。', warnings: ['折叠块未读取'], images: [{ name: '图.png', buffer: Buffer.from('image/png') }] }; } },
     generateCases: (sources, options) => generateStub ? generateStub(sources, options) : generateDocumentCases(sources, options),
@@ -214,6 +215,20 @@ test('document routes isolate users, deny raw requirements, and import browser t
     assert.equal(restoredDocuments[0].id, document.id);
     assert.equal(restoredDocuments[0].name, '活动策划-smoke.md');
     assert.deepEqual((await (await fetch(base + '/api/ai/documents', { headers: { 'x-user': 'two' } })).json()).documents, []);
+    db.prepare('UPDATE ai_documents SET created_at = ? WHERE id = ?').run(Date.now() - 2 * 24 * 60 * 60 * 1000, document.id);
+    assert.equal((await (await fetch(base + '/api/ai/documents')).json()).documents[0].id, document.id, 'imported inputs remain until explicitly removed');
+    const cached = { result: normalizeAiResult(generated()), answers: '已确认', projectId: 'project-1', previewId: document.id, selectedDocumentIds: [document.id], savedTargets: [] };
+    const saveDraft = (baseUpdatedAt) => fetch(base + '/api/ai/draft', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ projectId: 'project-1', state: cached, baseUpdatedAt }) });
+    assert.equal((await saveDraft(null)).status, 200);
+    const savedDraft = (await (await fetch(base + '/api/ai/draft?projectId=project-1')).json()).saved;
+    assert.deepEqual(savedDraft.state, cached);
+    assert.equal((await (await fetch(base + '/api/ai/draft?projectId=project-1', { headers: { 'x-user': 'two' } })).json()).saved, null);
+    assert.equal((await (await fetch(base + '/api/ai/draft?projectId=project-2')).json()).saved, null);
+    assert.equal((await saveDraft(savedDraft.updatedAt - 1)).status, 409);
+    assert.equal((await saveDraft(savedDraft.updatedAt)).status, 200);
+    users.one.permissions.ai.write = false;
+    assert.equal((await fetch(base + '/api/ai/draft?projectId=project-1')).status, 403);
+    users.one.permissions.ai.write = true;
     const largeText = '# 大文件策划\n奖励领取后进入背包。';
     const largeBuffer = Buffer.concat([Buffer.alloc(21 * 1024 * 1024, 0x20), Buffer.from(largeText)]);
     assert.ok(largeBuffer.length > 20 * 1024 * 1024);

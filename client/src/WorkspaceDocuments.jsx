@@ -19,6 +19,8 @@ import {
   Link2,
   List,
   LoaderCircle,
+  Maximize2,
+  Minimize2,
   Pencil,
   Plus,
   RefreshCw,
@@ -31,6 +33,14 @@ import {
 } from "lucide-react";
 import "./workspace-documents.css";
 import FeishuConnection, { FeishuBrowserStatus, FeishuConnectionHelp } from "./FeishuConnection";
+import {
+  planCacheKeys,
+  readPlanCache,
+  readPlanSelection,
+  removePlanCache,
+  writePlanCache,
+  writePlanSelection,
+} from "./plan-draft-cache";
 const markdown = new MarkdownIt({ html: false, linkify: false, breaks: true });
 const REQUIREMENT_STATUSES = ["草稿", "已确认", "已归档"];
 const PRIORITIES = ["P0", "P1", "P2", "P3"];
@@ -96,9 +106,9 @@ function useRequests(projectId, canWrite) {
   }, []);
   return { call, active, cancel };
 }
-function useUnsaved(dirty, busy = false) {
-  const current = useRef({ dirty, busy });
-  current.current = { dirty, busy };
+function useUnsaved(dirty, busy = false, closeMessage = "当前内容尚未保存，确定放弃修改并关闭吗？") {
+  const current = useRef({ dirty, busy, closeMessage });
+  current.current = { dirty, busy, closeMessage };
   useEffect(() => {
     function unload(event) {
       if (current.current.dirty || current.current.busy) {
@@ -124,7 +134,7 @@ function useUnsaved(dirty, busy = false) {
   return () =>
     !current.current.busy &&
     (!current.current.dirty ||
-      window.confirm("当前内容尚未保存，确定放弃修改并关闭吗？"));
+      window.confirm(current.current.closeMessage));
 }
 function Icon({ icon: Component, label, onClick, disabled, danger, pressed }) {
   return (
@@ -261,22 +271,30 @@ function Modal({
   className = "",
 }) {
   const id = useId();
+  const [maximized, setMaximized] = useState(false);
   return (
     <div className="modal-backdrop">
       <section
-        className={`modal ws-modal ${wide ? "ws-wide-modal" : ""} ${className}`}
+        className={`modal ws-modal ${wide ? "ws-wide-modal ws-resizable-modal" : ""} ${maximized ? "ws-maximized-modal" : ""} ${className}`}
         role="dialog"
         aria-modal="true"
         aria-labelledby={id}
       >
         <header className="modal-head">
           <h2 id={id}>{title}</h2>
+          <div className="ws-modal-tools">
+            {wide && <Icon
+              icon={maximized ? Minimize2 : Maximize2}
+              label={maximized ? "还原窗口" : "最大化窗口"}
+              onClick={() => setMaximized((value) => !value)}
+            />}
           <Icon
             icon={X}
             label={`关闭${title}`}
             disabled={busy}
             onClick={onClose}
           />
+          </div>
         </header>
         {children}
       </section>
@@ -714,6 +732,7 @@ function DraftDialog({
   project,
   requirement,
   kind,
+  userId,
   canWrite,
   canAi,
   config,
@@ -727,6 +746,19 @@ function DraftDialog({
   const [plans, setPlans] = useState([]);
   const [planId, setPlanId] = useState("");
   const planSnapshot = useRef(null);
+  const cacheKeys = useMemo(
+    () => planCacheKeys(userId, project.id, requirement.id),
+    [userId, project.id, requirement.id],
+  );
+  const cacheStorage = useMemo(() => {
+    try {
+      return userId ? window.localStorage : null;
+    } catch {
+      return null;
+    }
+  }, [userId]);
+  const [plansLoaded, setPlansLoaded] = useState(!isPlan);
+  const [cached, setCached] = useState(false);
   const [title, setTitle] = useState(`测试计划：${requirement.title}`);
   const [version, setVersion] = useState("");
   const [iteration, setIteration] = useState("");
@@ -745,8 +777,32 @@ function DraftDialog({
   const baseline = useRef(JSON.stringify([draft, title, version, iteration]));
   const dirty =
     JSON.stringify([draft, title, version, iteration]) !== baseline.current;
-  const mayClose = useUnsaved(dirty, Boolean(busy));
+  const mayClose = useUnsaved(
+    dirty,
+    Boolean(busy),
+    isPlan && cached
+      ? "当前修改仅缓存在此浏览器，尚未写入平台。确定关闭吗？"
+      : undefined,
+  );
   const canGenerate = canWrite && canAi && Boolean(config?.aiConfigured);
+  useEffect(() => {
+    if (!isPlan || !canWrite || !plansLoaded) return;
+    if (!dirty) {
+      removePlanCache(cacheStorage, cacheKeys.draft(planId));
+      setCached(false);
+      return;
+    }
+    const saved = writePlanCache(cacheStorage, cacheKeys.draft(planId), {
+      title,
+      version,
+      iteration,
+      content: draft,
+      baseRevision: planSnapshot.current?.revision || 0,
+    });
+    setCached(saved);
+    if (!saved)
+      setError((previous) => previous || "浏览器缓存不可用，请写入计划或导出 Markdown 后再关闭。");
+  }, [isPlan, canWrite, plansLoaded, dirty, cacheStorage, cacheKeys, planId, title, version, iteration, draft]);
   async function loadPlans() {
     const data = await call(
       `/api/test-plans?projectId=${project.id}&requirementId=${requirement.id}`,
@@ -758,7 +814,17 @@ function DraftDialog({
     if (isPlan)
       loadPlans()
         .then((values) => {
-          if (!canWrite && values[0]) choosePlan(values[0].id, values, true);
+          if (!active.current) return;
+          const selected = canWrite
+            ? readPlanSelection(
+                cacheStorage,
+                cacheKeys.selected,
+                values,
+                Boolean(readPlanCache(cacheStorage, cacheKeys.draft(""))),
+              )
+            : values[0]?.id || "";
+          choosePlan(selected, values, true);
+          setPlansLoaded(true);
         })
         .catch((failure) => {
           if (!isAbort(failure)) setError(failure.message);
@@ -849,23 +915,35 @@ function DraftDialog({
     if (
       !force &&
       dirty &&
-      !window.confirm("切换测试计划将替换当前草稿，确定继续吗？")
+      !window.confirm(
+        cached
+          ? "当前修改已缓存在此浏览器。确定切换测试计划吗？"
+          : "切换测试计划将替换当前草稿，确定继续吗？",
+      )
     )
       return;
-    planSnapshot.current = value || null;
+    const recovered = canWrite
+      ? readPlanCache(cacheStorage, cacheKeys.draft(id))
+      : null;
+    const stale = Boolean(value && recovered && value.revision !== recovered.baseRevision);
+    planSnapshot.current = value
+      ? { ...value, revision: stale ? recovered.baseRevision : value.revision }
+      : null;
     setPlanId(id);
+    writePlanSelection(cacheStorage, cacheKeys.selected, id);
     const nextTitle = value?.title || `测试计划：${requirement.title}`;
-    setTitle(nextTitle);
-    setVersion(value?.version || "");
-    setIteration(value?.iteration || "");
-    setDraft(value?.content || "");
+    setTitle(recovered?.title ?? nextTitle);
+    setVersion(recovered?.version ?? value?.version ?? "");
+    setIteration(recovered?.iteration ?? value?.iteration ?? "");
+    setDraft(recovered?.content ?? value?.content ?? "");
+    setCached(Boolean(recovered));
     setMessages([]);
     setQuestions([]);
     setSources([]);
     setTaskWarnings([]);
     setVision(null);
-    setConflict(false);
-    setError("");
+    setConflict(stale);
+    setError(stale ? "已恢复此浏览器的草稿，但平台中的计划已被其他人更新。请导出草稿或载入最新版本后继续。" : "");
     baseline.current = JSON.stringify([
       value?.content || "",
       nextTitle,
@@ -883,6 +961,7 @@ function DraftDialog({
         const values = await loadPlans();
         const latest = values.find((item) => item.id === planId);
         if (!latest) throw new Error("测试计划已不存在，请另建计划保存草稿");
+        removePlanCache(cacheStorage, cacheKeys.draft(planId));
         choosePlan(planId, values, true);
       } else {
         const latest = (
@@ -915,6 +994,7 @@ function DraftDialog({
     setError("");
     try {
       if (isPlan) {
+        const previousPlanId = planId;
         const result = await call(
           `/api/test-plans${planId ? `/${planId}` : ""}`,
           json(planId ? "PUT" : "POST", {
@@ -929,6 +1009,10 @@ function DraftDialog({
         );
         planSnapshot.current = result.plan;
         setPlanId(result.plan.id);
+        removePlanCache(cacheStorage, cacheKeys.draft(previousPlanId));
+        removePlanCache(cacheStorage, cacheKeys.draft(result.plan.id));
+        writePlanSelection(cacheStorage, cacheKeys.selected, result.plan.id);
+        setCached(false);
         await loadPlans();
       } else {
         const result = await call(
@@ -971,9 +1055,9 @@ function DraftDialog({
           {isPlan && (
             <div className="ws-plan-meta">
               <label className="field">
-                <span>写入目标</span>
+                <span>计划历史</span>
                 <select
-                  aria-label="写入测试计划"
+                  aria-label="选择测试计划"
                   value={planId}
                   disabled={Boolean(busy)}
                   onChange={(event) => choosePlan(event.target.value)}
@@ -981,7 +1065,7 @@ function DraftDialog({
                   <option value="">新建测试计划</option>
                   {plans.map((plan) => (
                     <option key={plan.id} value={plan.id}>
-                      {plan.title}
+                      {plan.title} · {stamp(plan.updatedAt)}
                     </option>
                   ))}
                 </select>
@@ -1036,7 +1120,7 @@ function DraftDialog({
                 源码
               </button>
             </div>
-            <span>{dirty ? "未保存" : "已保存"}</span>
+            <span>{dirty ? (cached ? "仅本机缓存" : "未保存") : "已保存"}</span>
           </div>
           <div className="ws-draft-editor">
             {source ? (
@@ -1224,6 +1308,7 @@ function DraftDialog({
 }
 function RequirementsPage({
   project,
+  userId,
   canWrite,
   isAdmin = false,
   canAi = false,
@@ -1595,6 +1680,7 @@ function RequirementsPage({
           project={project}
           requirement={draft.requirement}
           kind={draft.kind}
+          userId={userId}
           canWrite={canWrite}
           canAi={canAi}
           config={config}
