@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 import AiDocuments from "./AiDocuments";
 import { MarkdownView } from "./WorkspaceDocuments";
+import { normalizeModelCatalog, resolveModelSelection } from "./ai-models";
 import "./ai-workspace.css";
 const CATEGORIES = ["主流程", "UI", "异常与边界", "受影响模块"];
 const DIMENSIONS = [
@@ -131,14 +132,20 @@ function normalizeDraft(result) {
   };
 }
 async function request(url, options = {}) {
-  const response = await fetch(url, {
-    credentials: "same-origin",
-    ...options,
-    headers: { "Content-Type": "application/json", ...options.headers },
-  });
+  let response;
+  try {
+    response = await fetch(url, {
+      credentials: "same-origin",
+      ...options,
+      headers: { "Content-Type": "application/json", ...options.headers },
+    });
+  } catch (error) {
+    if (error.name === "AbortError") throw error;
+    throw new Error("与平台的连接中断，请确认服务正在运行后重试");
+  }
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    const error = new Error(data.message || "请求失败，请重试");
+    const error = new Error(data.message || `请求失败（HTTP ${response.status}），请重试或联系管理员`);
     error.status = response.status;
     error.warnings = data.warnings || [];
     throw error;
@@ -225,6 +232,10 @@ function AiWorkspace({
     initialRequirement?.id || "",
   );
   const [knowledgeBaseIds, setKnowledgeBaseIds] = useState([]);
+  const [model, setModel] = useState(config.aiModel || "");
+  const [modelCatalog, setModelCatalog] = useState(() => normalizeModelCatalog(null, config.aiModel));
+  const [modelStatus, setModelStatus] = useState("loading");
+  const [modelRetry, setModelRetry] = useState(0);
   const [mode, setMode] = useState("staged");
   const [reviewEnabled, setReviewEnabled] = useState(true);
   const [review, setReview] = useState(
@@ -345,6 +356,7 @@ function AiWorkspace({
     setRequirements([]);
     setLibraries([]);
     setKnowledgeBaseIds([]);
+    setModel(config.aiModel || "");
     setInstructions("");
     setRequirementId(
       initialRequirement?.projectId &&
@@ -353,6 +365,31 @@ function AiWorkspace({
         : initialRequirement?.id || "",
     );
   }, [project.id]);
+  useEffect(() => {
+    const controller = new AbortController();
+    setModelStatus("loading");
+    if (!config.aiConfigured) {
+      setModelCatalog(normalizeModelCatalog(null, config.aiModel));
+      setModelStatus("error");
+      return () => controller.abort();
+    }
+    request("/api/ai/models", { signal: controller.signal })
+      .then((data) => {
+        if (!alive.current || controller.signal.aborted) return;
+        const next = normalizeModelCatalog(data, config.aiModel);
+        setModelCatalog(next);
+        setModel((previous) => resolveModelSelection(previous, next));
+        setModelStatus(data.source === "configured" ? "fallback" : "ready");
+      })
+      .catch(() => {
+        if (!alive.current || controller.signal.aborted) return;
+        const fallback = normalizeModelCatalog(null, config.aiModel);
+        setModelCatalog(fallback);
+        setModel(fallback.defaultModel);
+        setModelStatus("error");
+      });
+    return () => controller.abort();
+  }, [config.aiConfigured, config.aiModel, modelRetry]);
   function queueSave(snapshot) {
     const saving = saveQueue.current.then(async () => {
       const result = await request("/api/workspace/ai-draft", {
@@ -371,6 +408,7 @@ function AiWorkspace({
     const id = saved?.requirementId || fallbackId;
     setRequirementId(id);
     setMode(["staged", "quick"].includes(state.mode) ? state.mode : "staged");
+    setModel(typeof state.model === "string" && state.model ? state.model : config.aiModel || "");
     setKnowledgeBaseIds(Array.isArray(state.knowledgeBaseIds) && canKnowledge ? state.knowledgeBaseIds : []);
     setReviewEnabled(state.reviewEnabled !== false);
     if (Array.isArray(state.review) && state.review.length === DIMENSIONS.length && state.review.every((item) => DIMENSIONS.includes(item.dimension))) setReview(state.review);
@@ -498,8 +536,9 @@ function AiWorkspace({
   const pointItems = draft?.points || [];
   const confirmedPoints =
     draft?.type === "points" ? pointItems : draft?.confirmedPoints || [];
+  const selectedModel = ["ready", "fallback"].includes(modelStatus) ? resolveModelSelection(model, modelCatalog) : config.aiModel || model;
   const blocked =
-    !canWrite || !cacheReady || !config.aiConfigured || busy !== "" || !requirementId;
+    !canWrite || !cacheReady || !config.aiConfigured || modelStatus === "loading" || busy !== "" || !requirementId;
   const saveBlocked = !canWrite || !canSave || !cacheReady || busy !== "" || !requirementId;
   const invalidCases =
     caseItems.length > 200 || caseItems.some((item) => !validCase(item));
@@ -546,7 +585,7 @@ function AiWorkspace({
     projectId: project.id,
     requirementId,
     state: {
-      mode, knowledgeBaseIds, reviewEnabled, review, instructions, history, answers,
+      mode, model, knowledgeBaseIds, reviewEnabled, review, instructions, history, answers,
       clarifications, confirmedAnswers, confirmedRulesOnly, draft, analysis,
       written: [...written], reviewStale, view, resultTab,
     },
@@ -582,7 +621,7 @@ function AiWorkspace({
         .catch(() => { if (alive.current && cacheRevision.current === revision) setCacheStatus(localSaved.current ? "error" : "failed"); });
     }, 450);
     return () => clearTimeout(timer);
-  }, [project.id, requirementId, cacheReady, mode, knowledgeBaseIds, reviewEnabled, review, instructions, history, answers, clarifications, confirmedAnswers, confirmedRulesOnly, draft, analysis, written, reviewStale, view, resultTab]);
+  }, [project.id, requirementId, cacheReady, mode, model, knowledgeBaseIds, reviewEnabled, review, instructions, history, answers, clarifications, confirmedAnswers, confirmedRulesOnly, draft, analysis, written, reviewStale, view, resultTab]);
   function report(failure) {
     if (failure.name !== "AbortError" && alive.current) {
       setError(failure.message);
@@ -747,6 +786,7 @@ function AiWorkspace({
           signal: controller.signal,
           body: JSON.stringify({
             projectId: project.id,
+            model: selectedModel,
             task: asRevision ? "revise" : task,
             outputType: asRevision ? draft.type : task,
             requirementId,
@@ -909,7 +949,7 @@ ${result.questions.map((question, index) => `${index + 1}. ${question}`).join("\
         </div>
         <span className="aw-model">
           <Bot size={15} />
-          {config.aiModel || "未配置模型"} ·{" "}
+          {selectedModel || "未配置模型"} ·{" "}
           {config.aiReasoningEffort || "默认"}
         </span>
       </div>
@@ -1498,6 +1538,30 @@ ${result.questions.map((question, index) => `${index + 1}. ${question}`).join("\
                 ))}
               </select>
             </label>
+            <div className="aw-model-setting">
+              <label className="field">
+                <span>生成模型</span>
+                <select
+                  aria-label="生成模型"
+                  value={selectedModel}
+                  disabled={disabledEdit || modelStatus === "loading" || !config.aiConfigured}
+                  onChange={(event) => setModel(event.target.value)}
+                >
+                  {modelCatalog.models.map((option) => (
+                    <option key={option.id} value={option.id}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                className="icon-button"
+                aria-label="刷新模型列表"
+                title="刷新模型列表"
+                disabled={disabledEdit || modelStatus === "loading" || !config.aiConfigured}
+                onClick={() => setModelRetry((value) => value + 1)}
+              ><RefreshCw size={16} /></button>
+            </div>
+            {["error", "fallback"].includes(modelStatus) && config.aiConfigured && <p className="aw-muted aw-model-warning">模型列表暂未同步，仅可使用当前默认模型。</p>}
             {canKnowledge && (
               <details>
                 <summary>知识库参考 ({knowledgeBaseIds.length}/10)</summary>
@@ -1663,7 +1727,7 @@ ${result.questions.map((question, index) => `${index + 1}. ${question}`).join("\
           )}
           <div className="aw-composer">
             <label className="field">
-              <span>{draft ? "补充规则或修改意见" : "测试范围（可选）"}</span>
+              <span title={mode === "staged" ? "分步模式按已审核并保留的测试点生成用例" : "快速模式按需求中已确认的规则生成用例"}>{draft ? "补充规则或修改意见" : "测试范围（留空按完整需求）"}</span>
               <textarea
                 aria-label="补充规则或修改意见"
                 maxLength={6e3}
@@ -1672,7 +1736,7 @@ ${result.questions.map((question, index) => `${index + 1}. ${question}`).join("\
                 placeholder={
                   draft
                     ? "例如：补充网络异常场景，删除重复测试点"
-                    : "例如：重点覆盖活动入口、奖励领取与异常处理"
+                    : "例如：仅覆盖活动入口与奖励领取"
                 }
                 onChange={(event) => setInstructions(event.target.value)}
               />

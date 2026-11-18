@@ -307,6 +307,7 @@ export function registerAiRoutes(app, { db, dataDir, sendError, authenticate, br
   const generating = new Set();
   app.post('/api/ai/generate', async (req, res) => {
     if (generating.has(req.user.id)) return sendError(res, 429, 'busy', '上一批用例仍在生成，请稍后重试');
+    res.setTimeout(16 * 60 * 1000);
     const controller = new AbortController();
     const disconnected = () => { if (!res.writableEnded) controller.abort(); };
     res.on('close', disconnected);
@@ -336,6 +337,10 @@ export function registerAiRoutes(app, { db, dataDir, sendError, authenticate, br
       if (error instanceof DocumentError) return sendError(res, error.status, 'ai_failed', error.message);
       console.error('Document AI generation failed:', error.name);
       sendError(res, 502, 'ai_failed', 'AI 服务暂时不可用，请检查服务配置或稍后重试');
-    } finally { generating.delete(req.user.id); res.removeListener('close', disconnected); }
+    } finally {
+      generating.delete(req.user.id);
+      res.removeListener('close', disconnected);
+      if (!res.destroyed) res.setTimeout(120000);
+    }
   });
 }

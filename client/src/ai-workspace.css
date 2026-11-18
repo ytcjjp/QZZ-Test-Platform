@@ -8,10 +8,25 @@
 .aw-model {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 7px;
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
   color: #718580;
   font-size: 12px;
 }
+.aw-model-setting {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 34px;
+  align-items: end;
+  gap: 8px;
+}
+.aw-model-setting .icon-button {
+  width: 34px;
+  height: 36px;
+}
+.aw-model-warning { margin: -8px 0 0; }
 .aw-cache-status {
   display: flex;
   align-items: center;

@@ -1,8 +1,9 @@
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import Ajv from 'ajv';
 import MarkdownIt from 'markdown-it';
-import { loadAiProvider, publicAiProvider } from './ai-provider.js';
+import { discoverAiModels, loadAiProvider, publicAiProvider, validAiModelId } from './ai-provider.js';
 import { runCodexData, prepareVisionImages, VISION_LIMITS } from './codex-generator.js';
 import { collectProjectContext } from './project-context.js';
 import { normalizeAiResult } from './ai-documents.js';
@@ -12,6 +13,7 @@ export const PLAN_SECTIONS = ['目标与范围', '策略与优先级', '环境�
 export const REVIEW_DIMENSIONS = ['覆盖完整性', '正确性', '冗余去重', '边界与异常', '步骤清晰度', '优先级合理性', '前置/数据完整性', '需求追溯'];
 const SKILL = fs.readFileSync(fileURLToPath(new URL('./skills/game-prd-testcases.md', import.meta.url)), 'utf8');
 const DRAFT_MAX_CHARS = 250000;
+const AI_GENERATION_SOCKET_TIMEOUT_MS = 16 * 60 * 1000;
 const markdown = new MarkdownIt({ html: false, maxNesting: 128 });
 const ajv = new Ajv({ strict: false, allErrors: false, validateFormats: false });
 const object = (properties) => ({ type: 'object', additionalProperties: false, required: Object.keys(properties), properties });
@@ -52,6 +54,8 @@ function inputValues(body) {
   const projectId = text(body.projectId, '项目组', 100);
   const requirementId = text(body.requirementId, '需求 ID', 100);
   if (!projectId || !requirementId) throw new WorkspaceAiError('请先选择项目组和需求文档');
+  const model = text(body.model, '模型', 120);
+  if (model && !validAiModelId(model)) throw new WorkspaceAiError('模型名称格式不正确');
   const knowledgeBaseIds = body.knowledgeBaseIds ?? [];
   if (!Array.isArray(knowledgeBaseIds) || knowledgeBaseIds.length > 10 || knowledgeBaseIds.some((value) => typeof value !== 'string' || !value || value.length > 100) || new Set(knowledgeBaseIds).size !== knowledgeBaseIds.length) throw new WorkspaceAiError('知识库选项不正确，一次最多选择 10 个');
   const review = body.review ?? [];
@@ -65,7 +69,7 @@ function inputValues(body) {
   if (draft !== null && (typeof draft !== 'object' || Array.isArray(draft) || JSON.stringify(draft).length > DRAFT_MAX_CHARS)) throw new WorkspaceAiError('待修订草稿格式不正确或内容过多');
   if (task === 'revise' && !draft) throw new WorkspaceAiError('请提供完整的待修订草稿');
   if (draft?.requirementId && draft.requirementId !== requirementId) throw new WorkspaceAiError('草稿不属于当前需求');
-  return { projectId, requirementId, task, type, knowledgeBaseIds, instructions: text(body.instructions, '补充说明', 12000), clarifications: text(body.clarifications, '规则回答', 12000), confirmedRulesOnly: body.confirmedRulesOnly === true, points: points.map((point) => ({ id: point.id, module: point.module, title: point.title, category: point.category, expected: point.expected, sourceIds: Array.isArray(point.sourceIds) ? point.sourceIds.filter((sourceId) => typeof sourceId === 'string' && sourceId.length <= 200).slice(0, 60) : [] })), draft, review: review.map(({ dimension, weight }) => ({ dimension, weight })), history: history.map(({ role, content }) => ({ role, content })) };
+  return { projectId, requirementId, model, task, type, knowledgeBaseIds, instructions: text(body.instructions, '补充说明', 12000), clarifications: text(body.clarifications, '规则回答', 12000), confirmedRulesOnly: body.confirmedRulesOnly === true, points: points.map((point) => ({ id: point.id, module: point.module, title: point.title, category: point.category, expected: point.expected, sourceIds: Array.isArray(point.sourceIds) ? point.sourceIds.filter((sourceId) => typeof sourceId === 'string' && sourceId.length <= 200).slice(0, 60) : [] })), draft, review: review.map(({ dimension, weight }) => ({ dimension, weight })), history: history.map(({ role, content }) => ({ role, content })) };
 }
 
 function permission(user, module, action) { return user?.role === 'admin' || Boolean(user?.permissions?.[module]?.[action]); }
@@ -138,8 +142,8 @@ export function normalizeWorkspaceOutput(raw, input, sources) {
 function taskInstructions(input) {
   if (input.type === 'analysis') return '分析当前需求，正文 Markdown 必须依次包含二级标题“功能清单”“界面描述”“待澄清项”。明确区分策划原文、界面图片可观察内容、缺失规则、前后矛盾；无界面依据时写明未提供，不能编造布局或入口。';
   if (input.type === 'plan') return `生成可人工确认的测试计划初稿，Markdown 必须依次包含二级标题：${PLAN_SECTIONS.join('、')}。人员、人天、时间和环境参数若无依据，用“待确认”占位并提问；不得伪造排期、人员或完成状态。`;
-  if (input.type === 'points') return '梳理可审核的测试点，按模块和四分支分类。每个测试点是一个明确场景，给出可观察预期。暂不输出大量详细操作用例；优先识别遗漏、重复与未知规则。';
-  return '生成测试用例，每条必须有前置条件、一句话执行步骤、可观察预期及需求出处。若提供已确认测试点，仅围绕这些测试点生成，不能将已删除测试点偷偷加回；必要补充项先放 questions 等待确认。分类使用技能四分支，单分支最多100条、合计最多200条；受影响模块必须有提供的需求/知识库/源码依据。';
+  if (input.type === 'points') return '梳理可审核的测试点，按模块和四分支分类。未限定范围时，逐条覆盖当前需求中全部已明确且可验证的规则、界面状态、边界异常和有证据的受影响模块，不要仅选新手流程、冒烟路径或示例场景。每个测试点是一个明确场景，给出可观察预期。暂不输出大量详细操作用例；识别遗漏、重复与未知规则。';
+  return `生成测试用例，每条必须有前置条件、一句话执行步骤、可观察预期及需求出处。${input.points.length ? '若提供已确认测试点，须逐条覆盖全部保留的测试点，不做冒烟抽样，不能将已删除测试点偷偷加回；必要补充项先放 questions 等待确认。' : '未限定范围时，覆盖当前需求中全部已明确且可验证的规则，不要只生成新手流程、冒烟用例或代表性样例。'}分类使用技能四分支，单分支最多100条、合计最多200条；受影响模块必须有提供的需求/知识库/源码依据。若无法在上限内完整覆盖，在 questions 中明确剩余范围并建议分模块生成，不得称部分结果为全量。`;
 }
 
 async function boundedJson(response) {
@@ -258,8 +262,25 @@ export async function generateWorkspaceTask(input, evidence, knowledge, { provid
   return result;
 }
 
-export function registerAiWorkspaceRoutes(app, { db, dataDir, workspace, requireProject, authenticate, sendError, loadProvider = loadAiProvider, generateTask = generateWorkspaceTask }) {
+export function registerAiWorkspaceRoutes(app, { db, dataDir, workspace, requireProject, authenticate, sendError, loadProvider = loadAiProvider, listModels = discoverAiModels, generateTask = generateWorkspaceTask }) {
   const active = new Set();
+  let modelCache;
+  async function availableModels(provider, refresh = false) {
+    const identity = [provider.baseUrl, provider.model, provider.mode, provider.reasoningEffort, crypto.createHash('sha256').update(provider.apiKey).digest('hex')].join('|');
+    if (!refresh && modelCache?.identity === identity && modelCache.expiresAt > Date.now()) return modelCache.value;
+    const value = await listModels(provider);
+    modelCache = { identity, value, expiresAt: Date.now() + (value.source === 'configured' ? 15000 : 5 * 60 * 1000) };
+    return value;
+  }
+  app.get('/api/ai/models', async (req, res) => {
+    try {
+      if (!permission(req.user, 'ai', 'write')) throw new WorkspaceAiError('没有查看 AI 模型所需的模块权限', 403);
+      res.set('Cache-Control', 'no-store');
+      res.json(await availableModels(loadProvider(dataDir), req.query.refresh === '1'));
+    } catch (error) {
+      sendError(res, error.status || 503, 'ai_models_error', error.publicMessage || '模型列表暂不可用，请稍后重试');
+    }
+  });
   if (db) {
     db.exec(`CREATE TABLE IF NOT EXISTS ai_workspace_drafts (
       user_id TEXT NOT NULL, project_id TEXT NOT NULL, requirement_id TEXT NOT NULL,
@@ -318,6 +339,8 @@ export function registerAiWorkspaceRoutes(app, { db, dataDir, workspace, require
     });
   }
   app.post('/api/workspace/ai', async (req, res) => {
+    // A Codex generation can take 15 minutes; the regular socket timeout is 2 minutes.
+    res.setTimeout(AI_GENERATION_SOCKET_TIMEOUT_MS);
     const controller = new AbortController();
     const disconnected = () => { if (!res.writableEnded) controller.abort(); };
     res.on('close', disconnected);
@@ -330,13 +353,18 @@ export function registerAiWorkspaceRoutes(app, { db, dataDir, workspace, require
       if (active.size >= 4) throw new WorkspaceAiError('当前 AI 任务较多，请稍后重试', 429);
       const provider = loadProvider(dataDir);
       if (!publicAiProvider(provider).aiConfigured) throw new WorkspaceAiError('AI 服务尚未配置，请联系管理员', 503);
+      if (input.model && input.model !== provider.model) {
+        const catalog = await availableModels(provider);
+        if (catalog.source === 'configured') throw new WorkspaceAiError('模型列表暂时无法同步，请稍后重试或使用默认模型', 503);
+        if (!catalog.models.some((model) => model.id === input.model)) throw new WorkspaceAiError('所选模型不在网关与本机 Codex 的可用列表中，请刷新模型列表', 400);
+      }
       active.add(req.user.id); ownsLock = true;
       const evidence = await workspace.getRequirementEvidence(input.projectId, input.requirementId);
       if (!evidence) throw new WorkspaceAiError('当前项目中不存在该需求，或需求已删除', 404);
       const query = [input.instructions.slice(0, 2000), input.clarifications.slice(0, 2000), evidence.requirement.title, (evidence.documents || []).map((document) => document.text).join('\n').slice(0, 7600)].join('\n').slice(0, 12000);
       const knowledge = await workspace.getKnowledgeContext(input.projectId, input.knowledgeBaseIds, query, { limit: 8, maxChars: 12000 });
       controller.signal.throwIfAborted();
-      const result = await generateTask(input, evidence, knowledge, { provider: { ...provider, dataDir }, signal: controller.signal });
+      const result = await generateTask(input, evidence, knowledge, { provider: { ...provider, model: input.model || provider.model, dataDir }, signal: controller.signal });
       if (controller.signal.aborted || res.destroyed) return;
       const fresh = authenticate(req);
       if (!fresh || fresh.id !== req.user.id) throw new WorkspaceAiError('登录已失效，请重新登录', 401);
@@ -353,6 +381,10 @@ export function registerAiWorkspaceRoutes(app, { db, dataDir, workspace, require
       if (error.status && error.status >= 400 && error.status < 500) return sendError(res, error.status, 'workspace_ai_error', error.message);
       console.error('Workspace AI failed:', error.name);
       sendError(res, 502, 'workspace_ai_error', 'AI 任务暂时不可用，请检查服务配置后重试');
-    } finally { if (ownsLock) active.delete(req.user.id); res.removeListener('close', disconnected); }
+    } finally {
+      if (ownsLock) active.delete(req.user.id);
+      res.removeListener('close', disconnected);
+      if (!res.destroyed) res.setTimeout(120000);
+    }
   });
 }

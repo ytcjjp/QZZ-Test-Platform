@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import os from 'node:os';
 import { loadPasswordKey, encryptPassword, decryptPassword } from './passwords.js';
 
 export const COMPANY_AI_DEFAULTS = {
@@ -8,6 +9,43 @@ export const COMPANY_AI_DEFAULTS = {
   model: 'gpt-6.1-sol', reasoningEffort: 'ultra', wireApi: 'responses',
   projectRoot: 'D:\\merge_happy.git',
 };
+const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,119}$/;
+
+export function validAiModelId(value) {
+  return typeof value === 'string' && MODEL_ID.test(value);
+}
+
+function localCodexModels(filename, reasoningEffort) {
+  try {
+    const catalog = JSON.parse(fs.readFileSync(filename, 'utf8'));
+    if (!Array.isArray(catalog.models)) return null;
+    return new Set(catalog.models.filter((entry) => validAiModelId(entry?.slug) &&
+      entry.visibility !== 'hide' &&
+      (!Array.isArray(entry.supported_reasoning_levels) || entry.supported_reasoning_levels.some((level) => level.effort === reasoningEffort)))
+      .map((entry) => entry.slug));
+  } catch { return null; }
+}
+
+export async function discoverAiModels(provider, { request = fetch, catalogFile = path.join(os.homedir(), '.codex', 'models_cache.json') } = {}) {
+  const defaultModel = provider.model;
+  const configured = { models: [{ id: defaultModel, label: defaultModel }], defaultModel, source: 'configured' };
+  if (!provider.apiKey || !validAiModelId(defaultModel)) return configured;
+  try {
+    const response = await request(new URL('models', provider.baseUrl), {
+      headers: { Authorization: `Bearer ${provider.apiKey}` }, signal: AbortSignal.timeout(8000),
+    });
+    if (!response.ok) return configured;
+    const payload = await response.json();
+    if (!Array.isArray(payload?.data) || payload.data.length > 500) return configured;
+    const gateway = [...new Set(payload.data.map((entry) => entry?.id).filter(validAiModelId))];
+    if (!gateway.length) return configured;
+    const local = provider.mode === 'codex' ? localCodexModels(catalogFile, provider.reasoningEffort) : null;
+    const available = gateway.filter((id) => !local || local.has(id));
+    if (!available.includes(defaultModel)) available.unshift(defaultModel);
+    available.sort((left, right) => left === defaultModel ? -1 : right === defaultModel ? 1 : left.localeCompare(right, 'en', { numeric: true }));
+    return { models: available.map((id) => ({ id, label: id })), defaultModel, source: local ? 'gateway+local' : 'gateway' };
+  } catch { return configured; }
+}
 
 function validateProvider(value) {
   const provider = { ...COMPANY_AI_DEFAULTS, ...value };

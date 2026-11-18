@@ -66,6 +66,24 @@ test('workspace analysis, eight-section plan, staged points and traced cases pre
   assert.equal(partial.points.length, 1);
 });
 
+test('unrestricted point and case generation requests complete evidence-backed coverage', async () => {
+  const prompts = [];
+  const options = {
+    provider, collectContext: async () => context(),
+    runCodex: async ({ prompt }) => {
+      prompts.push(prompt);
+      return prompts.length === 1 ? points() : cases();
+    },
+  };
+  await generateWorkspaceTask(input('points'), evidence(), knowledge(), options);
+  await generateWorkspaceTask(input('cases'), evidence(), knowledge(), options);
+  assert.match(prompts[0], /全部已明确且可验证的规则/);
+  assert.match(prompts[0], /不要仅选新手流程、冒烟路径/);
+  assert.match(prompts[1], /不要只生成新手流程、冒烟用例/);
+  assert.match(prompts[1], /不得称部分结果为全量/);
+  assert.equal(readPayload(prompts[1]).userInstructions, '');
+});
+
 test('workspace revise sends the complete prior draft and conversation without changing output type or fabricating citations', async () => {
   const prior = { type: 'analysis', requirementId: 'requirement-1', title: '上一版标题', content: '## 功能清单\n完整保留的功能甲与功能乙。\n## 界面描述\n原界面描述。\n## 待澄清项\n原问题。', questions: ['原问题'] };
   const history = [{ role: 'user', content: '只调整功能乙的界面描述。' }, { role: 'assistant', content: '保留功能甲及其他内容。' }];
@@ -188,7 +206,8 @@ test('workspace API checks project and module dependencies, rejects stale requir
   const users = Object.fromEntries(['member', 'no-ai', 'no-requirements', 'no-knowledge', 'no-cases'].map((name) => [name, { id: name, role: 'member', permissions: structuredClone(permissions) }]));
   users['no-ai'].permissions.ai.write = false; users['no-requirements'].permissions.requirements.view = false; users['no-knowledge'].permissions.knowledge.view = false; users['no-cases'].permissions.cases.write = false;
   app.use((req, res, next) => { req.user = users[req.headers['x-user'] || 'member']; next(); });
-  let revision = 1; let generatedCount = 0; let behavior = async () => ({ type: 'analysis', title: '分析草稿' });
+  let revision = 1; let generatedCount = 0; let selectedModel; let behavior = async () => ({ type: 'analysis', title: '分析草稿' });
+  let modelCatalog = { models: [{ id: 'gpt-6.1-sol', label: 'gpt-6.1-sol' }, { id: 'gpt-6-sol', label: 'gpt-6-sol' }], defaultModel: 'gpt-6.1-sol', source: 'gateway+local' };
   const workspace = {
     getRequirementEvidence(projectId, requirementId) { return projectId === 'project-1' && requirementId === 'requirement-1' ? { ...evidence(), requirement: { ...evidence().requirement, revision } } : null; },
     getRequirement(projectId, requirementId) { return projectId === 'project-1' && requirementId === 'requirement-1' ? { ...evidence().requirement, revision } : null; },
@@ -198,7 +217,7 @@ test('workspace API checks project and module dependencies, rejects stale requir
       return ids.length ? knowledge() : { chunks: [], images: [], warnings: [] };
     },
   };
-  registerAiWorkspaceRoutes(app, { dataDir: directory, workspace, requireProject: (projectId) => { if (!['project-1', 'project-2'].includes(projectId)) { const error = new Error('项目不存在'); error.status = 400; throw error; } return projectId; }, authenticate: (req) => users[req.headers['x-user'] || 'member'], sendError: (res, status, error, message) => res.status(status).json({ error, message }), loadProvider: () => ({ ...provider, dataDir: directory }), generateTask: (...args) => { generatedCount += 1; return behavior(...args); } });
+  registerAiWorkspaceRoutes(app, { dataDir: directory, workspace, requireProject: (projectId) => { if (!['project-1', 'project-2'].includes(projectId)) { const error = new Error('项目不存在'); error.status = 400; throw error; } return projectId; }, authenticate: (req) => users[req.headers['x-user'] || 'member'], sendError: (res, status, error, message) => res.status(status).json({ error, message }), loadProvider: () => ({ ...provider, dataDir: directory }), listModels: async () => modelCatalog, generateTask: (...args) => { generatedCount += 1; selectedModel = args[3].provider.model; return behavior(...args); } });
   const server = http.createServer(app); await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
   const body = { projectId: 'project-1', requirementId: 'requirement-1', task: 'analysis' };
@@ -217,7 +236,19 @@ test('workspace API checks project and module dependencies, rejects stale requir
     assert.equal((await post({ task: 'revise' })).status, 400);
     assert.equal((await post({ review: [{ dimension: '正确性', weight: 6 }] })).status, 400);
     assert.equal(generatedCount, 0);
+    const available = await fetch(base + '/api/ai/models');
+    assert.equal(available.status, 200);
+    assert.deepEqual((await available.json()).models.map(({ id }) => id), ['gpt-6.1-sol', 'gpt-6-sol']);
+    assert.equal((await fetch(base + '/api/ai/models', { headers: { 'x-user': 'no-ai' } })).status, 403);
+    assert.equal((await post({ model: 'gpt-6-sol' })).status, 200);
+    assert.equal(selectedModel, 'gpt-6-sol');
+    assert.equal((await post({ model: 'unknown-model' })).status, 400);
+    assert.equal((await post({ model: 'model with spaces' })).status, 400);
+    modelCatalog = { models: [{ id: provider.model, label: provider.model }], defaultModel: provider.model, source: 'configured' };
+    assert.equal((await fetch(base + '/api/ai/models?refresh=1')).status, 200);
+    assert.equal((await post({ model: 'gpt-6-sol' })).status, 503);
     assert.equal((await post({}, 'no-cases')).status, 200, 'analysis drafts do not require case-save permission');
+    assert.equal(selectedModel, provider.model);
     const prior = { type: 'plan', title: '旧计划', content: '完整旧计划', requirementId: 'requirement-1' };
     behavior = async (values) => { assert.equal(values.type, 'plan'); assert.deepEqual(values.draft, prior); return { type: 'plan', title: '修订计划' }; };
     assert.equal((await post({ task: 'revise', draft: prior, history: [{ role: 'user', content: '只调整交付物' }] })).status, 200);
@@ -246,6 +277,41 @@ test('workspace API checks project and module dependencies, rejects stale requir
     behavior = async (values) => { assert.deepEqual(values.points, points().points); return { type: 'cases' }; };
     assert.equal((await post({ task: 'revise', draft: published, points: [] })).status, 200);
   } finally { server.closeAllConnections(); await new Promise((resolve) => server.close(resolve)); await fs.rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }); }
+});
+
+test('workspace AI generation remains connected beyond the regular socket idle timeout', async () => {
+  const app = express(); app.use(express.json());
+  const user = { id: 'member', role: 'admin' };
+  app.use((req, res, next) => { req.user = user; next(); });
+  registerAiWorkspaceRoutes(app, {
+    dataDir: os.tmpdir(),
+    workspace: {
+      getRequirementEvidence: () => ({ requirement: { id: 'requirement-1', revision: 1, title: '需求' }, documents: [] }),
+      getRequirement: () => ({ id: 'requirement-1', revision: 1 }),
+      getKnowledgeContext: () => ({ chunks: [] }),
+    },
+    requireProject: () => {}, authenticate: () => user,
+    sendError: (res, status, error, message) => res.status(status).json({ error, message }),
+    loadProvider: () => provider,
+    generateTask: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      return { type: 'analysis', title: '生成完成' };
+    },
+  });
+  const server = http.createServer(app);
+  server.setTimeout(40);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/api/workspace/ai`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ projectId: 'project-1', requirementId: 'requirement-1', task: 'analysis' }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).title, '生成完成');
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
 });
 
 test('AI draft cache is durable per user, project and requirement with permission checks', async () => {

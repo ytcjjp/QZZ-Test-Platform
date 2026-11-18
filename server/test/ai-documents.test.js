@@ -294,3 +294,35 @@ test('document routes isolate users, deny raw requirements, and import browser t
     await fs.rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
   }
 });
+
+test('temporary document generation outlives the regular socket idle timeout', async () => {
+  const db = new Database(':memory:');
+  const app = express(); app.use(express.json());
+  const user = { id: 'one', role: 'admin' };
+  app.use((req, res, next) => { req.user = user; next(); });
+  registerAiRoutes(app, {
+    db, dataDir: os.tmpdir(), authenticate: () => user,
+    requireProject: () => {},
+    sendError: (res, status, error, message) => res.status(status).json({ error, message }),
+    loadProvider: () => ({ apiKey: 'test-key', model: 'test-model' }),
+    generateCases: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      return normalizeAiResult(generated());
+    },
+  });
+  db.prepare('INSERT INTO ai_documents VALUES (?, ?, ?, ?, ?)').run('document-1', user.id, '需求.md', '活动规则。', Date.now());
+  const server = http.createServer(app);
+  server.setTimeout(40);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/api/ai/generate`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ documentIds: ['document-1'] }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).tree.children[0].title, '主流程');
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+    db.close();
+  }
+});
