@@ -47,7 +47,7 @@ test('environment-only providers keep legacy chat compatibility and expose no ke
   } finally { await fs.rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }); }
 });
 
-test('model choices intersect the live gateway and local Codex catalog at the configured reasoning level', async () => {
+test('model choices include local xhigh-only models and expose per-model reasoning levels', async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'qzz-ai-models-'));
   const catalogFile = path.join(directory, 'models_cache.json');
   const provider = { mode: 'codex', model: 'gpt-6.1-sol', reasoningEffort: 'ultra', apiKey: 'private-fixture-key', baseUrl: 'https://gateway.example/v1/' };
@@ -55,19 +55,24 @@ test('model choices intersect the live gateway and local Codex catalog at the co
     await fs.writeFile(catalogFile, JSON.stringify({ models: [
       { slug: 'gpt-6-sol', visibility: 'list', supported_reasoning_levels: [{ effort: 'ultra' }] },
       { slug: 'gpt-6.1-sol', visibility: 'list', supported_reasoning_levels: [{ effort: 'ultra' }] },
+      { slug: 'gpt-xhigh-sol', visibility: 'list', supported_reasoning_levels: [{ effort: 'xhigh' }] },
       { slug: 'gpt-5-sol', visibility: 'list', supported_reasoning_levels: [{ effort: 'high' }] },
       { slug: 'hidden', visibility: 'hide' },
     ] }));
     const request = async (url, options) => {
       assert.equal(String(url), 'https://gateway.example/v1/models');
       assert.equal(options.headers.Authorization, 'Bearer private-fixture-key');
-      return { ok: true, json: async () => ({ data: ['gpt-6-sol', 'gpt-6.1-sol', 'gpt-5-sol', 'gateway-only', 'hidden', 'bad model'].map((id) => ({ id })) }) };
+      return { ok: true, json: async () => ({ data: ['gpt-6-sol', 'gpt-6.1-sol', 'gpt-xhigh-sol', 'gpt-5-sol', 'gateway-only', 'hidden', 'bad model'].map((id) => ({ id })) }) };
     };
     const found = await discoverAiModels(provider, { request, catalogFile });
-    assert.deepEqual(found, { models: [{ id: 'gpt-6.1-sol', label: 'gpt-6.1-sol' }, { id: 'gpt-6-sol', label: 'gpt-6-sol' }], defaultModel: 'gpt-6.1-sol', source: 'gateway+local' });
+    assert.deepEqual(found, { models: [
+      { id: 'gpt-6.1-sol', label: 'gpt-6.1-sol', reasoningEfforts: ['ultra'] },
+      { id: 'gpt-6-sol', label: 'gpt-6-sol', reasoningEfforts: ['ultra'] },
+      { id: 'gpt-xhigh-sol', label: 'gpt-xhigh-sol', reasoningEfforts: ['xhigh'] },
+    ], defaultModel: 'gpt-6.1-sol', source: 'gateway+local' });
     assert.equal(JSON.stringify(found).includes(provider.apiKey), false);
     const unavailable = await discoverAiModels(provider, { request: async () => { throw new Error('gateway offline'); }, catalogFile });
-    assert.deepEqual(unavailable, { models: [{ id: provider.model, label: provider.model }], defaultModel: provider.model, source: 'configured' });
+    assert.deepEqual(unavailable, { models: [{ id: provider.model, label: provider.model, reasoningEfforts: ['ultra'] }], defaultModel: provider.model, source: 'configured' });
     assert.equal(validAiModelId('gpt-6-sol'), true);
     assert.equal(validAiModelId('gpt-6-sol\nAuthorization: x'), false);
   } finally { await fs.rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }); }

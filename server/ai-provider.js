@@ -15,20 +15,27 @@ export function validAiModelId(value) {
   return typeof value === 'string' && MODEL_ID.test(value);
 }
 
-function localCodexModels(filename, reasoningEffort) {
+const SELECTABLE_EFFORTS = ['xhigh', 'ultra'];
+
+function localCodexModels(filename, defaultEffort) {
   try {
     const catalog = JSON.parse(fs.readFileSync(filename, 'utf8'));
     if (!Array.isArray(catalog.models)) return null;
-    return new Set(catalog.models.filter((entry) => validAiModelId(entry?.slug) &&
-      entry.visibility !== 'hide' &&
-      (!Array.isArray(entry.supported_reasoning_levels) || entry.supported_reasoning_levels.some((level) => level.effort === reasoningEffort)))
-      .map((entry) => entry.slug));
+    return new Map(catalog.models.filter((entry) => validAiModelId(entry?.slug) && entry.visibility !== 'hide')
+      .map((entry) => {
+        const supported = Array.isArray(entry.supported_reasoning_levels)
+          ? entry.supported_reasoning_levels.map((level) => level?.effort)
+          : [defaultEffort];
+        return [entry.slug, [...new Set([defaultEffort, ...SELECTABLE_EFFORTS].filter((effort) => supported.includes(effort)))]];
+      }).filter(([, efforts]) => efforts.length));
   } catch { return null; }
 }
 
 export async function discoverAiModels(provider, { request = fetch, catalogFile = path.join(os.homedir(), '.codex', 'models_cache.json') } = {}) {
   const defaultModel = provider.model;
-  const configured = { models: [{ id: defaultModel, label: defaultModel }], defaultModel, source: 'configured' };
+  const local = provider.mode === 'codex' ? localCodexModels(catalogFile, provider.reasoningEffort) : null;
+  const choices = (id) => local?.get(id) || [provider.reasoningEffort];
+  const configured = { models: [{ id: defaultModel, label: defaultModel, reasoningEfforts: choices(defaultModel) }], defaultModel, source: 'configured' };
   if (!provider.apiKey || !validAiModelId(defaultModel)) return configured;
   try {
     const response = await request(new URL('models', provider.baseUrl), {
@@ -39,11 +46,10 @@ export async function discoverAiModels(provider, { request = fetch, catalogFile 
     if (!Array.isArray(payload?.data) || payload.data.length > 500) return configured;
     const gateway = [...new Set(payload.data.map((entry) => entry?.id).filter(validAiModelId))];
     if (!gateway.length) return configured;
-    const local = provider.mode === 'codex' ? localCodexModels(catalogFile, provider.reasoningEffort) : null;
     const available = gateway.filter((id) => !local || local.has(id));
     if (!available.includes(defaultModel)) available.unshift(defaultModel);
     available.sort((left, right) => left === defaultModel ? -1 : right === defaultModel ? 1 : left.localeCompare(right, 'en', { numeric: true }));
-    return { models: available.map((id) => ({ id, label: id })), defaultModel, source: local ? 'gateway+local' : 'gateway' };
+    return { models: available.map((id) => ({ id, label: id, reasoningEfforts: choices(id) })), defaultModel, source: local ? 'gateway+local' : 'gateway' };
   } catch { return configured; }
 }
 

@@ -53,6 +53,27 @@ test('cloud disk preserves UTF-8 multipart names and original content', async ()
   assert.ok(downloaded.response.headers.get('content-disposition').includes(encodeURIComponent(file.name)));
 }));
 
+test('cloud disk accepts batches of files in a nested folder and preserves each download', async () => fixture(async ({ call, admin }) => {
+  const parent = (await call('/api/files/folders', { name: '批量导入' }, 'POST', admin)).body.folder;
+  const nested = (await call('/api/files/folders', { name: '空目录', parentId: parent.id }, 'POST', admin)).body.folder;
+  const form = new FormData();
+  for (const name of ['第一个.txt', '第二个.txt', 'third.txt']) form.append('file', new Blob([name]), name);
+  const uploaded = await call(`/api/files?folderId=${parent.id}`, form, 'POST', admin);
+  assert.equal(uploaded.status, 201);
+  assert.equal(uploaded.body.file.id, uploaded.body.files[0].id);
+  assert.deepEqual(uploaded.body.files.map((file) => file.name), ['第一个.txt', '第二个.txt', 'third.txt']);
+  assert.ok(uploaded.body.files.every((file) => file.folderId === parent.id));
+  for (const file of uploaded.body.files) {
+    const download = await call(file.downloadUrl, undefined, 'GET', admin);
+    assert.equal(download.body.toString('utf8'), file.name);
+  }
+  const listing = (await call(`/api/files?folderId=${parent.id}`, undefined, 'GET', admin)).body;
+  assert.equal(listing.files.length, 3);
+  assert.equal(listing.folders[0].id, nested.id);
+  const empty = (await call(`/api/files?folderId=${nested.id}`, undefined, 'GET', admin)).body;
+  assert.equal(empty.files.length, 0);
+}));
+
 test('legacy flat cloud files migrate into the root folder without changing bytes', async () => fixture(async ({ call, admin }) => {
   const listing = await call('/api/files', undefined, 'GET', admin);
   assert.equal(listing.status, 200);

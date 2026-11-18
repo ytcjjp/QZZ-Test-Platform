@@ -55,6 +55,8 @@ function inputValues(body) {
   if (!projectId || !requirementId) throw new WorkspaceAiError('请先选择项目组和需求文档');
   const model = text(body.model, '模型', 120);
   if (model && !validAiModelId(model)) throw new WorkspaceAiError('模型名称格式不正确');
+  const reasoningEffort = text(body.reasoningEffort, '推理强度', 12);
+  if (reasoningEffort && !['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(reasoningEffort)) throw new WorkspaceAiError('推理强度选项不正确');
   const knowledgeBaseIds = body.knowledgeBaseIds ?? [];
   if (!Array.isArray(knowledgeBaseIds) || knowledgeBaseIds.length > 10 || knowledgeBaseIds.some((value) => typeof value !== 'string' || !value || value.length > 100) || new Set(knowledgeBaseIds).size !== knowledgeBaseIds.length) throw new WorkspaceAiError('知识库选项不正确，一次最多选择 10 个');
   const review = body.review ?? [];
@@ -68,7 +70,7 @@ function inputValues(body) {
   if (draft !== null && (typeof draft !== 'object' || Array.isArray(draft) || JSON.stringify(draft).length > DRAFT_MAX_CHARS)) throw new WorkspaceAiError('待修订草稿格式不正确或内容过多');
   if (task === 'revise' && !draft) throw new WorkspaceAiError('请提供完整的待修订草稿');
   if (draft?.requirementId && draft.requirementId !== requirementId) throw new WorkspaceAiError('草稿不属于当前需求');
-  return { projectId, requirementId, model, task, type, knowledgeBaseIds, instructions: text(body.instructions, '补充说明', 12000), clarifications: text(body.clarifications, '规则回答', 12000), confirmedRulesOnly: body.confirmedRulesOnly === true, points: points.map((point) => ({ id: point.id, module: point.module, title: point.title, category: point.category, expected: point.expected, sourceIds: Array.isArray(point.sourceIds) ? point.sourceIds.filter((sourceId) => typeof sourceId === 'string' && sourceId.length <= 200).slice(0, 60) : [] })), draft, review: review.map(({ dimension, weight }) => ({ dimension, weight })), history: history.map(({ role, content }) => ({ role, content })) };
+  return { projectId, requirementId, model, reasoningEffort, task, type, knowledgeBaseIds, instructions: text(body.instructions, '补充说明', 12000), clarifications: text(body.clarifications, '规则回答', 12000), confirmedRulesOnly: body.confirmedRulesOnly === true, points: points.map((point) => ({ id: point.id, module: point.module, title: point.title, category: point.category, expected: point.expected, sourceIds: Array.isArray(point.sourceIds) ? point.sourceIds.filter((sourceId) => typeof sourceId === 'string' && sourceId.length <= 200).slice(0, 60) : [] })), draft, review: review.map(({ dimension, weight }) => ({ dimension, weight })), history: history.map(({ role, content }) => ({ role, content })) };
 }
 
 function permission(user, module, action) { return user?.role === 'admin' || Boolean(user?.permissions?.[module]?.[action]); }
@@ -352,10 +354,14 @@ export function registerAiWorkspaceRoutes(app, { db, dataDir, workspace, require
       if (active.size >= 4) throw new WorkspaceAiError('当前 AI 任务较多，请稍后重试', 429);
       const provider = loadProvider(dataDir);
       if (!publicAiProvider(provider).aiConfigured) throw new WorkspaceAiError('AI 服务尚未配置，请联系管理员', 503);
-      if (input.model && input.model !== provider.model) {
+      const selectedModel = input.model || provider.model;
+      const selectedEffort = input.reasoningEffort || provider.reasoningEffort;
+      if (selectedModel !== provider.model || selectedEffort !== provider.reasoningEffort) {
         const catalog = await availableModels(provider);
-        if (catalog.source === 'configured') throw new WorkspaceAiError('模型列表暂时无法同步，请稍后重试或使用默认模型', 503);
-        if (!catalog.models.some((model) => model.id === input.model)) throw new WorkspaceAiError('所选模型不在网关与本机 Codex 的可用列表中，请刷新模型列表', 400);
+        if (catalog.source === 'configured' && selectedModel !== provider.model) throw new WorkspaceAiError('模型列表暂时无法同步，请稍后重试或使用默认模型', 503);
+        const choice = catalog.models.find((model) => model.id === selectedModel);
+        if (!choice) throw new WorkspaceAiError('所选模型不在网关与本机 Codex 的可用列表中，请刷新模型列表', 400);
+        if (!(choice.reasoningEfforts || [provider.reasoningEffort]).includes(selectedEffort)) throw new WorkspaceAiError('所选模型不支持该推理强度，请刷新模型列表', 400);
       }
       active.add(req.user.id); ownsLock = true;
       const evidence = await workspace.getRequirementEvidence(input.projectId, input.requirementId);
@@ -363,7 +369,7 @@ export function registerAiWorkspaceRoutes(app, { db, dataDir, workspace, require
       const query = [input.instructions.slice(0, 2000), input.clarifications.slice(0, 2000), evidence.requirement.title, (evidence.documents || []).map((document) => document.text).join('\n').slice(0, 7600)].join('\n').slice(0, 12000);
       const knowledge = await workspace.getKnowledgeContext(input.projectId, input.knowledgeBaseIds, query, { limit: 8, maxChars: 12000 });
       controller.signal.throwIfAborted();
-      const options = { provider: { ...provider, model: input.model || provider.model, dataDir }, signal: controller.signal };
+      const options = { provider: { ...provider, model: selectedModel, reasoningEffort: selectedEffort, dataDir }, signal: controller.signal };
       let result;
       try {
         result = await generateTask(input, evidence, knowledge, options);

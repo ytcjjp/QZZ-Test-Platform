@@ -1,8 +1,10 @@
 .select-col { width: 42px; text-align: center; }
-.defect-table { min-width: 930px; }
+.defect-table { min-width: 1110px; }
 .defect-table th.select-col, .defect-table td.select-col { width: 42px; padding-left: 10px; padding-right: 10px; }
 .defect-table td.select-col { overflow: visible; text-overflow: clip; }
-.defect-table th.defect-title-col, .defect-table td.defect-title-col { width: 28%; padding-left: 12px; }
+.defect-table th.defect-title-col, .defect-table td.defect-title-col { width: 24%; padding-left: 12px; }
+.defect-table .defect-version-col { width: 12%; }
+.defect-filters select { max-width: 170px; }
 .defect-table th.defect-actions-col { width: 42px; }
 .select-col input { width: 16px; height: 16px; accent-color: var(--accent, #238b7d); cursor: pointer; }
 .record-selected { background: #eaf6f1; }

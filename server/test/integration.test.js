@@ -234,6 +234,28 @@ test('authenticated LAN APIs persist records and reject stale revisions', async 
     assert.equal(createdDefect.status, 201);
     const defectId = createdDefect.body.defect.id;
     assert.equal(createdDefect.body.defect.version, '1.0.0');
+    const blankDefect = await request(url, '/api/defects', cookie, {
+      method: 'POST', body: { projectId },
+    });
+    assert.equal(blankDefect.status, 201);
+    assert.equal(blankDefect.body.defect.title, '');
+    assert.equal(blankDefect.body.defect.module, '');
+    assert.equal(blankDefect.body.defect.version, '');
+      assert.equal(blankDefect.body.defect.severity, '一般');
+      assert.equal(blankDefect.body.defect.status, '待处理');
+    assert.equal(blankDefect.body.defect.reproSteps, '');
+    assert.equal(blankDefect.body.defect.actual, '');
+    assert.equal((await request(url, `/api/defects?projectId=${projectId}`, cookie)).body.defects.length, 2);
+    const blankId = blankDefect.body.defect.id;
+    assert.equal((await request(url, `/api/defects/${blankId}`, cookie, {
+      method: 'PUT', body: { projectId, revision: 1, title: '  ', version: ' 2.0.0 ' },
+    })).body.defect.version, '2.0.0');
+    assert.equal((await request(url, `/api/defects/${blankId}`, cookie, {
+      method: 'DELETE', body: { projectId, revision: 2 },
+    })).status, 200);
+    assert.equal((await request(url, '/api/defects', cookie, {
+      method: 'POST', body: { projectId, title: 42 },
+    })).status, 400);
     assert.equal((await request(url, `/api/defects/${defectId}`, cookie, {
       method: 'PUT', body: { projectId, revision: 1, status: 'fixed' },
     })).body.defect.revision, 2);

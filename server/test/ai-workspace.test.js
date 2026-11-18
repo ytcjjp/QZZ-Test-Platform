@@ -206,8 +206,8 @@ test('workspace API checks project and module dependencies, rejects stale requir
   const users = Object.fromEntries(['member', 'no-ai', 'no-requirements', 'no-knowledge', 'no-cases'].map((name) => [name, { id: name, role: 'member', permissions: structuredClone(permissions) }]));
   users['no-ai'].permissions.ai.write = false; users['no-requirements'].permissions.requirements.view = false; users['no-knowledge'].permissions.knowledge.view = false; users['no-cases'].permissions.cases.write = false;
   app.use((req, res, next) => { req.user = users[req.headers['x-user'] || 'member']; next(); });
-  let revision = 1; let generatedCount = 0; let selectedModel; let behavior = async () => ({ type: 'analysis', title: '分析草稿' });
-  let modelCatalog = { models: [{ id: 'gpt-6.1-sol', label: 'gpt-6.1-sol' }, { id: 'gpt-6-sol', label: 'gpt-6-sol' }], defaultModel: 'gpt-6.1-sol', source: 'gateway+local' };
+  let revision = 1; let generatedCount = 0; let selectedModel; let selectedEffort; let behavior = async () => ({ type: 'analysis', title: '分析草稿' });
+  let modelCatalog = { models: [{ id: 'gpt-6.1-sol', label: 'gpt-6.1-sol', reasoningEfforts: ['xhigh', 'ultra'] }, { id: 'gpt-6-sol', label: 'gpt-6-sol', reasoningEfforts: ['xhigh'] }], defaultModel: 'gpt-6.1-sol', source: 'gateway+local' };
   const workspace = {
     getRequirementEvidence(projectId, requirementId) { return projectId === 'project-1' && requirementId === 'requirement-1' ? { ...evidence(), requirement: { ...evidence().requirement, revision } } : null; },
     getRequirement(projectId, requirementId) { return projectId === 'project-1' && requirementId === 'requirement-1' ? { ...evidence().requirement, revision } : null; },
@@ -217,7 +217,7 @@ test('workspace API checks project and module dependencies, rejects stale requir
       return ids.length ? knowledge() : { chunks: [], images: [], warnings: [] };
     },
   };
-  registerAiWorkspaceRoutes(app, { dataDir: directory, workspace, requireProject: (projectId) => { if (!['project-1', 'project-2'].includes(projectId)) { const error = new Error('项目不存在'); error.status = 400; throw error; } return projectId; }, authenticate: (req) => users[req.headers['x-user'] || 'member'], sendError: (res, status, error, message) => res.status(status).json({ error, message }), loadProvider: () => ({ ...provider, dataDir: directory }), listModels: async () => modelCatalog, generateTask: (...args) => { generatedCount += 1; selectedModel = args[3].provider.model; return behavior(...args); } });
+  registerAiWorkspaceRoutes(app, { dataDir: directory, workspace, requireProject: (projectId) => { if (!['project-1', 'project-2'].includes(projectId)) { const error = new Error('项目不存在'); error.status = 400; throw error; } return projectId; }, authenticate: (req) => users[req.headers['x-user'] || 'member'], sendError: (res, status, error, message) => res.status(status).json({ error, message }), loadProvider: () => ({ ...provider, dataDir: directory }), listModels: async () => modelCatalog, generateTask: (...args) => { generatedCount += 1; selectedModel = args[3].provider.model; selectedEffort = args[3].provider.reasoningEffort; return behavior(...args); } });
   const server = http.createServer(app); await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
   const body = { projectId: 'project-1', requirementId: 'requirement-1', task: 'analysis' };
@@ -240,8 +240,13 @@ test('workspace API checks project and module dependencies, rejects stale requir
     assert.equal(available.status, 200);
     assert.deepEqual((await available.json()).models.map(({ id }) => id), ['gpt-6.1-sol', 'gpt-6-sol']);
     assert.equal((await fetch(base + '/api/ai/models', { headers: { 'x-user': 'no-ai' } })).status, 403);
-    assert.equal((await post({ model: 'gpt-6-sol' })).status, 200);
+    assert.equal((await post({ model: 'gpt-6-sol', reasoningEffort: 'xhigh' })).status, 200);
     assert.equal(selectedModel, 'gpt-6-sol');
+    assert.equal(selectedEffort, 'xhigh');
+    assert.equal((await post({ model: 'gpt-6-sol', reasoningEffort: 'ultra' })).status, 400);
+    assert.equal((await post({ reasoningEffort: 'xhigh' })).status, 200);
+    assert.equal(selectedEffort, 'xhigh');
+    assert.equal((await post({ reasoningEffort: 'unsupported' })).status, 400);
     assert.equal((await post({ model: 'unknown-model' })).status, 400);
     assert.equal((await post({ model: 'model with spaces' })).status, 400);
     modelCatalog = { models: [{ id: provider.model, label: provider.model }], defaultModel: provider.model, source: 'configured' };
@@ -249,6 +254,7 @@ test('workspace API checks project and module dependencies, rejects stale requir
     assert.equal((await post({ model: 'gpt-6-sol' })).status, 503);
     assert.equal((await post({}, 'no-cases')).status, 200, 'analysis drafts do not require case-save permission');
     assert.equal(selectedModel, provider.model);
+    assert.equal(selectedEffort, provider.reasoningEffort);
     const streamError = () => Object.assign(new Error('stream interrupted'), { code: 'CODEX_STREAM', status: 502, publicMessage: 'AI 返回流中断' });
     let attempts = 0; let releaseRetry; let retryStarted;
     const enteredRetry = new Promise((resolve) => { retryStarted = resolve; });

@@ -89,7 +89,7 @@ if (!db.prepare('PRAGMA table_info(cases)').all().some((column) => column.name =
 
 const userColumns = db.prepare('PRAGMA table_info(users)').all().map((column) => column.name);
 for (const [name, definition] of Object.entries({
-  disabled: 'INTEGER NOT NULL DEFAULT 0', permissions: 'TEXT', password_encrypted: 'TEXT',
+  disabled: 'INTEGER NOT NULL DEFAULT 0', permissions: 'TEXT', password_encrypted: 'TEXT', deleted_at: 'TEXT',
 })) {
   if (!userColumns.includes(name)) db.exec(`ALTER TABLE users ADD COLUMN ${name} ${definition}`);
 }
@@ -330,7 +330,7 @@ app.get('/api/config', (req, res) => {
 });
 
 app.get('/api/users', requireAdmin, (req, res) => {
-  const users = db.prepare('SELECT * FROM users ORDER BY created_at').all().map(mapUser);
+  const users = db.prepare('SELECT * FROM users WHERE deleted_at IS NULL ORDER BY created_at').all().map(mapUser);
   res.json({ users });
 });
 
@@ -374,7 +374,7 @@ app.post('/api/account/password', limitAccountAttempts, async (req, res) => {
 });
 
 app.put('/api/users/:id', requireAdmin, (req, res) => {
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
+  const user = db.prepare('SELECT * FROM users WHERE id = ? AND deleted_at IS NULL').get(req.params.id);
   if (!user) return sendError(res, 404, 'not_found', '账号不存在');
   const role = req.body?.role ?? user.role;
   const disabled = req.body?.disabled ?? Boolean(user.disabled);
@@ -397,6 +397,24 @@ app.put('/api/users/:id', requireAdmin, (req, res) => {
   res.json({ user: mapUser(db.prepare('SELECT * FROM users WHERE id = ?').get(user.id)) });
 });
 
+app.delete('/api/users/:id', requireAdmin, (req, res) => {
+  const user = db.prepare('SELECT * FROM users WHERE id = ? AND deleted_at IS NULL').get(req.params.id);
+  if (!user) return sendError(res, 404, 'not_found', '账号不存在');
+  if (user.id === req.user.id || user.role !== 'member') {
+    return sendError(res, 400, 'protected_admin', '管理员账号不能删除');
+  }
+  db.transaction(() => {
+    db.prepare(`UPDATE users SET username = ?, disabled = 1, password_hash = ?,
+      password_encrypted = NULL, permissions = ?, deleted_at = ? WHERE id = ?`)
+      .run(`已删除成员-${user.id}`, hashPassword(crypto.randomBytes(32).toString('base64url')),
+        JSON.stringify(Object.fromEntries(permissionModules.map((module) => [module, { view: false, write: false }]))),
+        new Date().toISOString(), user.id);
+    audit(req.user.id, user.id, 'user.deleted');
+  })();
+  invalidateUserSessions(user.id);
+  res.json({ ok: true });
+});
+
 app.post('/api/users/:id/reveal-password', requireAdmin, limitAccountAttempts, async (req, res) => {
   const admin = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
   const password = req.body?.currentPassword;
@@ -408,7 +426,7 @@ app.post('/api/users/:id/reveal-password', requireAdmin, limitAccountAttempts, a
   if (!freshAdmin || freshAdmin.role !== 'admin' || freshCredentials.password_hash !== admin.password_hash) {
     return sendError(res, 401, 'unauthorized', '账号已更新，请重新登录');
   }
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
+  const user = db.prepare('SELECT * FROM users WHERE id = ? AND deleted_at IS NULL').get(req.params.id);
   if (!user) return sendError(res, 404, 'not_found', '账号不存在');
   audit(req.user.id, user.id, 'password.revealed');
   res.set('Cache-Control', 'no-store');
@@ -561,10 +579,10 @@ app.delete('/api/cases/:id', (req, res) => {
 function normalizeDefect(body, previous = {}) {
   const source = body || {};
   const result = {
-    title: readString(source.title, 'title', 200, previous.title),
+    title: readString(source.title, 'title', 200, previous.title || ''),
     module: readString(source.module, 'module', 100, previous.module || ''),
-    severity: readString(source.severity, 'severity', 30, previous.severity || 'medium'),
-    status: readString(source.status, 'status', 30, previous.status || 'open'),
+    severity: readString(source.severity, 'severity', 30, previous.severity || '一般'),
+    status: readString(source.status, 'status', 30, previous.status || '待处理'),
     assignee: readString(source.assignee, 'assignee', 100, previous.assignee || ''),
     version: readString(source.version, 'version', 100, previous.version || ''),
     reproSteps: readString(source.reproSteps, 'reproSteps', 20000, previous.reproSteps || ''),
@@ -572,7 +590,6 @@ function normalizeDefect(body, previous = {}) {
     actual: readString(source.actual, 'actual', 20000, previous.actual || ''),
     notes: readString(source.notes, 'notes', 20000, previous.notes || ''),
   };
-  if (!result.title) throw new InputError('请输入缺陷标题');
   return result;
 }
 
@@ -655,7 +672,7 @@ const upload = multer({
     destination: uploadDir,
     filename: (req, file, callback) => callback(null, `${crypto.randomUUID()}.bin`),
   }),
-  limits: { files: 1, fields: 1, fieldSize: 100 },
+  limits: { files: 24, fields: 1, fieldSize: 100 },
 });
 
 const fileSelect = `SELECT files.*, users.username AS uploader_name FROM files
@@ -766,26 +783,28 @@ app.post('/api/files', (req, res, next) => {
   if (targetId && !getFolder.get(targetId)) return sendError(res, 404, 'not_found', '文件夹不存在');
   req.targetFolderId = targetId;
   next();
-}, upload.single('file'), (req, res) => {
-  if (!req.file) return sendError(res, 400, 'invalid_input', '请选择文件');
-  const name = uploadFilename(req.file.originalname, '');
-  if (!name) {
-    fs.unlinkSync(req.file.path);
+}, upload.array('file', 24), (req, res) => {
+  if (!req.files?.length) return sendError(res, 400, 'invalid_input', '请选择文件');
+  const entries = req.files.map((file) => ({ file, id: crypto.randomUUID(), name: uploadFilename(file.originalname, '') }));
+  const cleanup = () => { for (const { file } of entries) fs.rmSync(file.path, { force: true }); };
+  if (entries.some(({ name }) => !name)) {
+    cleanup();
     return sendError(res, 400, 'invalid_input', '文件名不能为空');
   }
-  const id = crypto.randomUUID();
   try {
-    db.prepare(`INSERT INTO files (id, name, stored_name, mime_type, size, uploaded_by, created_at, folder_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(id, name, req.file.filename, req.file.mimetype || 'application/octet-stream',
-        req.file.size, req.user.id, new Date().toISOString(), req.targetFolderId);
+    const insert = db.prepare(`INSERT INTO files (id, name, stored_name, mime_type, size, uploaded_by, created_at, folder_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
+    db.transaction(() => {
+      for (const { file, id, name } of entries) insert.run(id, name, file.filename, file.mimetype || 'application/octet-stream',
+        file.size, req.user.id, new Date().toISOString(), req.targetFolderId);
+    })();
   } catch (error) {
-    fs.unlinkSync(req.file.path);
+    cleanup();
     throw error;
   }
-  const record = mapFile(getFile.get(id));
-  broadcast('file.created', { file: record });
-  res.status(201).json({ file: record });
+  const records = entries.map(({ id }) => mapFile(getFile.get(id)));
+  for (const file of records) broadcast('file.created', { file });
+  res.status(201).json({ file: records[0], files: records });
 });
 
 app.patch('/api/files/:id', (req, res) => {

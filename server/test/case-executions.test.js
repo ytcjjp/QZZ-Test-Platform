@@ -40,28 +40,51 @@ async function fixture(run) {
   finally { server.closeAllConnections(); await new Promise((resolve) => server.close(resolve)); db.close(); await fs.rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); }
 }
 
-test('node execution statuses persist all three states and independent revisions without modifying the case tree or legacy data', async () => fixture(async ({ db, file, call, events }) => {
+test('node execution statuses persist all four states and independent revisions without modifying the case tree or legacy data', async () => fixture(async ({ db, file, call, events }) => {
   const before = db.prepare('SELECT * FROM cases WHERE id=?').get('set-a');
   const route = '/api/cases/set-a/node-statuses';
   const initial = await call(route + '?projectId=a');
   assert.equal(initial.status, 200); assert.deepEqual(initial.body.statuses, []); assert.equal(initial.body.caseRevision, 7); assert.equal(initial.response.headers.get('cache-control'), 'no-store');
   let status = (await call(route + '/first', { projectId: 'a', status: '测试通过', revision: 0 })).body.nodeStatus;
   assert.deepEqual({ ...status, updatedAt: '' }, { nodeId: 'first', status: '测试通过', revision: 1, updatedAt: '', updatedBy: '测试人员' });
+  status = (await call(route + '/first', { projectId: 'a', status: '测试不通过', revision: status.revision })).body.nodeStatus;
+  assert.equal(status.status, '测试不通过'); assert.equal(status.revision, 2);
   const conflict = await call(route + '/first', { projectId: 'a', status: '跳过', revision: 0 });
   assert.equal(conflict.status, 409); assert.deepEqual(conflict.body.nodeStatus, status);
   status = (await call(route + '/first', { projectId: 'a', status: '跳过', revision: status.revision })).body.nodeStatus;
-  assert.equal(status.revision, 2);
-  const unchanged = await call(route + '/first', { projectId: 'a', status: '跳过', revision: 2 });
-  assert.deepEqual(unchanged.body.nodeStatus, status); assert.equal(events.length, 2);
+  assert.equal(status.revision, 3);
+  const unchanged = await call(route + '/first', { projectId: 'a', status: '跳过', revision: 3 });
+  assert.deepEqual(unchanged.body.nodeStatus, status); assert.equal(events.length, 3);
   status = (await call(route + '/first', { projectId: 'a', status: '待测试' })).body.nodeStatus;
-  assert.equal(status.revision, 3); assert.equal(status.status, '待测试');
+  assert.equal(status.revision, 4); assert.equal(status.status, '待测试');
   assert.deepEqual(db.prepare('SELECT * FROM cases WHERE id=?').get('set-a'), before);
   initializeCaseExecutions(db); initializeCaseExecutions(db);
   const reopened = new Database(file);
-  try { initializeCaseExecutions(reopened); assert.deepEqual(reopened.prepare('SELECT node_id,status,revision FROM case_node_statuses').all(), [{ node_id: 'first', status: '待测试', revision: 3 }]); }
+  try { initializeCaseExecutions(reopened); assert.deepEqual(reopened.prepare('SELECT node_id,status,revision FROM case_node_statuses').all(), [{ node_id: 'first', status: '待测试', revision: 4 }]); }
   finally { reopened.close(); }
   assert.deepEqual(events[0], { type: 'case.node-status-updated', projectId: 'a', caseId: 'set-a', nodeStatus: { ...events[0].nodeStatus, nodeId: 'first', status: '测试通过', revision: 1, updatedBy: '测试人员' } });
   assert.ok(!Object.hasOwn(events[0], 'tree'));
+}));
+
+test('existing three-state execution records migrate without losing history or case cascade', async () => fixture(async ({ db, call }) => {
+  db.exec(`DROP TABLE case_node_statuses;
+    CREATE TABLE case_node_statuses (
+      case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+      node_id TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('待测试','测试通过','跳过')),
+      revision INTEGER NOT NULL CHECK (revision > 0),
+      updated_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+      updated_at TEXT NOT NULL, PRIMARY KEY (case_id, node_id)
+    );`);
+  db.prepare('INSERT INTO case_node_statuses VALUES(?,?,?,?,?,?)').run('set-a', 'first', '测试通过', 8, 'writer', '2026-11-18T00:00:00Z');
+  initializeCaseExecutions(db);
+  initializeCaseExecutions(db);
+  assert.deepEqual(db.prepare('SELECT node_id,status,revision,updated_at FROM case_node_statuses').all(), [
+    { node_id: 'first', status: '测试通过', revision: 8, updated_at: '2026-11-18T00:00:00Z' },
+  ]);
+  const changed = await call('/api/cases/set-a/node-statuses/first', { projectId: 'a', status: '测试不通过', revision: 8 });
+  assert.equal(changed.status, 200); assert.equal(changed.body.nodeStatus.revision, 9);
+  db.prepare('DELETE FROM cases WHERE id=?').run('set-a');
+  assert.equal(db.prepare('SELECT count(*) AS count FROM case_node_statuses').get().count, 0);
 }));
 
 test('node status APIs enforce account, project, node and write permissions and reject invalid states or stale CAS without side effects', async () => fixture(async ({ db, call, users, events }) => {

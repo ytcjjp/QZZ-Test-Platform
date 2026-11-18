@@ -18,7 +18,7 @@
 }
 .aw-model-setting {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 34px;
+  grid-template-columns: minmax(0, 1fr) minmax(96px, 118px) 34px;
   align-items: end;
   gap: 8px;
 }

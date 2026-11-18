@@ -46,7 +46,7 @@ const signature = (title, tree) => JSON.stringify([title, canonicalTree(tree)]);
 const FONT_SIZES = Array.from({ length: 19 }, (_, index) => `${12 + index * 2}px`);
 const EMPTY_FORMAT = { fontSize: null, color: null, background: null, bold: false, italic: false, underline: false };
 const CLEAR_STYLE_PROPERTIES = ['font-size', 'color', 'background', 'font-weight', 'font-style', 'text-decoration'];
-export const TEST_STATUSES = ['待测试', '测试通过', '跳过'];
+export const TEST_STATUSES = ['待测试', '测试通过', '测试不通过', '跳过'];
 const CASE_FIELDS = [
   ['preconditions', /^(?:前置条件|前提条件|前置)(?:[：:]\s*([\s\S]*))?$/],
   ['steps', /^(?:执行步骤|操作步骤|测试步骤|步骤)(?:[：:]\s*([\s\S]*))?$/],

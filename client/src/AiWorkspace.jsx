@@ -20,7 +20,7 @@ import {
 } from "lucide-react";
 import AiDocuments from "./AiDocuments";
 import { MarkdownView } from "./WorkspaceDocuments";
-import { normalizeModelCatalog, resolveModelSelection } from "./ai-models";
+import { modelReasoningEfforts, normalizeModelCatalog, resolveModelSelection, resolveReasoningSelection } from "./ai-models";
 import "./ai-workspace.css";
 const CATEGORIES = ["主流程", "UI", "异常与边界", "受影响模块"];
 const DIMENSIONS = [
@@ -233,7 +233,8 @@ function AiWorkspace({
   );
   const [knowledgeBaseIds, setKnowledgeBaseIds] = useState([]);
   const [model, setModel] = useState(config.aiModel || "");
-  const [modelCatalog, setModelCatalog] = useState(() => normalizeModelCatalog(null, config.aiModel));
+  const [reasoningEffort, setReasoningEffort] = useState(config.aiReasoningEffort || "ultra");
+  const [modelCatalog, setModelCatalog] = useState(() => normalizeModelCatalog(null, config.aiModel, config.aiReasoningEffort));
   const [modelStatus, setModelStatus] = useState("loading");
   const [modelRetry, setModelRetry] = useState(0);
   const [mode, setMode] = useState("staged");
@@ -357,6 +358,7 @@ function AiWorkspace({
     setLibraries([]);
     setKnowledgeBaseIds([]);
     setModel(config.aiModel || "");
+    setReasoningEffort(config.aiReasoningEffort || "ultra");
     setInstructions("");
     setRequirementId(
       initialRequirement?.projectId &&
@@ -369,27 +371,27 @@ function AiWorkspace({
     const controller = new AbortController();
     setModelStatus("loading");
     if (!config.aiConfigured) {
-      setModelCatalog(normalizeModelCatalog(null, config.aiModel));
+      setModelCatalog(normalizeModelCatalog(null, config.aiModel, config.aiReasoningEffort));
       setModelStatus("error");
       return () => controller.abort();
     }
-    request("/api/ai/models", { signal: controller.signal })
+    request(modelRetry ? "/api/ai/models?refresh=1" : "/api/ai/models", { signal: controller.signal })
       .then((data) => {
         if (!alive.current || controller.signal.aborted) return;
-        const next = normalizeModelCatalog(data, config.aiModel);
+        const next = normalizeModelCatalog(data, config.aiModel, config.aiReasoningEffort);
         setModelCatalog(next);
         setModel((previous) => resolveModelSelection(previous, next));
         setModelStatus(data.source === "configured" ? "fallback" : "ready");
       })
       .catch(() => {
         if (!alive.current || controller.signal.aborted) return;
-        const fallback = normalizeModelCatalog(null, config.aiModel);
+        const fallback = normalizeModelCatalog(null, config.aiModel, config.aiReasoningEffort);
         setModelCatalog(fallback);
         setModel(fallback.defaultModel);
         setModelStatus("error");
       });
     return () => controller.abort();
-  }, [config.aiConfigured, config.aiModel, modelRetry]);
+  }, [config.aiConfigured, config.aiModel, config.aiReasoningEffort, modelRetry]);
   function queueSave(snapshot) {
     const saving = saveQueue.current.then(async () => {
       const result = await request("/api/workspace/ai-draft", {
@@ -409,6 +411,7 @@ function AiWorkspace({
     setRequirementId(id);
     setMode(["staged", "quick"].includes(state.mode) ? state.mode : "staged");
     setModel(typeof state.model === "string" && state.model ? state.model : config.aiModel || "");
+    setReasoningEffort(typeof state.reasoningEffort === "string" && state.reasoningEffort ? state.reasoningEffort : config.aiReasoningEffort || "ultra");
     setKnowledgeBaseIds(Array.isArray(state.knowledgeBaseIds) && canKnowledge ? state.knowledgeBaseIds : []);
     setReviewEnabled(state.reviewEnabled !== false);
     if (Array.isArray(state.review) && state.review.length === DIMENSIONS.length && state.review.every((item) => DIMENSIONS.includes(item.dimension))) setReview(state.review);
@@ -537,6 +540,8 @@ function AiWorkspace({
   const confirmedPoints =
     draft?.type === "points" ? pointItems : draft?.confirmedPoints || [];
   const selectedModel = ["ready", "fallback"].includes(modelStatus) ? resolveModelSelection(model, modelCatalog) : config.aiModel || model;
+  const availableEfforts = modelReasoningEfforts(selectedModel, modelCatalog, config.aiReasoningEffort || "ultra");
+  const selectedEffort = resolveReasoningSelection(reasoningEffort, selectedModel, modelCatalog, config.aiReasoningEffort || "ultra");
   const blocked =
     !canWrite || !cacheReady || !config.aiConfigured || modelStatus === "loading" || busy !== "" || !requirementId;
   const saveBlocked = !canWrite || !canSave || !cacheReady || busy !== "" || !requirementId;
@@ -585,7 +590,7 @@ function AiWorkspace({
     projectId: project.id,
     requirementId,
     state: {
-      mode, model, knowledgeBaseIds, reviewEnabled, review, instructions, history, answers,
+      mode, model, reasoningEffort, knowledgeBaseIds, reviewEnabled, review, instructions, history, answers,
       clarifications, confirmedAnswers, confirmedRulesOnly, draft, analysis,
       written: [...written], reviewStale, view, resultTab,
     },
@@ -621,7 +626,7 @@ function AiWorkspace({
         .catch(() => { if (alive.current && cacheRevision.current === revision) setCacheStatus(localSaved.current ? "error" : "failed"); });
     }, 450);
     return () => clearTimeout(timer);
-  }, [project.id, requirementId, cacheReady, mode, model, knowledgeBaseIds, reviewEnabled, review, instructions, history, answers, clarifications, confirmedAnswers, confirmedRulesOnly, draft, analysis, written, reviewStale, view, resultTab]);
+  }, [project.id, requirementId, cacheReady, mode, model, reasoningEffort, knowledgeBaseIds, reviewEnabled, review, instructions, history, answers, clarifications, confirmedAnswers, confirmedRulesOnly, draft, analysis, written, reviewStale, view, resultTab]);
   function report(failure) {
     if (failure.name !== "AbortError" && alive.current) {
       setError(failure.message);
@@ -787,6 +792,7 @@ function AiWorkspace({
           body: JSON.stringify({
             projectId: project.id,
             model: selectedModel,
+            reasoningEffort: selectedEffort,
             task: asRevision ? "revise" : task,
             outputType: asRevision ? draft.type : task,
             requirementId,
@@ -950,7 +956,7 @@ ${result.questions.map((question, index) => `${index + 1}. ${question}`).join("\
         <span className="aw-model">
           <Bot size={15} />
           {selectedModel || "未配置模型"} ·{" "}
-          {config.aiReasoningEffort || "默认"}
+          {selectedEffort === "xhigh" ? "极高" : selectedEffort === "ultra" ? "Ultra" : selectedEffort}
         </span>
       </div>
       {(requirementId || cacheStatus === "load-error") && <div className={`aw-cache-status ${["error", "failed", "load-error"].includes(cacheStatus) || recovery ? "error" : ""}`} role="status">
@@ -1549,6 +1555,19 @@ ${result.questions.map((question, index) => `${index + 1}. ${question}`).join("\
                 >
                   {modelCatalog.models.map((option) => (
                     <option key={option.id} value={option.id}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="field">
+                <span>推理强度</span>
+                <select
+                  aria-label="推理强度"
+                  value={selectedEffort}
+                  disabled={disabledEdit || modelStatus === "loading" || !config.aiConfigured}
+                  onChange={(event) => setReasoningEffort(event.target.value)}
+                >
+                  {availableEfforts.map((effort) => (
+                    <option key={effort} value={effort}>{effort === "xhigh" ? "极高" : effort === "ultra" ? "Ultra" : effort}</option>
                   ))}
                 </select>
               </label>

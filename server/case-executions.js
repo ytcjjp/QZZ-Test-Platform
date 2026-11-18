@@ -1,4 +1,4 @@
-export const CASE_NODE_STATUSES = Object.freeze(['待测试', '测试通过', '跳过']);
+export const CASE_NODE_STATUSES = Object.freeze(['待测试', '测试通过', '测试不通过', '跳过']);
 const NODE_ID = /^[A-Za-z0-9_-]{1,100}$/;
 
 class ExecutionError extends Error {
@@ -19,15 +19,24 @@ function treeIds(tree) {
 }
 
 export function initializeCaseExecutions(db) {
-  db.exec(`CREATE TABLE IF NOT EXISTS case_node_statuses (
+  const schema = `CREATE TABLE case_node_statuses (
     case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
     node_id TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('待测试','测试通过','跳过')),
+    status TEXT NOT NULL CHECK (status IN ('待测试','测试通过','测试不通过','跳过')),
     revision INTEGER NOT NULL CHECK (revision > 0),
     updated_by TEXT REFERENCES users(id) ON DELETE SET NULL,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (case_id, node_id)
-  )`);
+  )`;
+  const existing = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='case_node_statuses'").get();
+  if (!existing) { db.exec(schema); return; }
+  if (existing.sql.includes("'测试不通过'")) return;
+  db.transaction(() => {
+    db.exec(schema.replace('case_node_statuses (', 'case_node_statuses_migrated ('));
+    db.exec('INSERT INTO case_node_statuses_migrated SELECT * FROM case_node_statuses');
+    db.exec('DROP TABLE case_node_statuses');
+    db.exec('ALTER TABLE case_node_statuses_migrated RENAME TO case_node_statuses');
+  }).immediate();
 }
 
 export function registerCaseExecutionRoutes(app, { db, projects, requirePermission, broadcast = () => {}, sendError } = {}) {
@@ -67,7 +76,7 @@ export function registerCaseExecutionRoutes(app, { db, projects, requirePermissi
     const nodeId = req.params.nodeId;
     if (!NODE_ID.test(nodeId) || !ids.has(nodeId)) throw new ExecutionError('此导图节点不存在或已被删除，请刷新用例集。', 404, 'not_found');
     const status = req.body?.status;
-    if (!CASE_NODE_STATUSES.includes(status)) throw new ExecutionError('节点状态只能为待测试、测试通过或跳过。');
+    if (!CASE_NODE_STATUSES.includes(status)) throw new ExecutionError('节点状态只能为待测试、测试通过、测试不通过或跳过。');
     const revision = req.body?.revision;
     if (revision !== undefined && (!Number.isSafeInteger(revision) || revision < 0)) throw new ExecutionError('节点 revision 格式不正确。');
     const current = getStatus.get(row.id, nodeId);

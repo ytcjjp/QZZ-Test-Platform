@@ -28,6 +28,7 @@
 - `PATCH /api/account` 当前只接受空对象读取账号；不允许普通成员修改角色、权限或其他用户。
 - `GET /api/users`、`POST /api/users`：仅管理员可列出和创建用户，创建请求为 `{username,password}`。
 - `PUT /api/users/:id`：仅管理员可修改 `{role?,disabled?,permissions?,password?}`，修改后撤销目标用户其他会话。
+- `DELETE /api/users/:id`：仅管理员可删除普通成员，撤销会话并清除凭据；保留历史记录外键，释放原账号名，管理员不可删除。
 - `POST /api/users/:id/reveal-password`：仅管理员，必须传 `{currentPassword}` 再次验证管理员密码，返回 `{available,password}`；旧密码副本不存在时返回 `available:false,password:null`。
 
 账号名为 2-32 位文字、数字或 `._-`，密码为 6-200 位。`admin` 是保留管理员，
@@ -104,7 +105,7 @@ DOCX 嵌图会提取并明确提示；扫描 PDF 当前无 OCR，需补截图或
 
 工作区 AI API：
 
-`POST /api/workspace/ai` 接收 `{projectId,requirementId,task,knowledgeBaseIds?,instructions?,clarifications?,confirmedRulesOnly?,points?,review?,history?,draft?,outputType?}`。
+`POST /api/workspace/ai` 接收 `{projectId,requirementId,task,model?,reasoningEffort?,knowledgeBaseIds?,instructions?,clarifications?,confirmedRulesOnly?,points?,review?,history?,draft?,outputType?}`。模型及推理档位根据 `/api/ai/models` 的本机与网关列表选择，切换时由服务端再次校验，不修改默认配置。
 `task` 为 `analysis/plan/points/cases/revise`；修订须传完整 `draft` 和原 `outputType`。
 一次最多引用 10 个本项目知识库，检索注入最多 8 个文本块、12000 字符；
 需求正文单轮最多 10 万字符。补充说明和回答各最多 12000 字符，对话最多 40 条、
@@ -131,13 +132,13 @@ AI 任务需 `ai.write` 和 `requirements.view`；引用知识库另需 `knowled
 
 AI 优先读取 `data/ai-provider.json` 中的固定本机配置，密钥以原有 `password-key`
 进行 AES-GCM 加密，不返回给网页。当前配置通过本机 Codex 使用公司 Responses 网关，
-模型 `gpt-6.1-sol`、档位 `ultra`。当前 CLI 将该档位序列化为网关支持的 `xhigh`；
+默认模型 `gpt-6.1-sol`、档位 `ultra`。AI 用例生成可选择本机支持的 `xhigh`（页面显示“极高”）或 `ultra`；
 已核对真实请求的 `store:false`。CLI 使用独立运行目录和临时输出 schema。
 平台只读采集点点消项目白名单中的相关源码片段，作为材料交给 Codex 分析；
 分析和计划任务除外，不采集源码。生成进程禁用系统命令及插件初始化，保持只读沙箱。
 网关请求配置 `request_max_retries=2`、流恢复配置 `stream_max_retries=1`，
-不做无限重试，仍受总超时和取消约束。临时提示及结果文件在完成或取消后清理。
-最长等待 15 分钟，网页取消或断开会终止本次子进程树并释放生成锁。
+不做无限重试；不设固定总时长，仍受长时间无输出看门狗与手动取消约束。临时提示及结果文件在完成或取消后清理。
+网页取消或断开会终止本次子进程树并释放生成锁。
 
 Codex 非正常退出按终端模型错误提供受控分类：认证、模型、接口、结构化协议、上下文容量、
 限流、连接/流中断、超时、本机运行环境，未知错误保留通用退出提示。启动警告中的 HTTP
@@ -179,7 +180,7 @@ AI 临时来源仅保存正文，图片应导入项目需求或知识库后参�
 `files`、`folders`、`path` 和 `allFolders`；旧文件仍在根目录。`POST /api/files/folders` 传
 `{name,parentId?}`，`PUT /api/files/folders/:id` 传 `{name}`，`DELETE` 只允许空文件夹；
 `PATCH /api/files/:id` 传 `{folderId:null|id}` 移动文件。上传至指定目录用
-`POST /api/files?folderId=...`，不传时上传到根目录。应用不再设置单文件大小上限，
+`POST /api/files?folderId=...`，不传时上传到根目录；同一请求最多 24 个 `file` 字段，网页自动分批，返回 `files` 数组并保留单文件兼容字段 `file`。文件夹拖入会先建立对应目录层级。应用不再设置单文件大小上限，
 `MAX_UPLOAD_MB` 已停用；上传允许持续超过 Node 默认的五分钟整请求时间，但连接空闲
 两分钟会断开。实际可上传大小仍取决于剩余磁盘空间、浏览器和网络代理限制。
 新上传文件名统一修复 multipart UTF-8 被按 Latin-1 解码的问题，保留原生 Unicode 文件名，

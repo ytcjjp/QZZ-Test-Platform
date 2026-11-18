@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowDownToLine, ChevronRight, CloudUpload, FileText, FolderInput, FolderOpen,
   FolderPlus, Pencil, RefreshCw, Trash2, Upload, X } from 'lucide-react';
+import { collectDroppedItems, collectSelectedItems, uploadFolderPaths } from './cloud-upload.js';
 import './CloudFilesPage.css';
 
 async function request(path, options = {}) {
@@ -41,10 +42,12 @@ export default function CloudFilesPage({ canWrite, refreshToken, showError, onNo
   const [refresh, setRefresh] = useState(0);
   const [dragging, setDragging] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(null);
   const [dialog, setDialog] = useState(null);
   const [name, setName] = useState('');
   const [targetId, setTargetId] = useState('');
   const fileInput = useRef(null);
+  const folderInput = useRef(null);
 
   useEffect(() => {
     let canceled = false;
@@ -72,15 +75,65 @@ export default function CloudFilesPage({ canWrite, refreshToken, showError, onNo
       .sort((left, right) => left.name.localeCompare(right.name, 'zh-CN'));
   }, [listing.allFolders]);
 
-  async function upload(file) {
-    if (!file) return;
+  async function uploadItems(itemsPromise) {
+    if (busy) return;
     setBusy(true);
+    let completed = 0;
+    let createdFolders = 0;
     try {
-      const body = new FormData(); body.append('file', file);
-      await request(`/api/files${folderId ? `?folderId=${encodeURIComponent(folderId)}` : ''}`, { method: 'POST', body });
-      onNotice('文件已上传'); setRefresh((value) => value + 1);
-    } catch (error) { showError(error.message); }
-    finally { setBusy(false); if (fileInput.current) fileInput.current.value = ''; }
+      const items = await itemsPromise;
+      if (!items.files.length && !items.folders.length) throw new Error('未读取到文件或文件夹，请使用 Chrome / Edge 重新拖入，或点击上传文件夹');
+      setUploadProgress({ completed: 0, total: items.files.length });
+      const listing = await request('/api/files');
+      const known = new Map(listing.allFolders.map((folder) => [`${folder.parentId || ''}\0${folder.name.toLowerCase()}`, folder.id]));
+      const ids = new Map([['', folderId]]);
+      for (const relativePath of uploadFolderPaths(items)) {
+        const parts = relativePath.split('/');
+        const parent = ids.get(parts.slice(0, -1).join('/'));
+        const name = parts.at(-1);
+        const key = `${parent || ''}\0${name.toLowerCase()}`;
+        let id = known.get(key);
+        if (!id) {
+          try {
+            const result = await request('/api/files/folders', { method: 'POST', body: JSON.stringify({ name, parentId: parent }) });
+            id = result.folder.id;
+            createdFolders += 1;
+          } catch (error) {
+            if (error.status !== 409) throw error;
+            const refreshed = await request('/api/files');
+            id = refreshed.allFolders.find((folder) => folder.parentId === parent && folder.name.toLowerCase() === name.toLowerCase())?.id;
+            if (!id) throw error;
+          }
+          known.set(key, id);
+        }
+        ids.set(relativePath, id);
+      }
+      const groups = new Map();
+      for (const item of items.files) {
+        const directory = item.relativePath.split('/').slice(0, -1).join('/');
+        if (!groups.has(directory)) groups.set(directory, []);
+        groups.get(directory).push(item.file);
+      }
+      for (const [directory, files] of groups) {
+        const target = ids.get(directory);
+        for (let index = 0; index < files.length; index += 24) {
+          const batch = files.slice(index, index + 24);
+          const body = new FormData();
+          for (const file of batch) body.append('file', file);
+          await request(`/api/files${target ? `?folderId=${encodeURIComponent(target)}` : ''}`, { method: 'POST', body });
+          completed += batch.length;
+          setUploadProgress({ completed, total: items.files.length });
+        }
+      }
+      onNotice(`已上传 ${completed} 个文件${createdFolders ? `，创建 ${createdFolders} 个文件夹` : ''}`);
+    } catch (error) { showError(completed ? `已上传 ${completed} 个文件，后续处理失败：${error.message}` : error.message); }
+    finally {
+      setBusy(false);
+      setUploadProgress(null);
+      if (completed || createdFolders) setRefresh((value) => value + 1);
+      if (fileInput.current) fileInput.current.value = '';
+      if (folderInput.current) folderInput.current.value = '';
+    }
   }
 
   async function submitDialog(event) {
@@ -121,13 +174,15 @@ export default function CloudFilesPage({ canWrite, refreshToken, showError, onNo
     <div className="section-heading"><div><span className="eyebrow">TEAM FILES</span><h1>测试工具云盘</h1><p>共享安装包、测试工具与团队资料</p></div>
       <div className="heading-actions"><IconButton icon={RefreshCw} label="刷新" onClick={() => setRefresh((value) => value + 1)} disabled={loading} />
         {canWrite && <><button className="button secondary" type="button" onClick={() => { setName(''); setDialog({ type: 'create' }); }} disabled={busy}><FolderPlus size={17} /> 新建文件夹</button>
+          <button className="button secondary" type="button" onClick={() => folderInput.current?.click()} disabled={busy}><FolderOpen size={17} /> 上传文件夹</button>
           <button className="button primary" type="button" onClick={() => fileInput.current?.click()} disabled={busy}><Upload size={17} /> 上传文件</button></>}</div></div>
-    <input ref={fileInput} type="file" hidden onChange={(event) => upload(event.target.files?.[0])} />
+    <input ref={fileInput} type="file" multiple hidden onChange={(event) => uploadItems(Promise.resolve(collectSelectedItems(event.target.files)))} />
+    <input ref={folderInput} type="file" multiple webkitdirectory="" directory="" hidden onChange={(event) => uploadItems(Promise.resolve(collectSelectedItems(event.target.files)))} />
     <nav className="cloud-breadcrumbs" aria-label="云盘目录"><button type="button" onClick={() => setFolderId(null)} aria-current={folderId === null ? 'page' : undefined}>团队文件</button>
       {listing.path.map((folder) => <React.Fragment key={folder.id}><ChevronRight size={15} /><button type="button" onClick={() => setFolderId(folder.id)} aria-current={folder.id === folderId ? 'page' : undefined}>{folder.name}</button></React.Fragment>)}</nav>
-    {canWrite && <div className={`upload-zone ${dragging ? 'dragging' : ''}`} onDragOver={(event) => { event.preventDefault(); setDragging(true); }}
-      onDragLeave={(event) => { event.preventDefault(); setDragging(false); }} onDrop={(event) => { event.preventDefault(); setDragging(false); upload(event.dataTransfer.files?.[0]); }}>
-      <div className="upload-icon"><CloudUpload size={24} /></div><div><strong>{busy ? '正在处理…' : '拖放文件到这里'}</strong><span>或 <button type="button" className="text-button" onClick={() => fileInput.current?.click()} disabled={busy}>选择文件</button> 上传到当前文件夹</span></div></div>}
+    {canWrite && <div className={`upload-zone ${dragging ? 'dragging' : ''}`} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = busy ? 'none' : 'copy'; if (!busy) setDragging(true); }}
+      onDragLeave={(event) => { event.preventDefault(); if (!event.currentTarget.contains(event.relatedTarget)) setDragging(false); }} onDrop={(event) => { event.preventDefault(); setDragging(false); if (!busy) uploadItems(collectDroppedItems(event.dataTransfer)); }}>
+      <div className="upload-icon"><CloudUpload size={24} /></div><div><strong>{uploadProgress ? `已上传 ${uploadProgress.completed} / ${uploadProgress.total} 个文件` : busy ? '正在处理…' : '拖放文件或文件夹到这里'}</strong><span>或 <button type="button" className="text-button" onClick={() => fileInput.current?.click()} disabled={busy}>选择文件</button>、<button type="button" className="text-button" onClick={() => folderInput.current?.click()} disabled={busy}>选择文件夹</button> 上传到当前文件夹</span></div></div>}
     <div className="table-surface files-table"><div className="files-table-title"><h2>{listing.path.at(-1)?.name || '团队文件'}</h2><span>{listing.folders.length} 个文件夹 · {listing.files.length} 个文件</span></div>
       {loading && total === 0 ? <div className="loading-state"><RefreshCw size={18} className="spin" /> 加载中…</div>
         : total === 0 ? <div className="empty-state"><div className="empty-icon"><FolderOpen size={26} /></div><h3>当前文件夹为空</h3></div>

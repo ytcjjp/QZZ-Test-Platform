@@ -69,6 +69,15 @@
   width: 100%;
 }
 
+.cloud-files-section .files-table table {
+  min-width: 800px;
+}
+
+.cloud-files-section .files-table .actions-col {
+  width: 138px;
+  min-width: 138px;
+}
+
 @media (max-width: 680px) {
   .cloud-files-section .heading-actions {
     flex-wrap: wrap;

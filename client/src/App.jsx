@@ -40,15 +40,15 @@ const CASE_FIELDS = [
 ];
 
 const DEFECT_FIELDS = [
-  { key: 'title', label: '缺陷标题', required: true, placeholder: '简要描述问题', wide: true },
-  { key: 'module', label: '所属模块', required: true, placeholder: '例如：活动中心' },
+  { key: 'title', label: '缺陷标题', placeholder: '简要描述问题', wide: true },
+  { key: 'module', label: '所属模块', placeholder: '例如：活动中心' },
   { key: 'version', label: '发现版本', placeholder: '例如：1.0.0' },
   { key: 'severity', label: '严重程度', type: 'select', options: ['致命', '严重', '一般', '轻微'] },
   { key: 'status', label: '处理状态', type: 'select', options: DEFECT_STATUSES },
   { key: 'assignee', label: '负责人', placeholder: '姓名或账号' },
-  { key: 'reproSteps', label: '复现步骤', type: 'textarea', required: true, placeholder: '环境、前置条件和复现路径', wide: true },
+  { key: 'reproSteps', label: '复现步骤', type: 'textarea', placeholder: '环境、前置条件和复现路径', wide: true },
   { key: 'expected', label: '预期表现', type: 'textarea', placeholder: '正确行为', wide: true },
-  { key: 'actual', label: '实际表现', type: 'textarea', required: true, placeholder: '实际发生的问题', wide: true },
+  { key: 'actual', label: '实际表现', type: 'textarea', placeholder: '实际发生的问题', wide: true },
   { key: 'notes', label: '备注', type: 'textarea', placeholder: '截图、日志路径等补充说明', wide: true },
 ];
 
@@ -60,6 +60,17 @@ const EMPTY_DEFECT = {
   title: '', module: '', version: '', severity: '一般', status: '待处理',
   assignee: '', reproSteps: '', expected: '', actual: '', notes: '',
 };
+
+const defectVersionKey = (userId, projectId) => `qzz-defect-version:${userId}:${projectId}`;
+function lastDefectVersion(userId, projectId) {
+  try { return localStorage.getItem(defectVersionKey(userId, projectId)) || ''; }
+  catch { return ''; }
+}
+function rememberDefectVersion(userId, projectId, version) {
+  if (!version?.trim()) return;
+  try { localStorage.setItem(defectVersionKey(userId, projectId), version.trim()); }
+  catch { /* Storage can be unavailable in private browsing; saving the defect still succeeds. */ }
+}
 
 async function api(path, options = {}) {
   const headers = options.body instanceof FormData
@@ -141,9 +152,9 @@ function Login({ onLogin, busy, error }) {
   </div>;
 }
 
-function RecordForm({ kind, initial, mode, project, onClose, onSave, busy, error, onReload }) {
+function RecordForm({ kind, initial, mode, project, userId, onClose, onSave, busy, error, onReload }) {
   const fields = kind === 'cases' ? CASE_FIELDS : DEFECT_FIELDS;
-  const [values, setValues] = useState(() => ({ ...(kind === 'cases' ? EMPTY_CASE : EMPTY_DEFECT), ...initial, tags: Array.isArray(initial?.tags) ? initial.tags.join(', ') : initial?.tags || '' }));
+  const [values, setValues] = useState(() => ({ ...(kind === 'cases' ? EMPTY_CASE : { ...EMPTY_DEFECT, version: mode === 'new' ? lastDefectVersion(userId, project.id) : '' }), ...initial, tags: Array.isArray(initial?.tags) ? initial.tags.join(', ') : initial?.tags || '' }));
   const title = kind === 'cases' ? '用例' : '缺陷';
   function submit(event) {
     event.preventDefault();
@@ -175,7 +186,7 @@ function RecordDetail({ kind, record, onClose, onEdit, onDelete, canWrite }) {
   return <div className="drawer-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
     <aside className="detail-drawer" aria-label={kind === 'cases' ? '用例详情' : '缺陷详情'}>
       <div className="drawer-head"><div><span className="eyebrow">{kind === 'cases' ? 'TEST CASE' : 'DEFECT'}</span><span className="record-id">#{String(record.id).slice(0, 8)}</span></div><IconButton icon={X} label="关闭" onClick={onClose} /></div>
-      <div className="drawer-body"><h2>{record.title}</h2><div className="detail-pills"><Tone value={kind === 'cases' ? record.priority : record.severity} /><Tone value={record.status} /><span className="detail-module">{record.module || '未分类'}</span></div>
+      <div className="drawer-body"><h2>{record.title || (kind === 'defects' ? '未命名缺陷' : '未命名用例')}</h2><div className="detail-pills"><Tone value={kind === 'cases' ? record.priority : record.severity} /><Tone value={record.status} /><span className="detail-module">{record.module || '未分类'}</span></div>
         <div className="detail-grid"><div><span>创建人</span><strong>{record.createdBy || '—'}</strong></div><div><span>更新时间</span><strong>{displayDate(record.updatedAt || record.createdAt)}</strong></div></div>
         <div className="detail-fields">{fields.filter((field) => !['title', 'module', 'priority', 'severity', 'status'].includes(field.key)).map((field) => <div key={field.key} className="detail-field"><span>{field.label}</span><p>{field.key === 'tags' ? (Array.isArray(record.tags) ? record.tags.join(' · ') : record.tags) || '—' : record[field.key] || '—'}</p></div>)}</div>
       </div>
@@ -249,10 +260,20 @@ function UsersDialog({ onClose, onChanged }) {
     catch (failure) { setError(failure.message); }
     finally { setBusy(false); }
   }
+  async function removeMember() {
+    if (!draft || !window.confirm(`确定删除成员账号“${draft.username}”吗？该账号将立即退出并无法恢复，历史记录会保留为已删除成员。`)) return;
+    setBusy(true); setError(''); setMessage('');
+    try {
+      await api(`/api/users/${encodeURIComponent(selected)}`, { method: 'DELETE' });
+      setSelected(''); setDraft(null); setPassword(''); setAdminPassword(''); setRevealed(null);
+      await load(); await onChanged(); setMessage('成员账号已删除，历史记录已保留');
+    } catch (failure) { setError(failure.message); }
+    finally { setBusy(false); }
+  }
   return <div className="modal-backdrop"><div className="modal users-modal account-users-modal" role="dialog" aria-modal="true" aria-labelledby="users-title"><div className="modal-head"><div><span className="eyebrow">TEAM ACCESS</span><h2 id="users-title">账号与权限管理</h2></div><IconButton icon={X} label="关闭" onClick={onClose} disabled={busy} /></div><div className="users-content"><div className="users-list-title"><h3>成员账号 · {users.length}</h3><button type="button" className="button secondary" disabled={busy} onClick={() => { setCreating(true); setDraft(null); setSelected(''); setPassword(''); setRevealed(null); setError(''); setMessage(''); }}><Plus size={15} />创建账号</button></div>{loading ? <div className="loading-state">加载中…</div> : <div className="member-picker">{users.map((member) => <button type="button" disabled={busy} key={member.id} className={`member-option ${selected === member.id ? 'selected' : ''}`} onClick={() => select(member)}><span className="avatar">{member.username.slice(0, 1).toUpperCase()}</span><strong>{member.username}</strong><span>{member.disabled ? '已停用' : member.role === 'admin' ? '管理员' : '成员'}</span></button>)}</div>}
       {(creating || draft) && <form className="account-editor" onSubmit={save}><h3>{creating ? '创建成员账号' : `管理 ${draft.username}`}</h3>{creating ? <label className="field"><span>账号</span><input value={newUsername} onChange={(event) => setNewUsername(event.target.value)} minLength={2} maxLength={32} required autoComplete="off" /></label> : <div className="user-form-row"><label className="field"><span>账号角色</span><select value={draft.role} onChange={(event) => setDraft({ ...draft, role: event.target.value })} disabled={busy}><option value="member">普通成员</option><option value="admin">管理员</option></select></label><label className="check-field"><input type="checkbox" checked={Boolean(draft.disabled)} onChange={(event) => setDraft({ ...draft, disabled: event.target.checked })} disabled={busy} /><span>停用账号</span></label></div>}
       {!creating && <div className="permissions-table"><div className="permission-row permission-head"><span>模块权限</span><span>查看</span><span>编辑 / 操作</span></div>{NAV.map((module) => <div className="permission-row" key={module.id}><span>{module.label}</span>{['view', 'write'].map((action) => <input key={action} type="checkbox" aria-label={`${module.label}${action === 'view' ? '查看' : '编辑'}`} checked={draft.role === 'admin' || Boolean(draft.permissions?.[module.id]?.[action])} disabled={busy || draft.role === 'admin'} onChange={(event) => permission(module.id, action, event.target.checked)} />)}</div>)}</div>}
-      <label className="field"><span>{creating ? '初始密码' : '设置新密码（留空则保留）'}</span><input type="password" autoComplete="new-password" minLength={6} maxLength={200} value={password} onChange={(event) => setPassword(event.target.value)} required={creating} placeholder="至少 6 位" disabled={busy} /></label><div className="modal-actions"><button className="button primary" disabled={busy}>{busy ? '保存中…' : creating ? '创建账号' : '保存账号与权限'}</button></div></form>}
+      <label className="field"><span>{creating ? '初始密码' : '设置新密码（留空则保留）'}</span><input type="password" autoComplete="new-password" minLength={6} maxLength={200} value={password} onChange={(event) => setPassword(event.target.value)} required={creating} placeholder="至少 6 位" disabled={busy} /></label><div className="modal-actions">{!creating && draft.role === 'member' && users.find((member) => member.id === selected)?.role === 'member' && <button type="button" className="button secondary account-delete" disabled={busy} onClick={removeMember}><Trash2 size={16} />删除成员</button>}<button className="button primary" disabled={busy}>{busy ? '保存中…' : creating ? '创建账号' : '保存账号与权限'}</button></div></form>}
       {draft && !creating && <div className="password-reveal"><h3>查看账号密码</h3>{revealed !== null ? <div className="revealed-password"><code>{revealed}</code><IconButton icon={EyeOff} label="隐藏密码" onClick={() => setRevealed(null)} /></div> : <div className="reveal-controls"><label className="field"><span>验证当前管理员密码</span><input type="password" autoComplete="current-password" value={adminPassword} onChange={(event) => setAdminPassword(event.target.value)} maxLength={200} /></label><button type="button" className="button secondary" disabled={busy || !adminPassword} onClick={reveal}><Eye size={16} />查看密码</button></div>}</div>}
       {message && <div className="account-success" role="status"><Check size={16} />{message}</div>}{error && <div className="inline-error"><AlertCircle size={16} />{error}</div>}
     </div></div></div>;
@@ -432,6 +453,7 @@ export default function App() {
       else delete payload.revision;
       await api(`/api/${kind}${isEdit ? `/${encodeURIComponent(record.id)}` : ''}`, { method: isEdit ? 'PUT' : 'POST', body: JSON.stringify(payload) });
       if (!current()) return;
+      if (kind === 'defects') rememberDefectVersion(user.id, projectId, values.version);
       setForm(null); setToast(isEdit ? '已保存修改' : kind === 'cases' ? '用例已添加' : '缺陷已添加');
       if (sourceIndex !== null) onSaved?.(sourceIndex);
       await loadData();
@@ -442,7 +464,7 @@ export default function App() {
     } finally { if (current()) setFormBusy(false); }
   }
   async function deleteRecord(kind, record) {
-    if (!window.confirm(`确定删除“${record.title}”吗？此操作无法撤销。`)) return;
+    if (!window.confirm(`确定删除“${record.title || '未命名缺陷'}”吗？此操作无法撤销。`)) return;
     const auth = authEpoch.current; const scope = scopeEpoch.current;
     const current = () => authEpoch.current === auth && scopeEpoch.current === scope;
     try { await api(`/api/${kind}/${encodeURIComponent(record.id)}`, { method: 'DELETE', body: JSON.stringify({ revision: record.revision, projectId: record.projectId }) }); if (!current()) return; setDetail(null); setToast('记录已删除'); await loadData(); }
@@ -511,7 +533,7 @@ export default function App() {
       {toast && <div className="toast" role="status"><Check size={17} />{toast}</div>}
     </div>
     {selectedRecord && permitted(user, detail.kind) && <RecordDetail kind={detail.kind} record={selectedRecord} canWrite={permitted(user, detail.kind, 'write')} onClose={() => setDetail(null)} onEdit={() => openForm(detail.kind, selectedRecord)} onDelete={() => deleteRecord(detail.kind, selectedRecord)} />}
-    {form && formProject && <RecordForm key={`${form.kind}-${form.projectId}-${form.record?.id || 'new'}-${form.sourceIndex ?? ''}`} kind={form.kind} initial={form.record} project={formProject} mode={form.record?.id ? 'edit' : 'new'} onClose={() => { if (!formBusy) setForm(null); }} onSave={saveForm} busy={formBusy} error={formError} onReload={() => setForm(null)} />}
+    {form && formProject && <RecordForm key={`${form.kind}-${form.projectId}-${form.record?.id || 'new'}-${form.sourceIndex ?? ''}`} kind={form.kind} initial={form.record} project={formProject} userId={user.id} mode={form.record?.id ? 'edit' : 'new'} onClose={() => { if (!formBusy) setForm(null); }} onSave={saveForm} busy={formBusy} error={formError} onReload={() => setForm(null)} />}
     {passwordOpen && <PasswordDialog onClose={() => setPasswordOpen(false)} onSaved={() => { setPasswordOpen(false); setToast('密码已修改，请在下次登录时使用新密码'); }} />}
     {usersOpen && user.role === 'admin' && <UsersDialog onClose={() => setUsersOpen(false)} onChanged={loadData} />}
   </div>;

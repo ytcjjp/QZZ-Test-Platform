@@ -111,6 +111,15 @@
   font-size: 14px;
   margin: 0 0 5px;
 }
+.button.secondary.account-delete {
+  margin-right: auto;
+  color: var(--danger);
+  border-color: #ebc9c0;
+}
+.button.secondary.account-delete:hover:not(:disabled) {
+  background: #fff0ec;
+  color: #9e4233;
+}
 .permissions-table {
   border: 1px solid #e0e8e6;
   border-radius: 5px;
