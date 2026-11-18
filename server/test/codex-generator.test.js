@@ -102,6 +102,20 @@ test('Codex worker returns unresolved questions and removes temporary schema and
   await assertNoJobs(dataDir);
 }));
 
+test('Codex generation has no default total-time limit while stdout reports progress', async () => fixture(async ({ documents, options, dataDir }) => {
+  const config = { ...options.config }; delete config.timeoutMs;
+  const runner = fakeRunner(async ({ args }, prompt, child) => {
+    for (let index = 0; index < 4; index += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      child.stdout.write(JSON.stringify({ type: 'item.updated' }) + '\n');
+    }
+    await fs.writeFile(args[args.indexOf('--output-last-message') + 1], JSON.stringify(result()));
+    child.emit('close', 0);
+  });
+  assert.deepEqual(await generateWithCodex(documents, { ...options, config }, { spawn: runner.spawn, inactivityTimeoutMs: 300 }), result());
+  await assertNoJobs(dataDir);
+}));
+
 test('Codex worker stops its own process tree on timeout or cancellation and returns controlled messages', async () => fixture(async ({ documents, options, dataDir }) => {
   const killed = [];
   const killTree = async (child) => { killed.push(child.pid); child.emit('close', 1); };
@@ -109,14 +123,18 @@ test('Codex worker stops its own process tree on timeout or cancellation and ret
   await assert.rejects(generateWithCodex(documents, { ...options, config: { ...options.config, timeoutMs: 15 } }, { spawn: timeoutRunner.spawn, killTree }), (error) => error.code === 'CODEX_TIMEOUT' && error.status === 504 && error.publicMessage === error.message);
   assert.deepEqual(killed, [timeoutRunner.child.pid]); await assertNoJobs(dataDir);
   assert.equal((await fs.readdir(path.join(dataDir, 'codex-diagnostics'))).length, 1);
+  const idleRunner = fakeRunner();
+  await assert.rejects(generateWithCodex(documents, { ...options, config: { ...options.config, timeoutMs: 0 } }, { spawn: idleRunner.spawn, killTree, inactivityTimeoutMs: 20 }), (error) => error.code === 'CODEX_IDLE_TIMEOUT' && error.status === 504 && /未返回进度/.test(error.publicMessage));
+  assert.deepEqual(killed, [timeoutRunner.child.pid, idleRunner.child.pid]); await assertNoJobs(dataDir);
+  assert.equal((await fs.readdir(path.join(dataDir, 'codex-diagnostics'))).length, 2);
   const controller = new AbortController();
   const abortRunner = fakeRunner(() => controller.abort());
-  await assert.rejects(generateWithCodex(documents, { ...options, signal: controller.signal }, { spawn: abortRunner.spawn, killTree }), (error) => error.code === 'CODEX_ABORTED');
-  assert.equal(killed.length, 2); await assertNoJobs(dataDir);
+  await assert.rejects(generateWithCodex(documents, { ...options, config: { ...options.config, timeoutMs: 0 }, signal: controller.signal }, { spawn: abortRunner.spawn, killTree }), (error) => error.code === 'CODEX_ABORTED');
+  assert.equal(killed.length, 3); await assertNoJobs(dataDir);
   const before = killed.length;
   await assert.rejects(generateWithCodex(documents, { ...options, signal: controller.signal }, { spawn: () => { throw new Error('must not start'); }, killTree }), (error) => error.status === 499);
   assert.equal(killed.length, before);
-  assert.equal((await fs.readdir(path.join(dataDir, 'codex-diagnostics'))).length, 1, 'cancellation does not create failure diagnostics');
+  assert.equal((await fs.readdir(path.join(dataDir, 'codex-diagnostics'))).length, 2, 'cancellation does not create failure diagnostics');
 }));
 
 test('Codex worker classifies terminal model errors and writes only bounded allowlisted diagnostics', async () => fixture(async ({ config, documents, options, dataDir }) => {

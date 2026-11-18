@@ -299,7 +299,16 @@ test('temporary document generation outlives the regular socket idle timeout', a
   const db = new Database(':memory:');
   const app = express(); app.use(express.json());
   const user = { id: 'one', role: 'admin' };
+  const socketTimeouts = [];
   app.use((req, res, next) => { req.user = user; next(); });
+  app.use((req, res, next) => {
+    const setTimeout = res.setTimeout.bind(res);
+    res.setTimeout = (milliseconds, ...args) => {
+      socketTimeouts.push(milliseconds);
+      return setTimeout(milliseconds, ...args);
+    };
+    next();
+  });
   registerAiRoutes(app, {
     db, dataDir: os.tmpdir(), authenticate: () => user,
     requireProject: () => {},
@@ -320,6 +329,7 @@ test('temporary document generation outlives the regular socket idle timeout', a
     });
     assert.equal(response.status, 200);
     assert.equal((await response.json()).tree.children[0].title, '主流程');
+    assert.deepEqual(socketTimeouts, [0, 120000]);
   } finally {
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));

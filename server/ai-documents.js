@@ -307,7 +307,7 @@ export function registerAiRoutes(app, { db, dataDir, sendError, authenticate, br
   const generating = new Set();
   app.post('/api/ai/generate', async (req, res) => {
     if (generating.has(req.user.id)) return sendError(res, 429, 'busy', '上一批用例仍在生成，请稍后重试');
-    res.setTimeout(16 * 60 * 1000);
+    res.setTimeout(0);
     const controller = new AbortController();
     const disconnected = () => { if (!res.writableEnded) controller.abort(); };
     res.on('close', disconnected);

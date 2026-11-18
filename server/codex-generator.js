@@ -10,6 +10,7 @@ const BRANCHES = ['主流程', 'UI', '异常与边界', '受影响模块'];
 const MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
 const MAX_LOG_BYTES = 64 * 1024;
 const MAX_DIAGNOSTICS = 50;
+const CODEX_INACTIVITY_TIMEOUT_MS = 45 * 60 * 1000;
 const diagnosticQueues = new Map();
 export const VISION_LIMITS = { images: 64, bytes: 64 * 1024 * 1024, pixels: 40000000 };
 
@@ -224,8 +225,9 @@ export async function runCodexData({ prompt, schema, config, signal, projectCont
   let validate;
   try { validate = new Ajv({ allErrors: false, strict: false, validateFormats: false }).compile(schema); }
   catch { throw new CodexGenerationError('结构化输出协议不正确，请联系管理员。', 'CODEX_INPUT', 400); }
-  const timeoutMs = config.timeoutMs ?? 15 * 60 * 1000;
-  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60 * 60 * 1000) throw new CodexGenerationError('本机 Codex 超时配置不正确。', 'CODEX_CONFIG', 503);
+  const timeoutMs = config.timeoutMs ?? 0;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 60 * 60 * 1000) throw new CodexGenerationError('本机 Codex 超时配置不正确。', 'CODEX_CONFIG', 503);
+  const inactivityTimeoutMs = dependencies.inactivityTimeoutMs ?? CODEX_INACTIVITY_TIMEOUT_MS;
   const projectRoot = path.resolve(config.projectRoot);
   const codexHomeDir = path.resolve(config.dataDir, 'codex-runtime');
   const jobsDir = path.resolve(config.dataDir, 'codex-jobs');
@@ -287,7 +289,8 @@ export async function runCodexData({ prompt, schema, config, signal, projectCont
       let stdout = Buffer.alloc(0);
       let stderr = Buffer.alloc(0);
       let timer;
-      const cleanup = () => { clearTimeout(timer); signal?.removeEventListener('abort', onAbort); stdout = Buffer.alloc(0); stderr = Buffer.alloc(0); };
+      let inactivityTimer;
+      const cleanup = () => { clearTimeout(timer); clearTimeout(inactivityTimer); signal?.removeEventListener('abort', onAbort); stdout = Buffer.alloc(0); stderr = Buffer.alloc(0); };
       const stop = async (error) => {
         if (finished) return;
         finished = true; cleanup();
@@ -295,7 +298,11 @@ export async function runCodexData({ prompt, schema, config, signal, projectCont
         reject(error);
       };
       const onAbort = () => { void stop(new CodexGenerationError('本次用例生成已取消。', 'CODEX_ABORTED', 499)); };
-      child.stdout?.on('data', (chunk) => { if (!finished) stdout = appendLog(stdout, chunk); });
+      const watchProgress = () => {
+        clearTimeout(inactivityTimer);
+        inactivityTimer = setTimeout(() => { void stop(new CodexGenerationError('本机 Codex 长时间未返回进度，已停止挂起的生成任务，请重试或切换模型。', 'CODEX_IDLE_TIMEOUT', 504)); }, inactivityTimeoutMs);
+      };
+      child.stdout?.on('data', (chunk) => { if (!finished) { stdout = appendLog(stdout, chunk); watchProgress(); } });
       child.stderr?.on('data', (chunk) => { if (!finished) stderr = appendLog(stderr, chunk); });
       child.stdin?.on('error', () => {});
       child.once('error', () => { void stop(new CodexGenerationError('无法启动本机 Codex，请检查程序路径和运行权限。', 'CODEX_START', 503)); });
@@ -307,7 +314,8 @@ export async function runCodexData({ prompt, schema, config, signal, projectCont
         if (failure) reject(failure);
         else resolve();
       });
-      timer = setTimeout(() => { void stop(new CodexGenerationError('本机 Codex 生成超时，请缩小文档或分模块后重试。', 'CODEX_TIMEOUT', 504)); }, timeoutMs);
+      watchProgress();
+      if (timeoutMs) timer = setTimeout(() => { void stop(new CodexGenerationError('本机 Codex 生成超时，请缩小文档或分模块后重试。', 'CODEX_TIMEOUT', 504)); }, timeoutMs);
       signal?.addEventListener('abort', onAbort, { once: true });
       if (signal?.aborted) onAbort();
       else {
