@@ -1,7 +1,8 @@
-export const CURRENT_VERSION = '0.2.1';
+export const CURRENT_VERSION = '0.2.2';
 
 // The 0.1.x milestones were reconstructed from the repository history.
 export const VERSION_HISTORY = [
+  { version: '0.2.2', date: '2026-11-18', summary: 'AI 返回流中断时自动重试一次，并延长长任务的连接保持时间。' },
   { version: '0.2.1', date: '2026-11-18', summary: '修复 AI 长任务断连，支持同步和切换模型，默认按完整需求设计用例。' },
   { version: '0.2.0', date: '2026-11-17', summary: '云盘文件夹、大文件上传、计划与 AI 草稿恢复、可缩放工作窗口和品牌图标。' },
   { version: '0.1.5', date: '2026-11-17', summary: '接入浏览器飞书文档导入，补齐用例列表执行状态与来源留存。' },

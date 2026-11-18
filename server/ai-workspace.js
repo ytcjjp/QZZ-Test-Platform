@@ -13,7 +13,6 @@ export const PLAN_SECTIONS = ['目标与范围', '策略与优先级', '环境�
 export const REVIEW_DIMENSIONS = ['覆盖完整性', '正确性', '冗余去重', '边界与异常', '步骤清晰度', '优先级合理性', '前置/数据完整性', '需求追溯'];
 const SKILL = fs.readFileSync(fileURLToPath(new URL('./skills/game-prd-testcases.md', import.meta.url)), 'utf8');
 const DRAFT_MAX_CHARS = 250000;
-const AI_GENERATION_SOCKET_TIMEOUT_MS = 16 * 60 * 1000;
 const markdown = new MarkdownIt({ html: false, maxNesting: 128 });
 const ajv = new Ajv({ strict: false, allErrors: false, validateFormats: false });
 const object = (properties) => ({ type: 'object', additionalProperties: false, required: Object.keys(properties), properties });
@@ -339,8 +338,8 @@ export function registerAiWorkspaceRoutes(app, { db, dataDir, workspace, require
     });
   }
   app.post('/api/workspace/ai', async (req, res) => {
-    // A Codex generation can take 15 minutes; the regular socket timeout is 2 minutes.
-    res.setTimeout(AI_GENERATION_SOCKET_TIMEOUT_MS);
+    // A transient stream failure may require a second full Codex run.
+    res.setTimeout(0);
     const controller = new AbortController();
     const disconnected = () => { if (!res.writableEnded) controller.abort(); };
     res.on('close', disconnected);
@@ -364,7 +363,14 @@ export function registerAiWorkspaceRoutes(app, { db, dataDir, workspace, require
       const query = [input.instructions.slice(0, 2000), input.clarifications.slice(0, 2000), evidence.requirement.title, (evidence.documents || []).map((document) => document.text).join('\n').slice(0, 7600)].join('\n').slice(0, 12000);
       const knowledge = await workspace.getKnowledgeContext(input.projectId, input.knowledgeBaseIds, query, { limit: 8, maxChars: 12000 });
       controller.signal.throwIfAborted();
-      const result = await generateTask(input, evidence, knowledge, { provider: { ...provider, model: input.model || provider.model, dataDir }, signal: controller.signal });
+      const options = { provider: { ...provider, model: input.model || provider.model, dataDir }, signal: controller.signal };
+      let result;
+      try {
+        result = await generateTask(input, evidence, knowledge, options);
+      } catch (error) {
+        if (error?.code !== 'CODEX_STREAM' || controller.signal.aborted || res.destroyed) throw error;
+        result = await generateTask(input, evidence, knowledge, options);
+      }
       if (controller.signal.aborted || res.destroyed) return;
       const fresh = authenticate(req);
       if (!fresh || fresh.id !== req.user.id) throw new WorkspaceAiError('登录已失效，请重新登录', 401);
