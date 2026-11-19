@@ -13,7 +13,7 @@ import { DEFECT_STATUSES, defectStatusClass } from './defect-status';
 import {
   AlertCircle, ArrowUpRight, Bot, Bug, Check, Copy,
   ChevronDown, ChevronRight, CircleHelp, Database,
-  Eye, EyeOff, FileText, Filter, FolderOpen, LayoutDashboard, LogOut, Menu,
+  Eye, EyeOff, FileText, Filter, FolderOpen, ImagePlus, LayoutDashboard, LogOut, Menu,
   PanelLeftClose, PanelLeftOpen, Pencil, Plus,
   RefreshCw, Search, ShieldCheck, Sparkles, Trash2,
   Users, Wifi, WifiOff, X, KeyRound,
@@ -62,6 +62,9 @@ const EMPTY_DEFECT = {
   issueType: '版本问题', title: '', module: '', version: '', severity: '一般', status: '待处理',
   assignee: '', reproSteps: '', expected: '', actual: '', notes: '',
 };
+const DEFECT_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp']);
+const DEFECT_IMAGE_EXTENSIONS = /\.(?:png|jpe?g|webp)$/i;
+const DEFECT_IMAGE_BYTES = 20 * 1024 * 1024;
 
 const defectVersionKey = (userId, projectId) => `qzz-defect-version:${userId}:${projectId}`;
 function lastDefectVersion(userId, projectId) {
@@ -157,16 +160,76 @@ function Login({ onLogin, busy, error }) {
 function RecordForm({ kind, initial, mode, project, userId, onClose, onSave, busy, error, onReload }) {
   const fields = kind === 'cases' ? CASE_FIELDS : DEFECT_FIELDS;
   const [values, setValues] = useState(() => ({ ...(kind === 'cases' ? EMPTY_CASE : { ...EMPTY_DEFECT, version: mode === 'new' ? lastDefectVersion(userId, project.id) : '' }), ...initial, tags: Array.isArray(initial?.tags) ? initial.tags.join(', ') : initial?.tags || '' }));
+  const [members, setMembers] = useState([]);
+  const [pendingImages, setPendingImages] = useState([]);
+  const [imageError, setImageError] = useState('');
+  const [dragging, setDragging] = useState(false);
+  const imageInput = useRef(null);
+  const imageUrls = useRef(new Set());
+  const imageSequence = useRef(0);
+  const dragDepth = useRef(0);
   const title = kind === 'cases' ? '用例' : '缺陷';
+  useEffect(() => {
+    if (kind !== 'defects') return undefined;
+    let active = true;
+    api('/api/members').then((result) => { if (active) setMembers(result.members || []); }).catch(() => {});
+    return () => { active = false; };
+  }, [kind]);
+  useEffect(() => () => { for (const url of imageUrls.current) URL.revokeObjectURL(url); }, []);
+  function addImages(items) {
+    if (kind !== 'defects' || busy) return;
+    const files = Array.from(items || []);
+    if (!files.length) return;
+    if (files.some((file) => !(DEFECT_IMAGE_TYPES.has(file.type) || (!file.type && DEFECT_IMAGE_EXTENSIONS.test(file.name))))) {
+      setImageError('图片仅支持 PNG、JPEG、WebP'); return;
+    }
+    if (files.some((file) => !file.size || file.size > DEFECT_IMAGE_BYTES)) {
+      setImageError('单张图片须小于 20 MB 且不能是空文件'); return;
+    }
+    if (pendingImages.length + files.length > 12 || (initial?.images?.length || 0) + pendingImages.length + files.length > 24) {
+      setImageError('每次最多上传 12 张，每条缺陷最多保留 24 张图片'); return;
+    }
+    const added = files.map((file) => {
+      const url = URL.createObjectURL(file);
+      imageUrls.current.add(url);
+      return { key: ++imageSequence.current, file, url };
+    });
+    setPendingImages((current) => [...current, ...added]);
+    setImageError('');
+  }
+  function removePendingImage(key) {
+    setPendingImages((current) => {
+      const removed = current.find((image) => image.key === key);
+      if (removed) { URL.revokeObjectURL(removed.url); imageUrls.current.delete(removed.url); }
+      return current.filter((image) => image.key !== key);
+    });
+    setImageError('');
+  }
+  function hasDraggedFiles(event) { return kind === 'defects' && Array.from(event.dataTransfer?.types || []).includes('Files'); }
+  function enterDrag(event) {
+    if (!hasDraggedFiles(event)) return;
+    event.preventDefault(); dragDepth.current += 1; setDragging(true);
+  }
+  function leaveDrag(event) {
+    if (kind !== 'defects' || !dragDepth.current) return;
+    event.preventDefault(); dragDepth.current -= 1;
+    if (!dragDepth.current) setDragging(false);
+  }
+  function dropImages(event) {
+    if (!hasDraggedFiles(event)) return;
+    event.preventDefault(); dragDepth.current = 0; setDragging(false);
+    addImages(event.dataTransfer.files);
+  }
   function submit(event) {
     event.preventDefault();
     const data = { ...values };
     if (kind === 'cases') data.tags = values.tags.split(/[,，]/).map((tag) => tag.trim()).filter(Boolean);
-    onSave(data);
+    else delete data.images;
+    onSave(data, pendingImages.map((image) => image.file));
   }
   return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-    <div className="modal" role="dialog" aria-modal="true" aria-labelledby="form-title">
-      <div className="modal-head"><div><span className="eyebrow">{mode === 'edit' ? 'EDIT RECORD' : 'NEW RECORD'}</span><h2 id="form-title">{mode === 'edit' ? `编辑${title}` : `新建${title}`}</h2></div><IconButton icon={X} label="关闭" onClick={onClose} /></div>
+    <div className="modal" role="dialog" aria-modal="true" aria-labelledby="form-title" onDragEnter={enterDrag} onDragOver={(event) => { if (hasDraggedFiles(event)) { event.preventDefault(); event.dataTransfer.dropEffect = 'copy'; } }} onDragLeave={leaveDrag} onDrop={dropImages}>
+      <div className="modal-head"><div><span className="eyebrow">{mode === 'edit' ? 'EDIT RECORD' : 'NEW RECORD'}</span><h2 id="form-title">{mode === 'edit' ? `编辑${title}` : `新建${title}`}</h2></div><IconButton icon={X} label="关闭" onClick={onClose} disabled={busy} /></div>
       <form onSubmit={submit} className="modal-form">
         {project && <div className="record-form-project"><ProjectIcon project={project} small /><span>{project.name}</span></div>}
         <div className="form-grid">{fields.map((field) => <label key={field.key} className={`field ${field.wide ? 'field-wide' : ''}`}><span>{field.label}{field.required && <em> *</em>}</span>
@@ -174,8 +237,20 @@ function RecordForm({ kind, initial, mode, project, userId, onClose, onSave, bus
             ? <textarea value={values[field.key] ?? ''} onChange={(e) => setValues({ ...values, [field.key]: e.target.value })} placeholder={field.placeholder} rows={field.key === 'steps' || field.key === 'reproSteps' ? 4 : 3} required={field.required} />
             : field.type === 'select'
               ? <select className={kind === 'defects' && field.key === 'status' ? defectStatusClass(values[field.key] || field.options[0]) : undefined} value={values[field.key] || field.options[0]} onChange={(e) => setValues({ ...values, [field.key]: e.target.value })}>{field.options.map((option) => <option key={option}>{option}</option>)}</select>
-              : <input value={values[field.key] ?? ''} onChange={(e) => setValues({ ...values, [field.key]: e.target.value })} placeholder={field.placeholder} required={field.required} />}
+              : <input value={values[field.key] ?? ''} onChange={(e) => setValues({ ...values, [field.key]: e.target.value })} placeholder={field.placeholder} required={field.required} list={kind === 'defects' && field.key === 'assignee' ? 'defect-member-usernames' : undefined} autoComplete={kind === 'defects' && field.key === 'assignee' ? 'off' : undefined} />}
         </label>)}</div>
+        {kind === 'defects' && <>
+          <datalist id="defect-member-usernames">{members.map((member) => <option key={member.id} value={member.username} />)}</datalist>
+          <section className={`defect-image-section ${dragging ? 'dragging' : ''}`} aria-label="缺陷图片">
+            <div className="defect-image-heading"><strong>图片</strong><button className="button secondary" type="button" disabled={busy} onClick={() => imageInput.current?.click()}><ImagePlus size={16} />添加图片</button></div>
+            <input ref={imageInput} className="defect-image-input" type="file" accept="image/png,image/jpeg,image/webp" multiple disabled={busy} aria-label="选择缺陷图片" onChange={(event) => { addImages(event.target.files); event.target.value = ''; }} />
+            {(initial?.images?.length || pendingImages.length) ? <div className="defect-image-grid">
+              {(initial?.images || []).map((image) => <div className="defect-image-item" key={image.id}><a href={image.url} target="_blank" rel="noopener noreferrer" aria-label={`查看图片 ${image.name}`}><img src={image.thumbnailUrl || image.url} alt={image.name} /></a><span title={image.name}>{image.name}</span></div>)}
+              {pendingImages.map((image) => <div className="defect-image-item" key={image.key}><a href={image.url} target="_blank" rel="noopener noreferrer" aria-label={`预览图片 ${image.file.name}`}><img src={image.url} alt={image.file.name} /></a><span title={image.file.name}>{image.file.name}</span><IconButton icon={X} label={`移除 ${image.file.name}`} className="defect-image-remove" disabled={busy} onClick={() => removePendingImage(image.key)} /></div>)}
+            </div> : <div className="defect-image-empty"><ImagePlus size={22} aria-hidden="true" /></div>}
+          </section>
+        </>}
+        {imageError && <div className="inline-error"><AlertCircle size={16} /><span>{imageError}</span></div>}
         {error && <div className="inline-error"><AlertCircle size={16} /><span>{error}</span>{error.includes('最新') && <button type="button" className="text-button" onClick={onReload}>查看最新记录</button>}</div>}
         <div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>取消</button><button className="button primary" disabled={busy} type="submit">{busy ? '保存中…' : '保存'}</button></div>
       </form>
@@ -183,7 +258,7 @@ function RecordForm({ kind, initial, mode, project, userId, onClose, onSave, bus
   </div>;
 }
 
-function RecordDetail({ kind, record, onClose, onEdit, onDelete, canWrite }) {
+function RecordDetail({ kind, record, onClose, onEdit, onDelete, onDeleteImage, canWrite }) {
   const fields = kind === 'cases' ? CASE_FIELDS : DEFECT_FIELDS;
   return <div className="drawer-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
     <aside className="detail-drawer" aria-label={kind === 'cases' ? '用例详情' : '缺陷详情'}>
@@ -191,6 +266,7 @@ function RecordDetail({ kind, record, onClose, onEdit, onDelete, canWrite }) {
       <div className="drawer-body"><h2 className={kind === 'defects' ? 'defect-detail-title' : undefined}>{kind === 'defects' && <span className={`defect-type-tag ${defectTypeClass(record.issueType)}`}>{record.issueType || '版本问题'}</span>}<span>{record.title || (kind === 'defects' ? '未命名缺陷' : '未命名用例')}</span></h2><div className="detail-pills"><Tone value={kind === 'cases' ? record.priority : record.severity} /><Tone value={record.status} /><span className="detail-module">{record.module || '未分类'}</span></div>
         <div className="detail-grid"><div><span>创建人</span><strong>{record.createdBy || '—'}</strong></div><div><span>更新时间</span><strong>{displayDate(record.updatedAt || record.createdAt)}</strong></div></div>
         <div className="detail-fields">{fields.filter((field) => !['title', 'module', 'priority', 'severity', 'status', 'issueType'].includes(field.key)).map((field) => <div key={field.key} className="detail-field"><span>{field.label}</span><p>{field.key === 'tags' ? (Array.isArray(record.tags) ? record.tags.join(' · ') : record.tags) || '—' : record[field.key] || '—'}</p></div>)}</div>
+        {kind === 'defects' && Boolean(record.images?.length) && <section className="defect-detail-images" aria-label="缺陷图片"><h3>图片</h3><div className="defect-image-grid">{record.images.map((image) => <div className="defect-image-item" key={image.id}><a href={image.url} target="_blank" rel="noopener noreferrer" aria-label={`查看图片 ${image.name}`}><img src={image.thumbnailUrl || image.url} alt={image.name} /></a><span title={image.name}>{image.name}</span>{canWrite && <IconButton icon={Trash2} label={`删除图片 ${image.name}`} className="defect-image-remove" onClick={() => onDeleteImage(record, image)} />}</div>)}</div></section>}
       </div>
       {canWrite && <div className="drawer-actions"><button className="button secondary" type="button" onClick={onDelete}><Trash2 size={16} /> 删除</button><button className="button primary" type="button" onClick={onEdit}><Pencil size={16} /> 编辑</button></div>}
     </aside>
@@ -442,7 +518,7 @@ export default function App() {
     if (!projectId || !projects.some((project) => project.id === projectId) || !permitted(user, kind, 'write')) return;
     setForm({ kind, record, projectId, sourceIndex, onSaved }); setDetail(null); setFormError('');
   }
-  async function saveForm(values) {
+  async function saveForm(values, images = []) {
     setFormBusy(true); setFormError('');
     const submittedForm = form;
     const { kind, record, projectId, sourceIndex, onSaved } = submittedForm;
@@ -453,7 +529,12 @@ export default function App() {
       const payload = { ...values, projectId };
       if (isEdit) payload.revision = record.revision;
       else delete payload.revision;
-      await api(`/api/${kind}${isEdit ? `/${encodeURIComponent(record.id)}` : ''}`, { method: isEdit ? 'PUT' : 'POST', body: JSON.stringify(payload) });
+      const body = kind === 'defects' && images.length ? new FormData() : JSON.stringify(payload);
+      if (body instanceof FormData) {
+        body.append('payload', JSON.stringify(payload));
+        for (const image of images) body.append('image', image, image.name);
+      }
+      await api(`/api/${kind}${isEdit ? `/${encodeURIComponent(record.id)}` : ''}`, { method: isEdit ? 'PUT' : 'POST', body });
       if (!current()) return;
       if (kind === 'defects') rememberDefectVersion(user.id, projectId, values.version);
       setForm(null); setToast(isEdit ? '已保存修改' : kind === 'cases' ? '用例已添加' : '缺陷已添加');
@@ -471,6 +552,22 @@ export default function App() {
     const current = () => authEpoch.current === auth && scopeEpoch.current === scope;
     try { await api(`/api/${kind}/${encodeURIComponent(record.id)}`, { method: 'DELETE', body: JSON.stringify({ revision: record.revision, projectId: record.projectId }) }); if (!current()) return; setDetail(null); setToast('记录已删除'); await loadData(); }
     catch (failure) { if (!current()) return; if (failure.status === 409) await loadData(); if (current()) setError(failure.status === 409 ? '记录已被他人修改，请查看最新内容后重新确认删除。' : failure.message); }
+  }
+  async function deleteDefectImage(record, image) {
+    if (!window.confirm(`删除图片“${image.name}”？`)) return;
+    const auth = authEpoch.current; const scope = scopeEpoch.current;
+    const current = () => authEpoch.current === auth && scopeEpoch.current === scope;
+    try {
+      await api(`/api/defects/${encodeURIComponent(record.id)}/images/${encodeURIComponent(image.id)}`, {
+        method: 'DELETE', body: JSON.stringify({ projectId: record.projectId, revision: record.revision }),
+      });
+      if (!current()) return;
+      setToast('图片已删除'); await loadData();
+    } catch (failure) {
+      if (!current()) return;
+      if (failure.status === 409) await loadData();
+      if (current()) setError(failure.status === 409 ? '缺陷已被他人修改，请刷新后重试。' : failure.message);
+    }
   }
   async function saveGenerated(record, projectId) {
     if (!projectId || !projects.some((project) => project.id === projectId)) throw new Error('请先选择保存到的项目组');
@@ -534,7 +631,7 @@ export default function App() {
       </main>
       {toast && <div className="toast" role="status"><Check size={17} />{toast}</div>}
     </div>
-    {selectedRecord && permitted(user, detail.kind) && <RecordDetail kind={detail.kind} record={selectedRecord} canWrite={permitted(user, detail.kind, 'write')} onClose={() => setDetail(null)} onEdit={() => openForm(detail.kind, selectedRecord)} onDelete={() => deleteRecord(detail.kind, selectedRecord)} />}
+    {selectedRecord && permitted(user, detail.kind) && <RecordDetail kind={detail.kind} record={selectedRecord} canWrite={permitted(user, detail.kind, 'write')} onClose={() => setDetail(null)} onEdit={() => openForm(detail.kind, selectedRecord)} onDelete={() => deleteRecord(detail.kind, selectedRecord)} onDeleteImage={deleteDefectImage} />}
     {form && formProject && <RecordForm key={`${form.kind}-${form.projectId}-${form.record?.id || 'new'}-${form.sourceIndex ?? ''}`} kind={form.kind} initial={form.record} project={formProject} userId={user.id} mode={form.record?.id ? 'edit' : 'new'} onClose={() => { if (!formBusy) setForm(null); }} onSave={saveForm} busy={formBusy} error={formError} onReload={() => setForm(null)} />}
     {passwordOpen && <PasswordDialog onClose={() => setPasswordOpen(false)} onSaved={() => { setPasswordOpen(false); setToast('密码已修改，请在下次登录时使用新密码'); }} />}
     {usersOpen && user.role === 'admin' && <UsersDialog onClose={() => setUsersOpen(false)} onChanged={loadData} />}

@@ -14,6 +14,7 @@ import { registerCaseExecutionRoutes } from './case-executions.js';
 import { registerAiRoutes } from './ai-documents.js';
 import { createFeishuBrowserService, registerFeishuBrowserRoutes } from './feishu-browser.js';
 import { createFeishuDefectNotifier, createFeishuDefectSender, loadFeishuDefectTarget } from './feishu-defect-notifications.js';
+import { createDefectImageStore } from './defect-images.js';
 import { initializeWorkspaceDocuments, registerWorkspaceDocumentRoutes } from './workspace-documents.js';
 import { registerAiWorkspaceRoutes } from './ai-workspace.js';
 import { uploadFilename } from './upload-name.js';
@@ -440,10 +441,12 @@ app.post('/api/users/:id/reveal-password', requireAdmin, limitAccountAttempts, a
 });
 
 const projects = createProjectService({ db, iconDir: projectIconDir, sendError, inputError: (message) => new InputError(message), authenticate: userFromRequest });
+const defectImages = createDefectImageStore({ db, dataDir, sendError, inputError: (message) => new InputError(message) });
 let defectNotificationTarget = null;
 try { defectNotificationTarget = loadFeishuDefectTarget(dataDir); }
 catch { console.warn('飞书缺陷通知目标配置无效，通知未启用。'); }
-const defectNotifier = createFeishuDefectNotifier({ db, target: defectNotificationTarget });
+const defectNotifier = createFeishuDefectNotifier({ db, target: defectNotificationTarget,
+  imageDir: path.join(dataDir, 'defect-images') });
 projects.register(app, requireAdmin, broadcast);
 
 app.use('/api', (req, res, next) => {
@@ -453,6 +456,11 @@ app.use('/api', (req, res, next) => {
   const operation = req.method === 'GET' || (req.method === 'POST' && req.path === '/cases/export') ? 'view' : 'write';
   if (!permission[operation]) return sendError(res, 403, 'forbidden', '没有此模块的操作权限');
   next();
+});
+
+app.get('/api/members', requirePermission('defects', 'view'), (_req, res) => {
+  res.json({ members: db.prepare(`SELECT id, username FROM users
+    WHERE disabled = 0 AND deleted_at IS NULL ORDER BY username COLLATE NOCASE`).all() });
 });
 
 function readString(value, field, max, fallback = '') {
@@ -612,7 +620,8 @@ function mapDefect(row) {
     module: row.module, severity: row.severity,
     status: row.status, assignee: row.assignee, version: row.version,
     reproSteps: row.repro_steps, expected: row.expected, actual: row.actual,
-    notes: row.notes, revision: row.revision, createdBy: row.creator_name,
+    notes: row.notes, images: defectImages.list(row.id, row.project_id),
+    revision: row.revision, createdBy: row.creator_name,
     createdAt: row.created_at, updatedAt: row.updated_at,
   };
 }
@@ -626,51 +635,120 @@ app.get('/api/defects', (req, res) => {
   res.json({ defects: db.prepare(`${defectSelect} WHERE defects.project_id = ? ORDER BY defects.updated_at DESC, defects.id DESC`).all(projectId).map(mapDefect) });
 });
 
-app.post('/api/defects', (req, res) => {
-  const projectId = projects.requireProject(req.body?.projectId);
-  const value = normalizeDefect(req.body);
-  const id = crypto.randomUUID();
-  const now = new Date().toISOString();
-  const record = db.transaction(() => {
-    db.prepare(`INSERT INTO defects (id, title, issue_type, module, severity, status, assignee, version, repro_steps,
-      expected, actual, notes, revision, created_by, created_at, updated_at, project_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`)
-      .run(id, value.title, value.issueType, value.module, value.severity, value.status, value.assignee,
-        value.version, value.reproSteps, value.expected, value.actual, value.notes,
-        req.user.id, now, now, projectId);
-    const created = mapDefect(getDefect.get(id));
-    defectNotifier.enqueue('created', created);
-    return created;
-  })();
-  broadcast('defect.created', { defect: record, projectId });
-  res.status(201).json({ defect: record });
+app.post('/api/defects', defectImages.parseUpload, async (req, res) => {
+  let images = []; let saved = false;
+  try {
+    const input = defectImages.payload(req);
+    const projectId = projects.requireProject(input?.projectId);
+    const value = normalizeDefect(input);
+    const id = crypto.randomUUID();
+    const now = new Date().toISOString();
+    defectImages.assertCapacity(id, req.files?.length || 0);
+    images = await defectImages.prepare(req);
+    const freshUser = userFromRequest(req);
+    if (!freshUser) return sendError(res, 401, 'unauthorized', '账号已更新，请重新登录');
+    if (!freshUser.permissions.defects.write) return sendError(res, 403, 'forbidden', '没有此模块的操作权限');
+    const record = db.transaction(() => {
+      db.prepare(`INSERT INTO defects (id, title, issue_type, module, severity, status, assignee, version, repro_steps,
+        expected, actual, notes, revision, created_by, created_at, updated_at, project_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`)
+        .run(id, value.title, value.issueType, value.module, value.severity, value.status, value.assignee,
+          value.version, value.reproSteps, value.expected, value.actual, value.notes,
+          freshUser.id, now, now, projectId);
+      defectImages.save(images, id, projectId, freshUser.id);
+      const created = mapDefect(getDefect.get(id));
+      defectNotifier.enqueue('created', created);
+      return created;
+    })();
+    saved = true;
+    broadcast('defect.created', { defect: record, projectId });
+    res.status(201).json({ defect: record });
+  } finally {
+    defectImages.cleanupUpload(req);
+    if (!saved) defectImages.discard(images);
+  }
 });
 
-app.put('/api/defects/:id', (req, res) => {
+app.put('/api/defects/:id', defectImages.parseUpload, async (req, res) => {
+  let images = []; let saved = false;
+  try {
+    const input = defectImages.payload(req);
+    const projectId = projects.requireProject(input?.projectId);
+    const current = getDefect.get(req.params.id);
+    if (!current || current.project_id !== projectId) return sendError(res, 404, 'not_found', '缺陷不存在');
+    const revision = readRevision(input?.revision);
+    if (revision !== current.revision) {
+      return res.status(409).json({ error: 'conflict', message: '缺陷已被其他人修改，请刷新后重试', defect: mapDefect(current) });
+    }
+    const value = normalizeDefect(input, mapDefect(current));
+    defectImages.assertCapacity(current.id, req.files?.length || 0);
+    images = await defectImages.prepare(req);
+    const freshUser = userFromRequest(req);
+    if (!freshUser) return sendError(res, 401, 'unauthorized', '账号已更新，请重新登录');
+    if (!freshUser.permissions.defects.write) return sendError(res, 403, 'forbidden', '没有此模块的操作权限');
+    const record = db.transaction(() => {
+      const result = db.prepare(`UPDATE defects SET title=?, issue_type=?, module=?, severity=?, status=?, assignee=?,
+        version=?, repro_steps=?, expected=?, actual=?, notes=?, revision=revision+1, updated_at=?
+        WHERE id=? AND revision=?`).run(value.title, value.issueType, value.module, value.severity, value.status,
+          value.assignee, value.version, value.reproSteps, value.expected, value.actual,
+          value.notes, new Date().toISOString(), current.id, revision);
+      if (!result.changes) return null;
+      defectImages.save(images, current.id, projectId, freshUser.id);
+      const updated = mapDefect(getDefect.get(current.id));
+      if (current.status !== updated.status && ['已解决', '已关闭'].includes(updated.status)) {
+        defectNotifier.enqueue(updated.status === '已解决' ? 'resolved' : 'closed', updated);
+      }
+      return updated;
+    })();
+    if (!record) return res.status(409).json({ error: 'conflict', message: '缺陷已被其他人修改', defect: mapDefect(getDefect.get(current.id)) });
+    saved = true;
+    broadcast('defect.updated', { defect: record, projectId });
+    res.json({ defect: record });
+  } finally {
+    defectImages.cleanupUpload(req);
+    if (!saved) defectImages.discard(images);
+  }
+});
+
+function serveDefectImage(req, res, next, thumbnail) {
+  const projectId = projects.requireProject(req.query.projectId);
+  const defect = getDefect.get(req.params.id);
+  if (!defect || defect.project_id !== projectId) return sendError(res, 404, 'not_found', '缺陷不存在');
+  const image = defectImages.row(req.params.imageId, defect.id, projectId);
+  if (!image) return sendError(res, 404, 'not_found', '图片不存在');
+  const filename = defectImages.imagePath(image, thumbnail);
+  if (!filename || !fs.existsSync(filename)) return sendError(res, 404, 'not_found', '图片不存在');
+  res.set('X-Content-Type-Options', 'nosniff');
+  res.set('Content-Security-Policy', 'sandbox');
+  res.type(thumbnail ? 'webp' : 'png');
+  res.sendFile(filename, (error) => { if (error && !res.headersSent) next(error); });
+}
+
+app.get('/api/defects/:id/images/:imageId/thumbnail', (req, res, next) => serveDefectImage(req, res, next, true));
+app.get('/api/defects/:id/images/:imageId', (req, res, next) => serveDefectImage(req, res, next, false));
+
+app.delete('/api/defects/:id/images/:imageId', (req, res) => {
   const projectId = projects.requireProject(req.body?.projectId);
   const current = getDefect.get(req.params.id);
   if (!current || current.project_id !== projectId) return sendError(res, 404, 'not_found', '缺陷不存在');
+  const image = defectImages.row(req.params.imageId, current.id, projectId);
+  if (!image) return sendError(res, 404, 'not_found', '图片不存在');
   const revision = readRevision(req.body?.revision);
   if (revision !== current.revision) {
     return res.status(409).json({ error: 'conflict', message: '缺陷已被其他人修改，请刷新后重试', defect: mapDefect(current) });
   }
-  const value = normalizeDefect(req.body, mapDefect(current));
-  const record = db.transaction(() => {
-    const result = db.prepare(`UPDATE defects SET title=?, issue_type=?, module=?, severity=?, status=?, assignee=?,
-      version=?, repro_steps=?, expected=?, actual=?, notes=?, revision=revision+1, updated_at=?
-      WHERE id=? AND revision=?`).run(value.title, value.issueType, value.module, value.severity, value.status,
-        value.assignee, value.version, value.reproSteps, value.expected, value.actual,
-        value.notes, new Date().toISOString(), current.id, revision);
+  const updated = db.transaction(() => {
+    const result = db.prepare('UPDATE defects SET revision = revision + 1, updated_at = ? WHERE id = ? AND revision = ?')
+      .run(new Date().toISOString(), current.id, revision);
     if (!result.changes) return null;
-    const updated = mapDefect(getDefect.get(current.id));
-    if (current.status !== updated.status && ['已解决', '已关闭'].includes(updated.status)) {
-      defectNotifier.enqueue(updated.status === '已解决' ? 'resolved' : 'closed', updated);
-    }
-    return updated;
+    db.prepare('DELETE FROM defect_images WHERE id = ? AND defect_id = ?').run(image.id, current.id);
+    return mapDefect(getDefect.get(current.id));
   })();
-  if (!record) return res.status(409).json({ error: 'conflict', message: '缺陷已被其他人修改', defect: mapDefect(getDefect.get(current.id)) });
-  broadcast('defect.updated', { defect: record, projectId });
-  res.json({ defect: record });
+  if (!updated) return res.status(409).json({ error: 'conflict', message: '缺陷已被其他人修改', defect: mapDefect(getDefect.get(current.id)) });
+  try { defectImages.removeFiles([image]); }
+  catch (error) { console.error('Defect image cleanup failed:', error); }
+  broadcast('defect.updated', { defect: updated, projectId });
+  res.json({ defect: updated });
 });
 
 app.delete('/api/defects/:id', (req, res) => {
@@ -681,6 +759,7 @@ app.delete('/api/defects/:id', (req, res) => {
   if (revision !== current.revision) {
     return res.status(409).json({ error: 'conflict', message: '缺陷已被其他人修改', defect: mapDefect(current) });
   }
+  const images = defectImages.stored(current.id, projectId);
   const result = db.prepare('DELETE FROM defects WHERE id = ? AND revision = ?').run(current.id, revision);
   if (!result.changes) {
     const latest = getDefect.get(current.id);
@@ -688,6 +767,8 @@ app.delete('/api/defects/:id', (req, res) => {
       ? res.status(409).json({ error: 'conflict', message: '缺陷已被其他人修改', defect: mapDefect(latest) })
       : sendError(res, 404, 'not_found', '缺陷不存在');
   }
+  try { defectImages.removeFiles(images); }
+  catch (error) { console.error('Defect image cleanup failed:', error); }
   broadcast('defect.deleted', { id: current.id, projectId });
   res.json({ ok: true });
 });
@@ -945,7 +1026,7 @@ server.listen(port, '0.0.0.0', () => {
       if (!credentials) throw new Error('飞书机器人凭据缺失');
       const Lark = await import('@larksuiteoapi/node-sdk');
       const client = new Lark.Client({ ...credentials, loggerLevel: Lark.LoggerLevel.error });
-      if (!shuttingDown) defectNotifier.start(createFeishuDefectSender(client));
+      if (!shuttingDown) defectNotifier.start(createFeishuDefectSender(client, { imageDir: path.join(dataDir, 'defect-images') }));
     }).catch(() => { console.warn('飞书缺陷通知暂不可发送，已保存的通知将在服务重启后重试。'); });
   }
   void import('./feishu-bot.js').then(({ startFeishuBot }) => startFeishuBot(dataDir))

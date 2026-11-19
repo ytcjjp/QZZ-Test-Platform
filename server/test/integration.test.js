@@ -439,6 +439,28 @@ test('defect notices are queued for one project on creation and resolved/closed 
     assert.equal(result.status, 200);
     assert.equal(queued().length, 5);
     assert.match(queued()[4].content, /第二条待处理缺陷/);
+
+    const png = await sharp({ create: { width: 16, height: 12, channels: 3, background: '#61a288' } }).png().toBuffer();
+    const createWithImage = new FormData();
+    createWithImage.set('payload', JSON.stringify({ projectId, title: '带截图的缺陷' }));
+    createWithImage.append('image', new Blob([png], { type: 'image/png' }), '截图.png');
+    const imageCreate = await request(started.url, '/api/defects', cookie, { method: 'POST', body: createWithImage });
+    assert.equal(imageCreate.status, 201);
+    assert.equal(imageCreate.body.defect.images.length, 1);
+    assert.equal(queued().length, 6);
+    assert.deepEqual(JSON.parse(queued()[5].images_json).map(({ id }) => id), [imageCreate.body.defect.images[0].id]);
+    assert.match(queued()[5].content, /带截图的缺陷/);
+
+    const resolveWithImage = new FormData();
+    resolveWithImage.set('payload', JSON.stringify({ projectId, revision: imageCreate.body.defect.revision, status: '已解决' }));
+    resolveWithImage.append('image', new Blob([png], { type: 'image/png' }), '修复截图.png');
+    const imageUpdate = await request(started.url, `/api/defects/${imageCreate.body.defect.id}`, cookie,
+      { method: 'PUT', body: resolveWithImage });
+    assert.equal(imageUpdate.status, 200);
+    assert.equal(imageUpdate.body.defect.images.length, 2);
+    assert.equal(queued().length, 7);
+    assert.deepEqual(JSON.parse(queued()[6].images_json).map(({ id }) => id), imageUpdate.body.defect.images.map(({ id }) => id));
+    assert.match(queued()[6].content, /^状态：已解决$/m);
   } finally {
     db?.close();
     if (child) { child.kill(); await new Promise((resolve) => child.once('exit', resolve)); }
