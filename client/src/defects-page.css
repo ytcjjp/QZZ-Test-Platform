@@ -31,8 +31,12 @@
 .defect-bulk select, .defect-status-select { border: 1px solid #d5dfdc; border-radius: 4px; background: #fff; padding: 7px 9px; font: inherit; font-size: 12px; min-width: 104px; }
 .defect-status-select { width: 100%; min-width: 0; }
 .defect-delete-modal { max-width: 440px; }
+@media (max-width: 1100px) {
+  .defect-table-toolbar .search-box { flex: none; width: 100%; max-width: none; }
+  .defect-toolbar-controls { width: 100%; }
+}
 @media (max-width: 700px) {
-  .defect-toolbar-controls { width: 100%; justify-content: flex-start; }
+  .defect-toolbar-controls { justify-content: flex-start; }
   .defect-filters { max-width: 100%; }
 }
 @media (max-width: 600px) { .defect-bulk { gap: 8px; padding: 12px; } }
