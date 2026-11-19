@@ -77,6 +77,29 @@ AI 生成草稿无需项目，保存进用例库时必须选择所属项目。
 - `POST /api/defects/batch`：同上，支持 `action:"delete"` 或 `action:"status",status:"待处理"|"处理中"|"待验证"|"搁置"|"已解决"|"已关闭"`。单条列表状态修改同样使用此接口，`items` 只有一条。
 - 批量操作须有相应模块写权限，最多 1000 条，不接受重复 ID。先校验全部项目归属和修订，再在事务内整体提交；任一条过期返回 409、跨项目或不存在返回 404，不会部分成功。成功返回 `{ok:true,count}`，逐记录发送原有实时事件。记录删除不可恢复，网页需要用户确认；项目组删除则可从已删除项目恢复。
 
+## AI 代码巡检
+
+`GET/POST /api/code-audit/sources` 按 `projectId` 列出或登记来源。登记请求为
+`{projectId,label,kind:"local"|"git",location}`，仅管理员可操作；本地路径是服务器主机上的
+绝对目录，不能是符号链接、平台自身或敏感目录。`git` 来源只接受不含账号、口令、查询串的
+HTTPS 地址，默认允许 `github.com`；额外可信域名由服务器环境变量
+`QZZ_CODE_AUDIT_GIT_HOSTS` 指定，多个主机用逗号分隔。平台禁用 Git 凭据交互、重定向、
+子模块和项目钩子；私有仓库建议由管理员先在服务器克隆，再登记为 `local`。
+`DELETE /api/code-audit/sources/:id` 传 `{projectId}` 停用来源，不删除历史巡检。
+
+`POST /api/code-audit/runs` 传 `{projectId,sourceId,caseId,autoCreateVerified?}`，返回 202
+和持久化的运行记录。`GET /api/code-audit/runs?projectId=...`、
+`GET /api/code-audit/runs/:id?projectId=...` 查看最近历史及结果；
+`DELETE /api/code-audit/runs/:id` 传 `{projectId}` 由发起人取消运行中任务。
+审查需 `ai.write` 和 `cases.view`，自动建单另需 `defects.write`。
+模型只接收安全筛选后的少量源码片段和用例，不得自行读取磁盘、执行项目代码或网络操作。
+结论保留 Git 版本、文件行号、取样预算和未验证项；没有运行引擎或游戏，不写入人工执行状态。
+确定性资源发现只有完整索引且唯一匹配用例时才可能自动建单；
+AI 候选须由有 `defects.write` 的 QA 在结果页确认，调用
+`POST /api/code-audit/runs/:id/findings/:findingId/defect` 传 `{projectId}`，按来源、用例及证据去重。
+正式缺陷会按现有目标配置发送飞书通知。AI 不可用时保留静态扫描结果并说明原因；
+服务重启会将未完成任务标记为中断，记录仍可查看。
+
 需求管理、测试计划及知识库 API：
 
 这些接口均需登录并验证有效 `projectId`。读取由查询参数传项目 ID，写入由 JSON 或

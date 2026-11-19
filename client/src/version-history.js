@@ -1,7 +1,8 @@
-export const CURRENT_VERSION = '0.2.9';
+export const CURRENT_VERSION = '0.3.0';
 
 // The 0.1.x milestones were reconstructed from the repository history.
 export const VERSION_HISTORY = [
+  { version: '0.3.0', date: '2026-11-19', summary: '新增 AI 代码巡检：按用例核对代码与资源变更，记录证据并生成缺陷。' },
   { version: '0.2.9', date: '2026-11-19', summary: '缺陷支持拖入图片并预览、成员用户名候选；飞书通知可附图片。' },
   { version: '0.2.8', date: '2026-11-19', summary: '精简缺陷飞书通知，按问题类型、标题、版本、模块、状态、负责人和编号展示。' },
   { version: '0.2.7', date: '2026-11-19', summary: '甜点项目组缺陷新建、解决、关闭后自动通知指定飞书群，失败可恢复投递。' },

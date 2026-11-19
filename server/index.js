@@ -17,6 +17,7 @@ import { createFeishuDefectNotifier, createFeishuDefectSender, loadFeishuDefectT
 import { createDefectImageStore } from './defect-images.js';
 import { initializeWorkspaceDocuments, registerWorkspaceDocumentRoutes } from './workspace-documents.js';
 import { registerAiWorkspaceRoutes } from './ai-workspace.js';
+import { registerCodeAuditRoutes } from './code-audits.js';
 import { uploadFilename } from './upload-name.js';
 import { hashPassword, verifyPassword, loadPasswordKey,
   encryptPassword as encryptWithKey, decryptPassword as decryptWithKey } from './passwords.js';
@@ -953,6 +954,8 @@ app.get('/api/feishu-browser/extension.zip', requireAdmin, (req, res) => {
 registerAiRoutes(app, { db, dataDir, sendError, authenticate: userFromRequest, browserService: feishuBrowser, requireProject: projects.requireProject });
 registerWorkspaceDocumentRoutes(app, { db, dataDir, requirePermission, requireProject: projects.requireProject, broadcast, authenticate: userFromRequest, browserService: feishuBrowser });
 registerAiWorkspaceRoutes(app, { db, dataDir, workspace: workspaceDocuments, requireProject: projects.requireProject, authenticate: userFromRequest, sendError });
+const codeAudit = registerCodeAuditRoutes(app, { db, dataDir, requireProject: projects.requireProject, authenticate: userFromRequest,
+  sendError, requirePermission, requireAdmin, getCase, getDefect, mapDefect, broadcast, notifyDefect: defectNotifier.enqueue });
 
 app.use('/api', (req, res) => sendError(res, 404, 'not_found', '接口不存在'));
 
@@ -1005,7 +1008,7 @@ function broadcast(type, details) {
       WHERE token_hash = ? AND expires_at > ? AND disabled = 0`)
       .get(client.tokenHash, Date.now());
     const category = type.split('.')[0];
-    const module = { case: 'cases', defect: 'defects', file: 'files', requirement: 'requirements', plan: 'requirements', knowledge: 'knowledge' }[category];
+    const module = { case: 'cases', defect: 'defects', file: 'files', requirement: 'requirements', plan: 'requirements', knowledge: 'knowledge', audit: 'ai' }[category];
     const user = session && mapUser(session);
     if (user && category === 'project') {
       if (projects.canView(user)) client.send(JSON.stringify({ type, project: projects.mapProject(projects.getProject.get(details.project.id), user) }));
@@ -1034,11 +1037,15 @@ server.listen(port, '0.0.0.0', () => {
     .catch(() => { console.warn('飞书助手未启动，请检查本机凭据、模型、网络及飞书应用配置。'); });
 });
 
-function shutdown() {
+async function shutdown() {
+  if (shuttingDown) return;
   shuttingDown = true;
   defectNotifier.close();
   feishuBot?.close({ force: true });
-  feishuBrowser.close(); server.close(); wss.close(); db.close(); process.exit(0);
+  feishuBrowser.close();
+  try { await codeAudit.close(); }
+  catch (error) { console.error('Code audit shutdown failed:', error); }
+  server.close(); wss.close(); db.close(); process.exit(0);
 }
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+process.on('SIGINT', () => { void shutdown(); });
+process.on('SIGTERM', () => { void shutdown(); });
