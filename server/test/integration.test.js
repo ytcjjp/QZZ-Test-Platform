@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { access, mkdtemp, readFile, rm, unlink } from 'node:fs/promises';
+import { access, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -350,6 +350,95 @@ test('first-run generated password survives a restart until login and WebSocket 
     await request(started.url, '/api/session', cookie, { method: 'DELETE' });
     await disconnected;
   } finally {
+    if (child) { child.kill(); await new Promise((resolve) => child.once('exit', resolve)); }
+    await rm(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
+test('defect notices are queued for one project on creation and resolved/closed transitions, including batch changes', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'qzz-defect-notification-api-'));
+  let child; let db;
+  const env = { FEISHU_APP_ID: '', FEISHU_APP_SECRET: '' };
+  try {
+    let started = await launch(dataDir, env); child = started.child;
+    let session = await request(started.url, '/api/session', null, {
+      method: 'POST', body: { username: 'admin', password: 'AdminPassword123456' },
+    });
+    let cookie = session.response.headers.get('set-cookie').split(';')[0];
+    const sweet = await request(started.url, '/api/projects', cookie, { method: 'POST', body: { name: '甜点项目组' } });
+    assert.equal(sweet.status, 201);
+    const projectId = sweet.body.project.id;
+    child.kill(); await new Promise((resolve) => child.once('exit', resolve)); child = null;
+    await writeFile(path.join(dataDir, 'feishu-defect-notifications.json'), JSON.stringify({ projectId, chatId: 'oc_testgroup123' }));
+
+    started = await launch(dataDir, env); child = started.child;
+    session = await request(started.url, '/api/session', null, {
+      method: 'POST', body: { username: 'admin', password: 'AdminPassword123456' },
+    });
+    cookie = session.response.headers.get('set-cookie').split(';')[0];
+    const otherId = (await request(started.url, '/api/projects', cookie)).body.projects.find((item) => item.id !== projectId).id;
+    db = new Database(path.join(dataDir, 'platform.db'));
+    const queued = () => db.prepare('SELECT * FROM feishu_defect_notifications ORDER BY rowid').all();
+    const crossProject = await request(started.url, '/api/defects', cookie, {
+      method: 'POST', body: { projectId: otherId, title: '其他项目不应发群' },
+    });
+    assert.equal(crossProject.status, 201);
+    assert.equal(queued().length, 0);
+    let result = await request(started.url, '/api/defects', cookie, {
+      method: 'POST', body: { projectId, title: '测试通知', version: '2.0', reproSteps: '不要发送复现正文' },
+    });
+    assert.equal(result.status, 201);
+    let defect = result.body.defect;
+    assert.equal(queued().length, 1);
+    assert.equal(queued()[0].chat_id, 'oc_testgroup123');
+    assert.match(queued()[0].content, /新建缺陷/);
+    assert.doesNotMatch(queued()[0].content, /不要发送复现正文/);
+
+    result = await request(started.url, `/api/defects/${defect.id}`, cookie, {
+      method: 'PUT', body: { projectId, revision: defect.revision, status: '待处理', notes: '只修改其他字段' },
+    });
+    assert.equal(result.status, 200); defect = result.body.defect;
+    assert.equal(queued().length, 1);
+    result = await request(started.url, `/api/defects/${defect.id}`, cookie, {
+      method: 'PUT', body: { projectId, revision: defect.revision, status: '已解决' },
+    });
+    assert.equal(result.status, 200); defect = result.body.defect;
+    assert.equal(queued().length, 2);
+    assert.match(queued()[1].content, /缺陷已解决/);
+    assert.equal((await request(started.url, `/api/defects/${defect.id}`, cookie, {
+      method: 'PUT', body: { projectId, revision: defect.revision - 1, status: '已关闭' },
+    })).status, 409);
+    assert.equal(queued().length, 2);
+    result = await request(started.url, '/api/defects/batch', cookie, {
+      method: 'POST', body: { projectId, items: [{ id: defect.id, revision: defect.revision }], action: 'status', status: '已关闭' },
+    });
+    assert.equal(result.status, 200);
+    assert.equal(queued().length, 3);
+    assert.match(queued()[2].content, /缺陷已关闭/);
+    defect = (await request(started.url, `/api/defects?projectId=${projectId}`, cookie)).body.defects.find((item) => item.id === defect.id);
+    result = await request(started.url, '/api/defects/batch', cookie, {
+      method: 'POST', body: { projectId, items: [{ id: defect.id, revision: defect.revision }], action: 'status', status: '已关闭' },
+    });
+    assert.equal(result.status, 200);
+    assert.equal(queued().length, 3);
+    assert.equal(new Set(queued().map((item) => item.id)).size, 3);
+    const second = await request(started.url, '/api/defects', cookie, {
+      method: 'POST', body: { projectId, title: '第二条待处理缺陷' },
+    });
+    assert.equal(second.status, 201);
+    assert.equal(queued().length, 4);
+    defect = (await request(started.url, `/api/defects?projectId=${projectId}`, cookie)).body.defects.find((item) => item.id === defect.id);
+    result = await request(started.url, '/api/defects/batch', cookie, {
+      method: 'POST', body: { projectId, items: [
+        { id: defect.id, revision: defect.revision },
+        { id: second.body.defect.id, revision: second.body.defect.revision },
+      ], action: 'status', status: '已关闭' },
+    });
+    assert.equal(result.status, 200);
+    assert.equal(queued().length, 5);
+    assert.match(queued()[4].content, /第二条待处理缺陷/);
+  } finally {
+    db?.close();
     if (child) { child.kill(); await new Promise((resolve) => child.once('exit', resolve)); }
     await rm(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }

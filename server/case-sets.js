@@ -24,7 +24,7 @@ export function caseTree(source, previous, normalized, inputError) {
   } catch (error) { throw inputError(error.message); }
 }
 
-export function registerCaseSetRoutes(app, { db, projects, sendError, inputError, readRevision, mapCase, mapDefect, getCase, getDefect, broadcast }) {
+export function registerCaseSetRoutes(app, { db, projects, sendError, inputError, readRevision, mapCase, mapDefect, getCase, getDefect, broadcast, notifyDefect = () => {} }) {
   function selected(body) {
     const projectId = projects.requireProject(body?.projectId);
     if (!Array.isArray(body?.items) || !body.items.length || body.items.length > 1000) throw inputError('请选择 1-1000 条记录');
@@ -65,6 +65,9 @@ export function registerCaseSetRoutes(app, { db, projects, sendError, inputError
               ? db.prepare(`DELETE FROM ${table} WHERE id = ? AND revision = ?`).run(row.id, row.revision)
               : db.prepare('UPDATE defects SET status = ?, revision = revision + 1, updated_at = ? WHERE id = ? AND revision = ?').run(req.body.status, now, row.id, row.revision);
             if (!result.changes) throw new Error('conflict');
+            if (table === 'defects' && action === 'status' && row.status !== req.body.status && ['已解决', '已关闭'].includes(req.body.status)) {
+              notifyDefect(req.body.status === '已解决' ? 'resolved' : 'closed', mapDefect(getDefect.get(row.id)));
+            }
           }
         })();
       } catch (error) {

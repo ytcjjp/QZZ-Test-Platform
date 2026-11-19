@@ -13,6 +13,7 @@ import { initializeCaseSets, caseTree, registerCaseSetRoutes } from './case-sets
 import { registerCaseExecutionRoutes } from './case-executions.js';
 import { registerAiRoutes } from './ai-documents.js';
 import { createFeishuBrowserService, registerFeishuBrowserRoutes } from './feishu-browser.js';
+import { createFeishuDefectNotifier, createFeishuDefectSender, loadFeishuDefectTarget } from './feishu-defect-notifications.js';
 import { initializeWorkspaceDocuments, registerWorkspaceDocumentRoutes } from './workspace-documents.js';
 import { registerAiWorkspaceRoutes } from './ai-workspace.js';
 import { uploadFilename } from './upload-name.js';
@@ -439,6 +440,10 @@ app.post('/api/users/:id/reveal-password', requireAdmin, limitAccountAttempts, a
 });
 
 const projects = createProjectService({ db, iconDir: projectIconDir, sendError, inputError: (message) => new InputError(message), authenticate: userFromRequest });
+let defectNotificationTarget = null;
+try { defectNotificationTarget = loadFeishuDefectTarget(dataDir); }
+catch { console.warn('飞书缺陷通知目标配置无效，通知未启用。'); }
+const defectNotifier = createFeishuDefectNotifier({ db, target: defectNotificationTarget });
 projects.register(app, requireAdmin, broadcast);
 
 app.use('/api', (req, res, next) => {
@@ -626,13 +631,17 @@ app.post('/api/defects', (req, res) => {
   const value = normalizeDefect(req.body);
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
-  db.prepare(`INSERT INTO defects (id, title, issue_type, module, severity, status, assignee, version, repro_steps,
-    expected, actual, notes, revision, created_by, created_at, updated_at, project_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`)
-    .run(id, value.title, value.issueType, value.module, value.severity, value.status, value.assignee,
-      value.version, value.reproSteps, value.expected, value.actual, value.notes,
-      req.user.id, now, now, projectId);
-  const record = mapDefect(getDefect.get(id));
+  const record = db.transaction(() => {
+    db.prepare(`INSERT INTO defects (id, title, issue_type, module, severity, status, assignee, version, repro_steps,
+      expected, actual, notes, revision, created_by, created_at, updated_at, project_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`)
+      .run(id, value.title, value.issueType, value.module, value.severity, value.status, value.assignee,
+        value.version, value.reproSteps, value.expected, value.actual, value.notes,
+        req.user.id, now, now, projectId);
+    const created = mapDefect(getDefect.get(id));
+    defectNotifier.enqueue('created', created);
+    return created;
+  })();
   broadcast('defect.created', { defect: record, projectId });
   res.status(201).json({ defect: record });
 });
@@ -646,13 +655,20 @@ app.put('/api/defects/:id', (req, res) => {
     return res.status(409).json({ error: 'conflict', message: '缺陷已被其他人修改，请刷新后重试', defect: mapDefect(current) });
   }
   const value = normalizeDefect(req.body, mapDefect(current));
-  const result = db.prepare(`UPDATE defects SET title=?, issue_type=?, module=?, severity=?, status=?, assignee=?,
-    version=?, repro_steps=?, expected=?, actual=?, notes=?, revision=revision+1, updated_at=?
-    WHERE id=? AND revision=?`).run(value.title, value.issueType, value.module, value.severity, value.status,
-      value.assignee, value.version, value.reproSteps, value.expected, value.actual,
-      value.notes, new Date().toISOString(), current.id, revision);
-  if (!result.changes) return res.status(409).json({ error: 'conflict', message: '缺陷已被其他人修改', defect: mapDefect(getDefect.get(current.id)) });
-  const record = mapDefect(getDefect.get(current.id));
+  const record = db.transaction(() => {
+    const result = db.prepare(`UPDATE defects SET title=?, issue_type=?, module=?, severity=?, status=?, assignee=?,
+      version=?, repro_steps=?, expected=?, actual=?, notes=?, revision=revision+1, updated_at=?
+      WHERE id=? AND revision=?`).run(value.title, value.issueType, value.module, value.severity, value.status,
+        value.assignee, value.version, value.reproSteps, value.expected, value.actual,
+        value.notes, new Date().toISOString(), current.id, revision);
+    if (!result.changes) return null;
+    const updated = mapDefect(getDefect.get(current.id));
+    if (current.status !== updated.status && ['已解决', '已关闭'].includes(updated.status)) {
+      defectNotifier.enqueue(updated.status === '已解决' ? 'resolved' : 'closed', updated);
+    }
+    return updated;
+  })();
+  if (!record) return res.status(409).json({ error: 'conflict', message: '缺陷已被其他人修改', defect: mapDefect(getDefect.get(current.id)) });
   broadcast('defect.updated', { defect: record, projectId });
   res.json({ defect: record });
 });
@@ -845,7 +861,7 @@ app.delete('/api/files/:id', (req, res) => {
   res.json({ ok: true });
 });
 
-registerCaseSetRoutes(app, { db, projects, sendError, inputError: (message) => new InputError(message), readRevision, mapCase, mapDefect, getCase, getDefect, broadcast });
+registerCaseSetRoutes(app, { db, projects, sendError, inputError: (message) => new InputError(message), readRevision, mapCase, mapDefect, getCase, getDefect, broadcast, notifyDefect: defectNotifier.enqueue });
 registerFeishuBrowserRoutes(app, { service: feishuBrowser, requireAdmin, sendError });
 app.get('/api/feishu-browser/extension.zip', requireAdmin, (req, res) => {
   const archive = path.join(projectDir, 'browser-extension', 'dist', 'QZZ-Feishu-Browser.zip');
@@ -923,6 +939,15 @@ let feishuBot;
 let shuttingDown = false;
 server.listen(port, '0.0.0.0', () => {
   console.log(`QZZ test platform listening on http://0.0.0.0:${server.address().port}`);
+  if (defectNotificationTarget) {
+    void import('./feishu-bot.js').then(async ({ loadFeishuBotCredentials }) => {
+      const credentials = loadFeishuBotCredentials(dataDir);
+      if (!credentials) throw new Error('飞书机器人凭据缺失');
+      const Lark = await import('@larksuiteoapi/node-sdk');
+      const client = new Lark.Client({ ...credentials, loggerLevel: Lark.LoggerLevel.error });
+      if (!shuttingDown) defectNotifier.start(createFeishuDefectSender(client));
+    }).catch(() => { console.warn('飞书缺陷通知暂不可发送，已保存的通知将在服务重启后重试。'); });
+  }
   void import('./feishu-bot.js').then(({ startFeishuBot }) => startFeishuBot(dataDir))
     .then((bot) => { if (shuttingDown) bot?.close({ force: true }); else feishuBot = bot; })
     .catch(() => { console.warn('飞书助手未启动，请检查本机凭据、模型、网络及飞书应用配置。'); });
@@ -930,6 +955,7 @@ server.listen(port, '0.0.0.0', () => {
 
 function shutdown() {
   shuttingDown = true;
+  defectNotifier.close();
   feishuBot?.close({ force: true });
   feishuBrowser.close(); server.close(); wss.close(); db.close(); process.exit(0);
 }
