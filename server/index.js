@@ -919,9 +919,19 @@ function broadcast(type, details) {
   }
 }
 
+let feishuBot;
+let shuttingDown = false;
 server.listen(port, '0.0.0.0', () => {
   console.log(`QZZ test platform listening on http://0.0.0.0:${server.address().port}`);
+  void import('./feishu-bot.js').then(({ startFeishuBot }) => startFeishuBot(dataDir))
+    .then((bot) => { if (shuttingDown) bot?.close({ force: true }); else feishuBot = bot; })
+    .catch(() => { console.warn('飞书助手未启动，请检查本机凭据、模型、网络及飞书应用配置。'); });
 });
 
-process.on('SIGINT', () => { feishuBrowser.close(); server.close(); wss.close(); db.close(); process.exit(0); });
-process.on('SIGTERM', () => { feishuBrowser.close(); server.close(); wss.close(); db.close(); process.exit(0); });
+function shutdown() {
+  shuttingDown = true;
+  feishuBot?.close({ force: true });
+  feishuBrowser.close(); server.close(); wss.close(); db.close(); process.exit(0);
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
