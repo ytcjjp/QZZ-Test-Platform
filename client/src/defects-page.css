@@ -5,6 +5,24 @@
 .defect-table th.defect-title-col, .defect-table td.defect-title-col { width: 24%; padding-left: 12px; }
 .defect-table .defect-version-col { width: 12%; }
 .defect-filters select { max-width: 170px; }
+.defect-table-toolbar { flex-wrap: wrap; }
+.defect-table-toolbar .search-box { width: auto; max-width: 340px; flex: 1 1 220px; }
+.defect-toolbar-controls { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 10px; min-width: 0; }
+.defect-type-filters { display: inline-flex; flex: none; border: 1px solid #d9e4de; border-radius: 5px; overflow: hidden; background: white; }
+.defect-type-filters button { display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-width: 100px; height: 34px; padding: 0 9px; border: 0; background: transparent; color: #586e61; font: inherit; font-size: 11px; cursor: pointer; white-space: nowrap; }
+.defect-type-filters button + button { border-left: 1px solid #d9e4de; }
+.defect-type-filters button:hover { background: #f3f7f4; }
+.defect-type-filters button[aria-pressed="true"].defect-type-version { background: #e9f3ef; color: #2b6954; font-weight: 700; }
+.defect-type-filters button[aria-pressed="true"].defect-type-online { background: #fff0eb; color: #a74c37; font-weight: 700; }
+.defect-type-filters button span { min-width: 12px; font-variant-numeric: tabular-nums; opacity: .7; }
+.defect-title { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.defect-title-text { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.defect-type-tag { display: inline-flex; align-items: center; justify-content: center; flex: none; min-height: 20px; padding: 0 5px; border: 1px solid; border-radius: 3px; font-size: 10px; line-height: 1.3; font-weight: 600; white-space: nowrap; vertical-align: middle; }
+.defect-type-tag.defect-type-version { background: #edf5f1; border-color: #d0e2d7; color: #367158; }
+.defect-type-tag.defect-type-online { background: #fff1eb; border-color: #f0d1c3; color: #aa513a; }
+.defect-detail-title { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; }
+.defect-detail-title > span:last-child { min-width: 0; overflow-wrap: anywhere; }
+.defect-detail-title .defect-type-tag { position: relative; top: -2px; }
 .defect-table th.defect-actions-col { width: 42px; }
 .select-col input { width: 16px; height: 16px; accent-color: var(--accent, #238b7d); cursor: pointer; }
 .record-selected { background: #eaf6f1; }
@@ -13,4 +31,8 @@
 .defect-bulk select, .defect-status-select { border: 1px solid #d5dfdc; border-radius: 4px; background: #fff; padding: 7px 9px; font: inherit; font-size: 12px; min-width: 104px; }
 .defect-status-select { width: 100%; min-width: 0; }
 .defect-delete-modal { max-width: 440px; }
+@media (max-width: 700px) {
+  .defect-toolbar-controls { width: 100%; justify-content: flex-start; }
+  .defect-filters { max-width: 100%; }
+}
 @media (max-width: 600px) { .defect-bulk { gap: 8px; padding: 12px; } }

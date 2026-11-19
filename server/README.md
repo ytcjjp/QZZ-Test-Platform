@@ -57,6 +57,7 @@
 - `GET /api/projects/:id/icon`：登录且有任一项目模块查看权限后才能访问，返回图像及 `nosniff` 头。`iconUrl` 自带修订版本参数。
 - 重命名和图标更新均检查 `revision`，过期修改返回 409 及最新 `{project}`。普通成员按模块权限选择和浏览项目组，不能管理项目组。
 - `GET /api/cases?projectId=...`、`GET /api/defects?projectId=...` 必须传有效项目 ID，仅返回该组记录；对应 `POST`、`PUT /:id`、`DELETE /:id` 的 JSON 也必须包含 `projectId`。缺少或无效项目返回 400，以其他项目 ID 操作既有记录返回 404。
+- 缺陷含独立的 `issueType` 字段，仅接受 `版本问题` 或 `线上问题`；创建省略时默认 `版本问题`，修改省略时保留原值。旧缺陷升级后默认归为版本问题，响应及实时事件都会返回该字段。
 - 用例和缺陷返回 `projectId`，更新不会跨组移动记录；修改、删除仍须提供记录自身的 `revision`，并遵循原模块写权限。
 - 用例集新增可空 `requirementId`。创建/编辑显式关联时校验需求查看权限、项目归属及未删除状态；编辑时省略字段保留原关联，`null` 解除关联。`GET /api/cases?projectId=...&requirementId=...` 按需求筛选，跨项目需求被拒绝。删除需求解除用例关联，保留导图和测试计划历史。
 

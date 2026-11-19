@@ -3,6 +3,7 @@ import { forgetLogin, readRememberedLogin, rememberLogin } from './remembered-lo
 import ProjectsPage, { ProjectContext, ProjectIcon } from './Projects';
 import CaseSetsPage from './CaseSetsPage';
 import DefectsPage from './DefectsPage';
+import { DEFECT_TYPES, defectTypeClass } from './defect-types';
 import AiWorkspace from './AiWorkspace';
 import CloudFilesPage from './CloudFilesPage';
 import BrandMark from './BrandMark';
@@ -41,6 +42,7 @@ const CASE_FIELDS = [
 
 const DEFECT_FIELDS = [
   { key: 'title', label: '缺陷标题', placeholder: '简要描述问题', wide: true },
+  { key: 'issueType', label: '问题类型', type: 'select', options: DEFECT_TYPES },
   { key: 'module', label: '所属模块', placeholder: '例如：活动中心' },
   { key: 'version', label: '发现版本', placeholder: '例如：1.0.0' },
   { key: 'severity', label: '严重程度', type: 'select', options: ['致命', '严重', '一般', '轻微'] },
@@ -57,7 +59,7 @@ const EMPTY_CASE = {
   preconditions: '', steps: '', expected: '', tags: '', notes: '',
 };
 const EMPTY_DEFECT = {
-  title: '', module: '', version: '', severity: '一般', status: '待处理',
+  issueType: '版本问题', title: '', module: '', version: '', severity: '一般', status: '待处理',
   assignee: '', reproSteps: '', expected: '', actual: '', notes: '',
 };
 
@@ -186,9 +188,9 @@ function RecordDetail({ kind, record, onClose, onEdit, onDelete, canWrite }) {
   return <div className="drawer-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
     <aside className="detail-drawer" aria-label={kind === 'cases' ? '用例详情' : '缺陷详情'}>
       <div className="drawer-head"><div><span className="eyebrow">{kind === 'cases' ? 'TEST CASE' : 'DEFECT'}</span><span className="record-id">#{String(record.id).slice(0, 8)}</span></div><IconButton icon={X} label="关闭" onClick={onClose} /></div>
-      <div className="drawer-body"><h2>{record.title || (kind === 'defects' ? '未命名缺陷' : '未命名用例')}</h2><div className="detail-pills"><Tone value={kind === 'cases' ? record.priority : record.severity} /><Tone value={record.status} /><span className="detail-module">{record.module || '未分类'}</span></div>
+      <div className="drawer-body"><h2 className={kind === 'defects' ? 'defect-detail-title' : undefined}>{kind === 'defects' && <span className={`defect-type-tag ${defectTypeClass(record.issueType)}`}>{record.issueType || '版本问题'}</span>}<span>{record.title || (kind === 'defects' ? '未命名缺陷' : '未命名用例')}</span></h2><div className="detail-pills"><Tone value={kind === 'cases' ? record.priority : record.severity} /><Tone value={record.status} /><span className="detail-module">{record.module || '未分类'}</span></div>
         <div className="detail-grid"><div><span>创建人</span><strong>{record.createdBy || '—'}</strong></div><div><span>更新时间</span><strong>{displayDate(record.updatedAt || record.createdAt)}</strong></div></div>
-        <div className="detail-fields">{fields.filter((field) => !['title', 'module', 'priority', 'severity', 'status'].includes(field.key)).map((field) => <div key={field.key} className="detail-field"><span>{field.label}</span><p>{field.key === 'tags' ? (Array.isArray(record.tags) ? record.tags.join(' · ') : record.tags) || '—' : record[field.key] || '—'}</p></div>)}</div>
+        <div className="detail-fields">{fields.filter((field) => !['title', 'module', 'priority', 'severity', 'status', 'issueType'].includes(field.key)).map((field) => <div key={field.key} className="detail-field"><span>{field.label}</span><p>{field.key === 'tags' ? (Array.isArray(record.tags) ? record.tags.join(' · ') : record.tags) || '—' : record[field.key] || '—'}</p></div>)}</div>
       </div>
       {canWrite && <div className="drawer-actions"><button className="button secondary" type="button" onClick={onDelete}><Trash2 size={16} /> 删除</button><button className="button primary" type="button" onClick={onEdit}><Pencil size={16} /> 编辑</button></div>}
     </aside>

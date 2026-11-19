@@ -53,7 +53,9 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS cases_updated_idx ON cases(updated_at DESC);
   CREATE TABLE IF NOT EXISTS defects (
-    id TEXT PRIMARY KEY, title TEXT NOT NULL, module TEXT NOT NULL,
+    id TEXT PRIMARY KEY, title TEXT NOT NULL,
+    issue_type TEXT NOT NULL DEFAULT '版本问题' CHECK (issue_type IN ('版本问题', '线上问题')),
+    module TEXT NOT NULL,
     severity TEXT NOT NULL, status TEXT NOT NULL, assignee TEXT NOT NULL,
     version TEXT NOT NULL, repro_steps TEXT NOT NULL, expected TEXT NOT NULL,
     actual TEXT NOT NULL, notes TEXT NOT NULL, revision INTEGER NOT NULL,
@@ -68,6 +70,9 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS files_created_idx ON files(created_at DESC);
 `);
+if (!db.prepare('PRAGMA table_info(defects)').all().some((column) => column.name === 'issue_type')) {
+  db.exec("ALTER TABLE defects ADD COLUMN issue_type TEXT NOT NULL DEFAULT '版本问题' CHECK (issue_type IN ('版本问题', '线上问题'))");
+}
 db.exec(`
   CREATE TABLE IF NOT EXISTS file_folders (
     id TEXT PRIMARY KEY, name TEXT NOT NULL, parent_id TEXT REFERENCES file_folders(id),
@@ -578,7 +583,10 @@ app.delete('/api/cases/:id', (req, res) => {
 
 function normalizeDefect(body, previous = {}) {
   const source = body || {};
+  const issueType = readString(source.issueType, 'issueType', 20, previous.issueType || '版本问题');
+  if (!['版本问题', '线上问题'].includes(issueType)) throw new InputError('缺陷类型只能为版本问题或线上问题');
   const result = {
+    issueType,
     title: readString(source.title, 'title', 200, previous.title || ''),
     module: readString(source.module, 'module', 100, previous.module || ''),
     severity: readString(source.severity, 'severity', 30, previous.severity || '一般'),
@@ -595,7 +603,8 @@ function normalizeDefect(body, previous = {}) {
 
 function mapDefect(row) {
   return {
-    id: row.id, projectId: row.project_id, title: row.title, module: row.module, severity: row.severity,
+    id: row.id, projectId: row.project_id, title: row.title, issueType: row.issue_type,
+    module: row.module, severity: row.severity,
     status: row.status, assignee: row.assignee, version: row.version,
     reproSteps: row.repro_steps, expected: row.expected, actual: row.actual,
     notes: row.notes, revision: row.revision, createdBy: row.creator_name,
@@ -617,10 +626,10 @@ app.post('/api/defects', (req, res) => {
   const value = normalizeDefect(req.body);
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
-  db.prepare(`INSERT INTO defects (id, title, module, severity, status, assignee, version, repro_steps,
+  db.prepare(`INSERT INTO defects (id, title, issue_type, module, severity, status, assignee, version, repro_steps,
     expected, actual, notes, revision, created_by, created_at, updated_at, project_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`)
-    .run(id, value.title, value.module, value.severity, value.status, value.assignee,
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`)
+    .run(id, value.title, value.issueType, value.module, value.severity, value.status, value.assignee,
       value.version, value.reproSteps, value.expected, value.actual, value.notes,
       req.user.id, now, now, projectId);
   const record = mapDefect(getDefect.get(id));
@@ -637,9 +646,9 @@ app.put('/api/defects/:id', (req, res) => {
     return res.status(409).json({ error: 'conflict', message: '缺陷已被其他人修改，请刷新后重试', defect: mapDefect(current) });
   }
   const value = normalizeDefect(req.body, mapDefect(current));
-  const result = db.prepare(`UPDATE defects SET title=?, module=?, severity=?, status=?, assignee=?,
+  const result = db.prepare(`UPDATE defects SET title=?, issue_type=?, module=?, severity=?, status=?, assignee=?,
     version=?, repro_steps=?, expected=?, actual=?, notes=?, revision=revision+1, updated_at=?
-    WHERE id=? AND revision=?`).run(value.title, value.module, value.severity, value.status,
+    WHERE id=? AND revision=?`).run(value.title, value.issueType, value.module, value.severity, value.status,
       value.assignee, value.version, value.reproSteps, value.expected, value.actual,
       value.notes, new Date().toISOString(), current.id, revision);
   if (!result.changes) return res.status(409).json({ error: 'conflict', message: '缺陷已被其他人修改', defect: mapDefect(getDefect.get(current.id)) });

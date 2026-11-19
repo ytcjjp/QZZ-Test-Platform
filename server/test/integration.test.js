@@ -229,36 +229,48 @@ test('authenticated LAN APIs persist records and reject stale revisions', async 
     assert.equal((await request(url, `/api/cases?projectId=${projectId}`, cookie)).body.cases[0].title, 'Login with invalid password');
 
     const createdDefect = await request(url, '/api/defects', cookie, {
-      method: 'POST', body: { projectId, title: 'Crash on login', version: '1.0.0' },
+      method: 'POST', body: { projectId, title: 'Crash on login', issueType: '线上问题', version: '1.0.0' },
     });
     assert.equal(createdDefect.status, 201);
     const defectId = createdDefect.body.defect.id;
     assert.equal(createdDefect.body.defect.version, '1.0.0');
+    assert.equal(createdDefect.body.defect.issueType, '线上问题');
     const blankDefect = await request(url, '/api/defects', cookie, {
       method: 'POST', body: { projectId },
     });
     assert.equal(blankDefect.status, 201);
     assert.equal(blankDefect.body.defect.title, '');
+    assert.equal(blankDefect.body.defect.issueType, '版本问题');
     assert.equal(blankDefect.body.defect.module, '');
     assert.equal(blankDefect.body.defect.version, '');
-      assert.equal(blankDefect.body.defect.severity, '一般');
-      assert.equal(blankDefect.body.defect.status, '待处理');
+    assert.equal(blankDefect.body.defect.severity, '一般');
+    assert.equal(blankDefect.body.defect.status, '待处理');
     assert.equal(blankDefect.body.defect.reproSteps, '');
     assert.equal(blankDefect.body.defect.actual, '');
     assert.equal((await request(url, `/api/defects?projectId=${projectId}`, cookie)).body.defects.length, 2);
+    assert.equal((await request(url, `/api/defects?projectId=${projectId}`, cookie)).body.defects.find((defect) => defect.id === defectId).issueType, '线上问题');
     const blankId = blankDefect.body.defect.id;
-    assert.equal((await request(url, `/api/defects/${blankId}`, cookie, {
-      method: 'PUT', body: { projectId, revision: 1, title: '  ', version: ' 2.0.0 ' },
-    })).body.defect.version, '2.0.0');
+    const updatedBlank = await request(url, `/api/defects/${blankId}`, cookie, {
+      method: 'PUT', body: { projectId, revision: 1, title: '  ', version: ' 2.0.0 ', issueType: '线上问题' },
+    });
+    assert.equal(updatedBlank.body.defect.issueType, '线上问题');
+    assert.equal(updatedBlank.body.defect.version, '2.0.0');
     assert.equal((await request(url, `/api/defects/${blankId}`, cookie, {
       method: 'DELETE', body: { projectId, revision: 2 },
     })).status, 200);
     assert.equal((await request(url, '/api/defects', cookie, {
       method: 'POST', body: { projectId, title: 42 },
     })).status, 400);
-    assert.equal((await request(url, `/api/defects/${defectId}`, cookie, {
+    for (const issueType of ['', '其他问题', null, 42]) {
+      assert.equal((await request(url, '/api/defects', cookie, {
+        method: 'POST', body: { projectId, issueType },
+      })).status, 400);
+    }
+    const updatedDefect = await request(url, `/api/defects/${defectId}`, cookie, {
       method: 'PUT', body: { projectId, revision: 1, status: 'fixed' },
-    })).body.defect.revision, 2);
+    });
+    assert.equal(updatedDefect.body.defect.revision, 2);
+    assert.equal(updatedDefect.body.defect.issueType, '线上问题');
     assert.equal((await request(url, `/api/defects/${defectId}`, cookie, {
       method: 'PUT', body: { projectId, revision: 1, status: 'closed' },
     })).status, 409);
@@ -339,6 +351,58 @@ test('first-run generated password survives a restart until login and WebSocket 
     await disconnected;
   } finally {
     if (child) { child.kill(); await new Promise((resolve) => child.once('exit', resolve)); }
+    await rm(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
+test('preexisting defects gain the version issue marker without changing their contents or revision', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'qzz-defect-type-migration-'));
+  let child;
+  try {
+    const db = new Database(path.join(dataDir, 'platform.db'));
+    try {
+      db.exec(`CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, role TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE TABLE defects (
+          id TEXT PRIMARY KEY, title TEXT NOT NULL, module TEXT NOT NULL,
+          severity TEXT NOT NULL, status TEXT NOT NULL, assignee TEXT NOT NULL,
+          version TEXT NOT NULL, repro_steps TEXT NOT NULL, expected TEXT NOT NULL,
+          actual TEXT NOT NULL, notes TEXT NOT NULL, revision INTEGER NOT NULL,
+          created_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );`);
+      db.prepare('INSERT INTO users VALUES (?, ?, ?, ?, ?)')
+        .run('legacy-admin', 'admin', hashPassword('AdminPassword123456'), 'admin', '2026-01-01');
+      db.prepare('INSERT INTO defects VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run('legacy-defect', '历史缺陷标题', '活动', '一般', '待处理', '', '1.0.0',
+          '打开活动', '正常显示', '页面空白', '保留记录', 7, 'legacy-admin', '2026-01-02', '2026-01-03');
+    } finally { db.close(); }
+    const started = await launch(dataDir); child = started.child;
+    const login = await request(started.url, '/api/session', null, {
+      method: 'POST', body: { username: 'admin', password: 'AdminPassword123456' },
+    });
+    assert.equal(login.status, 200);
+    const cookie = login.response.headers.get('set-cookie').split(';')[0];
+    const projectId = (await request(started.url, '/api/projects', cookie)).body.projects[0].id;
+    const record = (await request(started.url, `/api/defects?projectId=${projectId}`, cookie)).body.defects[0];
+    assert.equal(record.issueType, '版本问题');
+    assert.equal(record.title, '历史缺陷标题');
+    assert.equal(record.version, '1.0.0');
+    assert.equal(record.actual, '页面空白');
+    assert.equal(record.revision, 7);
+    const migrated = new Database(path.join(dataDir, 'platform.db'), { readonly: true });
+    try {
+      assert.deepEqual(migrated.prepare('SELECT title,issue_type,version,revision,created_at,updated_at FROM defects WHERE id=?').get('legacy-defect'), {
+        title: '历史缺陷标题', issue_type: '版本问题', version: '1.0.0', revision: 7,
+        created_at: '2026-01-02', updated_at: '2026-01-03',
+      });
+      assert.match(migrated.prepare("SELECT sql FROM sqlite_master WHERE name='defects'").get().sql, /CHECK \(issue_type IN \('版本问题', '线上问题'\)\)/);
+    } finally { migrated.close(); }
+    await new Promise((resolve) => { child.once('exit', resolve); child.kill(); }); child = null;
+    const reopened = await launch(dataDir); child = reopened.child;
+    const verify = new Database(path.join(dataDir, 'platform.db'), { readonly: true });
+    try { assert.equal(verify.prepare('SELECT issue_type FROM defects WHERE id=?').get('legacy-defect').issue_type, '版本问题'); }
+    finally { verify.close(); }
+  } finally {
+    if (child) await new Promise((resolve) => { child.once('exit', resolve); child.kill(); });
     await rm(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
