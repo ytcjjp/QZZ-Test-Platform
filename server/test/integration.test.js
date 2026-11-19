@@ -385,13 +385,15 @@ test('defect notices are queued for one project on creation and resolved/closed 
     assert.equal(crossProject.status, 201);
     assert.equal(queued().length, 0);
     let result = await request(started.url, '/api/defects', cookie, {
-      method: 'POST', body: { projectId, title: '测试通知', version: '2.0', reproSteps: '不要发送复现正文' },
+      method: 'POST', body: { projectId, title: '测试通知', version: '2.0', assignee: '测试负责人', reproSteps: '不要发送复现正文' },
     });
     assert.equal(result.status, 201);
     let defect = result.body.defect;
     assert.equal(queued().length, 1);
     assert.equal(queued()[0].chat_id, 'oc_testgroup123');
-    assert.match(queued()[0].content, /新建缺陷/);
+    assert.match(queued()[0].content, /^负责人：测试负责人$/m);
+    assert.match(queued()[0].content, /^状态：待处理$/m);
+    assert.doesNotMatch(queued()[0].content, /新建缺陷|项目组：/);
     assert.doesNotMatch(queued()[0].content, /不要发送复现正文/);
 
     result = await request(started.url, `/api/defects/${defect.id}`, cookie, {
@@ -404,7 +406,7 @@ test('defect notices are queued for one project on creation and resolved/closed 
     });
     assert.equal(result.status, 200); defect = result.body.defect;
     assert.equal(queued().length, 2);
-    assert.match(queued()[1].content, /缺陷已解决/);
+    assert.match(queued()[1].content, /^状态：已解决$/m);
     assert.equal((await request(started.url, `/api/defects/${defect.id}`, cookie, {
       method: 'PUT', body: { projectId, revision: defect.revision - 1, status: '已关闭' },
     })).status, 409);
@@ -414,7 +416,7 @@ test('defect notices are queued for one project on creation and resolved/closed 
     });
     assert.equal(result.status, 200);
     assert.equal(queued().length, 3);
-    assert.match(queued()[2].content, /缺陷已关闭/);
+    assert.match(queued()[2].content, /^状态：已关闭$/m);
     defect = (await request(started.url, `/api/defects?projectId=${projectId}`, cookie)).body.defects.find((item) => item.id === defect.id);
     result = await request(started.url, '/api/defects/batch', cookie, {
       method: 'POST', body: { projectId, items: [{ id: defect.id, revision: defect.revision }], action: 'status', status: '已关闭' },

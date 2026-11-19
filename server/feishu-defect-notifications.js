@@ -15,20 +15,19 @@ export function loadFeishuDefectTarget(dataDir) {
   return { projectId: target.projectId, chatId: target.chatId };
 }
 
-function line(value, limit = 200) {
-  return String(value || '').replace(/[\r\n\t\x00-\x1f\x7f]+/g, ' ').trim().slice(0, limit) || '未填写';
+function line(value, limit = 200, fallback = '未填写') {
+  return String(value || '').replace(/[\r\n\t\x00-\x1f\x7f]+/g, ' ').trim().slice(0, limit) || fallback;
 }
 
-export function formatFeishuDefectNotice(type, defect, projectName) {
+export function formatFeishuDefectNotice(type, defect) {
   if (!Object.hasOwn(NOTIFICATION_TYPES, type)) throw new Error('缺陷通知类型无效');
   return [
-    `【QZZ ${NOTIFICATION_TYPES[type]}】`,
-    `项目组：${line(projectName, 60)}`,
     `问题类型：${line(defect.issueType, 20)}`,
     `标题：${line(defect.title)}`,
     `发现版本：${line(defect.version, 100)}`,
     `模块：${line(defect.module, 100)}`,
     `状态：${line(defect.status, 30)}`,
+    `负责人：${line(defect.assignee, 100, '')}`,
     `缺陷编号：${line(defect.id, 100).slice(0, 8)}`,
   ].join('\n');
 }
@@ -59,7 +58,7 @@ export function createFeishuDefectNotifier({ db, target, logger = console, now =
   const next = db.prepare('SELECT MIN(next_attempt_at) AS time FROM feishu_defect_notifications');
   const delivered = db.prepare('DELETE FROM feishu_defect_notifications WHERE id = ?');
   const retry = db.prepare('UPDATE feishu_defect_notifications SET attempts = attempts + 1, next_attempt_at = ? WHERE id = ?');
-  const project = db.prepare('SELECT name FROM projects WHERE id = ? AND deleted_at IS NULL');
+  const project = db.prepare('SELECT 1 FROM projects WHERE id = ? AND deleted_at IS NULL');
   let send; let timer; let running; let stopped = false;
 
   function schedule() {
@@ -76,11 +75,10 @@ export function createFeishuDefectNotifier({ db, target, logger = console, now =
 
   function enqueue(type, defect) {
     if (stopped || defect.projectId !== target.projectId) return false;
-    const projectName = project.get(defect.projectId)?.name;
-    if (!projectName) return false;
+    if (!project.get(defect.projectId)) return false;
     const time = now();
     insert.run(crypto.randomUUID(), defect.id, defect.projectId, target.chatId,
-      formatFeishuDefectNotice(type, defect, projectName), time, new Date(time).toISOString());
+      formatFeishuDefectNotice(type, defect), time, new Date(time).toISOString());
     if (send) schedule();
     return true;
   }

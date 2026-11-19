@@ -11,7 +11,7 @@ const projectId = '11111111-2222-4333-8444-555555555555';
 const chatId = 'oc_0123456789abcdef0123456789abcdef';
 const target = { projectId, chatId };
 const defect = { id: '281e78cd-39ac-4662-ae70-a41bd71612b5', projectId, title: '活动规则显示异常',
-  issueType: '版本问题', version: '1.2.3', module: '活动', status: '待处理',
+  issueType: '版本问题', version: '1.2.3', module: '活动', status: '待处理', assignee: '测试负责人',
   reproSteps: '不应出现在群里的详细重现步骤', actual: '不应出现在群里的实际结果', notes: '不应出现在群里的备注' };
 
 test('group target is explicit, validated, and no sensitive defect body is sent', () => {
@@ -20,12 +20,23 @@ test('group target is explicit, validated, and no sensitive defect body is sent'
     assert.equal(loadFeishuDefectTarget(directory), null);
     fs.writeFileSync(path.join(directory, 'feishu-defect-notifications.json'), JSON.stringify(target));
     assert.deepEqual(loadFeishuDefectTarget(directory), target);
-    const text = formatFeishuDefectNotice('created', defect, '甜点项目组');
-    assert.match(text, /新建缺陷/);
-    assert.match(text, /281e78cd/);
-    assert.match(text, /活动规则显示异常/);
-    assert.doesNotMatch(text, /重现步骤|实际结果|备注|39ac-4662/);
-    assert.match(formatFeishuDefectNotice('closed', { ...defect, title: '' }, '甜点项目组'), /标题：未填写/);
+    const text = formatFeishuDefectNotice('created', defect);
+    assert.equal(text, [
+      '问题类型：版本问题', '标题：活动规则显示异常', '发现版本：1.2.3',
+      '模块：活动', '状态：待处理', '负责人：测试负责人', '缺陷编号：281e78cd',
+    ].join('\n'));
+    assert.doesNotMatch(text, /QZZ|甜点项目组|新建缺陷|重现步骤|实际结果|备注|39ac-4662/);
+    assert.equal(formatFeishuDefectNotice('closed', { ...defect, title: '', assignee: '' }), [
+      '问题类型：版本问题', '标题：未填写', '发现版本：1.2.3',
+      '模块：活动', '状态：待处理', '负责人：', '缺陷编号：281e78cd',
+    ].join('\n'));
+    assert.equal(formatFeishuDefectNotice('created', {
+      ...defect, id: 'fbe1a572-0000-4000-8000-000000000000', title: 'test',
+      version: '166.0', module: '绚烂挑战', assignee: '',
+    }), [
+      '问题类型：版本问题', '标题：test', '发现版本：166.0',
+      '模块：绚烂挑战', '状态：待处理', '负责人：', '缺陷编号：fbe1a572',
+    ].join('\n'));
     fs.writeFileSync(path.join(directory, 'feishu-defect-notifications.json'), JSON.stringify({ ...target, chatId: 'not-a-chat' }));
     assert.throws(() => loadFeishuDefectTarget(directory), /配置无效/);
   } finally { fs.rmSync(directory, { recursive: true, force: true }); }
